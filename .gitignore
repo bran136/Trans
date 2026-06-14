@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.env
+config/app_config.json
+logs/*.log
+logs/*.log.*
+nohup.out
