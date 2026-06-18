@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>翻译工具</title>
+    <title>Trans工具</title>
     <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
   </head>
   <body class="login-body">
@@ -17,12 +17,22 @@
             <path d="M36 44l5-12 5 12M38 40h6"></path>
           </svg>
         </div>
-        <h1>翻译工具</h1>
-        <p>输入访问密码继续</p>
+        <h1>Trans工具</h1>
+        <p>{% if authenticated %}选择要使用的功能{% else %}输入访问密码并选择功能{% endif %}</p>
+        {% if authenticated %}
+        <div class="login-targets">
+          <a href="{{ url_for('translate_page') }}">在线翻译</a>
+          <a href="{{ url_for('reader_page') }}">在线读书</a>
+        </div>
+        {% else %}
         <form method="post" class="login-form">
           <input type="password" name="password" placeholder="访问密码" autocomplete="current-password" autofocus required>
-          <button type="submit">登录</button>
+          <div class="login-targets">
+            <button type="submit" name="target" value="translate">在线翻译</button>
+            <button type="submit" name="target" value="reader">在线读书</button>
+          </div>
         </form>
+        {% endif %}
         {% if error %}
         <div class="form-error">{{ error }}</div>
         {% endif %}

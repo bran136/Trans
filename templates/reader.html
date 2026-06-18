@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>在线读书</title>
+    <link rel="stylesheet" href="{{ asset_url('reader.css') }}">
+  </head>
+  <body class="reader-body">
+    <div class="reader-shell">
+      <header class="reader-topbar">
+        <div>
+          <h1>在线读书</h1>
+          <span id="readerStatus">本地书架</span>
+        </div>
+        <nav class="reader-actions">
+          <button id="shelfBtn" type="button">书架</button>
+          <button id="manageBtn" type="button">管理</button>
+          <button id="tocBtn" type="button">目录</button>
+          <button id="ttsBtn" type="button">听书</button>
+          <button id="settingsBtn" type="button">设置</button>
+          <button id="logoutBtn" type="button">退出</button>
+        </nav>
+      </header>
+
+      <main class="reader-stage">
+        <section id="shelfView" class="shelf-view">
+          <div class="shelf-head">
+            <div>
+              <h2>我的书架</h2>
+              <span id="bookCount">0 本</span>
+            </div>
+          </div>
+          <div id="bookList" class="book-list"></div>
+        </section>
+
+        <section id="readingView" class="reading-view" hidden>
+          <div class="reader-toolbar">
+            <button id="prevChapterBtn" type="button">上一章</button>
+            <select id="chapterSelect"></select>
+            <button id="nextChapterBtn" type="button">下一章</button>
+          </div>
+          <div id="listenToolbar" class="listen-toolbar" hidden>
+            <button id="listenPauseBtn" type="button">暂停</button>
+            <button id="listenStopBtn" type="button">停止</button>
+            <select id="playbackRateSelect" aria-label="播放倍速">
+              <option value="0.8">0.8x</option>
+              <option value="1">1.0x</option>
+              <option value="1.2">1.2x</option>
+              <option value="1.5">1.5x</option>
+              <option value="2">2.0x</option>
+            </select>
+            <select id="quickVoiceSelect" aria-label="听书音色"></select>
+            <button id="sleepTimerBtn" class="sleep-timer-btn" type="button">定时</button>
+            <span id="listenStatus">点击句子可从该句开始读</span>
+          </div>
+          <article id="bookContent" class="book-content empty">选择一本书开始阅读</article>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="manageDialog" class="reader-dialog manage-dialog">
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2>书籍管理</h2>
+          <button id="closeManageBtn" type="button">关闭</button>
+        </div>
+        <div class="manage-layout">
+          <section class="manage-upload">
+            <form id="uploadForm" class="upload-box">
+              <input id="bookFile" name="book" type="file" accept=".txt,.epub,.pdf">
+              <label class="upload-drop" for="bookFile">
+                <strong>导入本地书</strong>
+                <span id="selectedFileName">TXT / EPUB / PDF，最大 50MB</span>
+              </label>
+              <div id="uploadProgress" class="upload-progress" hidden>
+                <div id="uploadProgressBar"></div>
+              </div>
+              <div id="uploadMessage" class="upload-message">选择文件后导入到本地书架</div>
+              <div id="importJobs" class="import-jobs" hidden></div>
+            </form>
+          </section>
+          <section>
+            <div id="manageBookList" class="manage-book-list"></div>
+          </section>
+        </div>
+      </section>
+    </dialog>
+
+    <dialog id="tocDialog" class="reader-dialog">
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2>目录</h2>
+          <button id="closeTocBtn" type="button">关闭</button>
+        </div>
+        <div id="tocList" class="toc-list"></div>
+      </section>
+    </dialog>
+
+    <dialog id="settingsDialog" class="reader-dialog settings-dialog">
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2>阅读设置</h2>
+          <div class="dialog-actions">
+            <button id="darkModeBtn" class="theme-mode-btn" type="button" aria-pressed="false">黑暗</button>
+            <button id="closeSettingsBtn" type="button">关闭</button>
+          </div>
+        </div>
+        <label class="setting-row">
+          字号 <span id="fontValue">18</span>
+          <input id="fontInput" type="range" min="15" max="24" step="1" value="18">
+        </label>
+        <label class="setting-row">
+          字体
+          <div id="fontPicker" class="font-picker" role="group" aria-label="选择阅读字体"></div>
+        </label>
+      </section>
+    </dialog>
+
+    <dialog id="ttsDialog" class="reader-dialog tts-dialog">
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2>听书</h2>
+          <div class="dialog-actions">
+            <button id="saveTtsConfigBtn" type="button">保存</button>
+            <button id="closeTtsBtn" type="button">关闭</button>
+          </div>
+        </div>
+        <section class="tts-config-panel">
+          <div id="ttsConfigMessage" class="reader-config-message" hidden></div>
+          <label class="setting-check"><input id="ttsEnabled" type="checkbox"> 启用 Xiaomi MiMo 听书</label>
+          <div class="tts-settings-grid">
+            <label>API Key
+              <input id="ttsApiKey" type="password" autocomplete="off">
+            </label>
+            <label>接口地址
+              <input id="ttsBaseUrl" type="url">
+            </label>
+            <label>模型
+              <select id="ttsModel"></select>
+            </label>
+            <label>音色
+              <select id="ttsVoiceId"></select>
+            </label>
+            <label>单句字符
+              <input id="ttsChunkChars" type="number" min="80" max="800" step="10">
+            </label>
+            <label class="tts-wide">风格 / 音色描述
+              <textarea id="ttsStylePrompt" rows="3"></textarea>
+            </label>
+          </div>
+          <div class="tts-cache-row">
+            <label class="setting-check"><input id="ttsCacheEnabled" type="checkbox"> 启用服务端音频缓存</label>
+            <span id="ttsCacheStats" class="tts-cache-stats"></span>
+          </div>
+        </section>
+      </section>
+    </dialog>
+
+    <dialog id="sleepTimerDialog" class="reader-dialog sleep-dialog">
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2>定时暂停</h2>
+          <div class="dialog-actions">
+            <button id="closeSleepTimerBtn" type="button">关闭</button>
+          </div>
+        </div>
+        <section class="sleep-panel">
+          <div class="sleep-options">
+            <button type="button" data-sleep-minutes="5">5 分钟</button>
+            <button type="button" data-sleep-minutes="10">10 分钟</button>
+            <button type="button" data-sleep-minutes="15">15 分钟</button>
+            <button type="button" data-sleep-minutes="30">30 分钟</button>
+            <button type="button" data-sleep-minutes="45">45 分钟</button>
+            <button type="button" data-sleep-minutes="60">60 分钟</button>
+          </div>
+          <label class="sleep-custom">自定义分钟
+            <input id="sleepCustomMinutes" type="number" min="1" max="480" step="1" inputmode="numeric" placeholder="例如 25">
+          </label>
+          <div class="sleep-actions">
+            <button id="applySleepCustomBtn" type="button">应用</button>
+            <button id="clearSleepTimerBtn" type="button">取消定时</button>
+          </div>
+        </section>
+      </section>
+    </dialog>
+
+    <div class="reader-version">v{{ app_version() }}</div>
+    <script src="{{ asset_url('reader.js') }}"></script>
+  </body>
+</html>

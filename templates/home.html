@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trans工具</title>
+    <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
+  </head>
+  <body class="home-body">
+    <main class="home-shell">
+      <header class="home-head">
+        <div>
+          <h1>Trans工具</h1>
+          <p>选择要使用的工具</p>
+        </div>
+        <button class="ghost" id="logoutBtn" type="button">退出</button>
+      </header>
+      <section class="tool-grid">
+        <a class="tool-card" href="{{ url_for('translate_page') }}">
+          <span>在线翻译</span>
+          <strong>实时在线翻译</strong>
+        </a>
+        <a class="tool-card" href="{{ url_for('reader_page') }}">
+          <span>在线读书</span>
+          <strong>本地书架与听书</strong>
+        </a>
+      </section>
+    </main>
+    <div class="version-badge">v{{ app_version() }}</div>
+    <script>
+      document.getElementById("logoutBtn").addEventListener("click", async () => {
+        await fetch("/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        window.location.href = "/login";
+      });
+    </script>
+  </body>
+</html>

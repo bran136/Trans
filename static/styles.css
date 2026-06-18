@@ -57,8 +57,17 @@ button {
   place-items: center;
 }
 
+.home-body {
+  display: grid;
+  place-items: center;
+}
+
 .login-shell {
   width: min(92vw, 430px);
+}
+
+.home-shell {
+  width: min(92vw, 760px);
 }
 
 .login-panel {
@@ -119,6 +128,12 @@ button {
 
 .login-form {
   display: grid;
+  gap: 12px;
+}
+
+.login-targets {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -183,22 +198,30 @@ textarea:disabled {
   font-weight: 700;
 }
 
-.login-form button {
+.login-form button,
+.login-targets a {
   height: 50px;
   font-size: 16px;
 }
 
 .primary,
-.login-form button {
+.login-form button,
+.login-targets a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 0;
   background: var(--accent);
   color: #fff;
   border-radius: 14px;
   box-shadow: 0 10px 24px rgba(107, 125, 227, 0.28);
+  font-weight: 800;
+  text-decoration: none;
 }
 
 .primary:hover,
-.login-form button:hover {
+.login-form button:hover,
+.login-targets a:hover {
   background: var(--accent-strong);
 }
 
@@ -221,6 +244,63 @@ textarea:disabled {
 .form-error {
   margin-top: 16px;
   color: var(--danger);
+}
+
+.home-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.home-head h1 {
+  margin: 0;
+  color: #3848bd;
+  font-size: clamp(30px, 5vw, 46px);
+}
+
+.home-head p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.tool-card {
+  display: grid;
+  gap: 12px;
+  min-height: 180px;
+  align-content: end;
+  padding: 22px;
+  border: 1px solid rgba(255, 255, 255, 0.78);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.86);
+  color: var(--ink);
+  text-decoration: none;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+  transition: transform 0.18s ease, border-color 0.18s ease;
+}
+
+.tool-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(107, 125, 227, 0.42);
+}
+
+.tool-card span {
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.tool-card strong {
+  font-size: 24px;
 }
 
 .app-shell {
@@ -964,6 +1044,27 @@ dialog::backdrop {
 }
 
 @media (max-width: 640px) {
+  .home-shell {
+    width: min(100vw - 24px, 760px);
+  }
+
+  .home-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .tool-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .login-targets {
+    grid-template-columns: 1fr;
+  }
+
+  .tool-card {
+    min-height: 150px;
+  }
+
   #settingsDialog {
     width: calc(100vw - 16px);
     max-height: calc(100dvh - 16px);

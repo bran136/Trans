@@ -5,3 +5,4 @@ config/app_config.json
 logs/*.log
 logs/*.log.*
 nohup.out
+reader_data/
