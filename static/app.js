@@ -6,6 +6,7 @@ const state = {
   translateTimer: null,
   monitorTimer: null,
   balanceTimer: null,
+  balanceRetryTimer: null,
   deepseekBalance: null,
   deepseekBalanceLoadedAt: 0,
   requestId: 0,
@@ -290,18 +291,21 @@ function stopMonitorRefresh() {
 
 async function loadDeepSeekBalance() {
   if (document.hidden) return;
+  window.clearTimeout(state.balanceRetryTimer);
   try {
     const data = await api("/api/deepseek/balance");
     state.deepseekBalance = data.balance;
     state.deepseekBalanceLoadedAt = Date.now();
   } catch (error) {
     state.deepseekBalance = null;
+    state.balanceRetryTimer = window.setTimeout(loadDeepSeekBalance, 15 * 1000);
   }
   renderDeepSeekBalance();
 }
 
 function startBalanceRefresh() {
   window.clearInterval(state.balanceTimer);
+  window.clearTimeout(state.balanceRetryTimer);
   loadDeepSeekBalance();
   state.balanceTimer = window.setInterval(loadDeepSeekBalance, 15 * 60 * 1000);
 }

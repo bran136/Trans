@@ -42,10 +42,10 @@ http://127.0.0.1:31000
 ```text
 ./path_dir/.env                    真实运行配置，包含密码和 API Key
 ./path_dir/.env.example            示例配置，不放真实密钥
-./path_dir/config/app_config.json  普通页面配置，不保存真实 API Key
+./path_dir/config/app_config.json  普通页面配置，缺失时自动生成，不保存真实 API Key
 ./path_dir/logs/app.log            应用日志
 ./path_dir/reader_data             书籍、章节缓存、TTS 音频缓存
-./path_dir/static/fonts            阅读字体文件和字体许可说明
+./path_dir/static/fonts            页面字体资产和许可说明
 ```
 
 `reader_data/`、`.env`、日志等运行数据已加入 `.gitignore`。
@@ -67,12 +67,14 @@ ALLOW_CUSTOM_DEEPSEEK_BASE_URL=false
 
 MIMO_API_KEY=
 MIMO_TTS_BASE_URL=https://api.xiaomimimo.com/v1/chat/completions
+MIMO_BALANCE_URL=https://platform.xiaomimimo.com/api/v1/balance
+MIMO_BALANCE_COOKIE=
 MIMO_TTS_MODEL=mimo-v2.5-tts
 MIMO_TTS_VOICE=mimo_default
 MIMO_TTS_STYLE_PROMPT=适合小说听书，自然清晰地朗读，情绪丰富一点。
 ALLOW_CUSTOM_MIMO_BASE_URL=false
-TTS_CACHE_LIMIT_MB=800
-TTS_CACHE_TTL_DAYS=180
+TTS_CACHE_LIMIT_MB=8192
+TTS_CACHE_TTL_DAYS=90
 ```
 
 说明：
@@ -172,7 +174,7 @@ GET /api/deepseek/balance
 - 页面切到后台时不主动刷新。
 - 页面重新可见时，超过 15 分钟才刷新。
 - 后端也有 15 分钟余额缓存。
-- 查询失败后 60 秒内不会反复请求 DeepSeek 官方接口。
+- 查询失败后 15 秒内不会反复请求 DeepSeek 官方接口。
 
 余额查询使用 DeepSeek 官方 `GET /user/balance`，不是模型推理接口，不产生翻译 token。
 
@@ -223,7 +225,7 @@ GET /api/deepseek/balance
 - 楷体
 - 衬线
 
-字体文件和许可说明放在：
+页面字体资产和许可说明放在：
 
 ```text
 ./path_dir/static/fonts
@@ -242,6 +244,8 @@ https://mimo.xiaomi.com/mimo-v2-5-tts
 - 启用或关闭听书
 - MiMo API Key
 - 接口地址
+- 余额接口地址
+- 余额 Cookie
 - 模型
 - 音色
 - 单句最大字符数
@@ -275,6 +279,16 @@ mimo-v2.5-tts
 - 可以设置定时暂停，支持 5、10、15、30、45、60 分钟和自定义分钟数。
 - 定时暂停会等当前句读完，并在最后一段做渐弱后暂停。
 
+MiMo 余额显示：
+
+- 听书页面会显示 MiMo 余额和更新时间。
+- 余额查询通过后端代理请求 `MIMO_BALANCE_URL`。
+- 前端不会获得 MiMo API Key 或已保存的余额 Cookie。
+- 余额 Cookie 可以在听书配置页更新，也可以点击按钮清空。
+- Cookie 通常会随小米网页登录态变化而失效，失效后需要在页面里重新配置。
+- 后端不主动定时查询余额；只有前端页面请求时才会查询。
+- 余额查询成功后缓存 15 分钟，失败后 15 秒内不会反复请求。
+
 ## 听书缓存
 
 听书有两层缓存：
@@ -293,8 +307,8 @@ mimo-v2.5-tts
 服务器磁盘缓存：
 
 - 默认目录：`./path_dir/reader_data/tts_cache`
-- 默认大小上限：`TTS_CACHE_LIMIT_MB=800`
-- 默认有效期：`TTS_CACHE_TTL_DAYS=180`
+- 默认大小上限：`TTS_CACHE_LIMIT_MB=8192`
+- 默认有效期：`TTS_CACHE_TTL_DAYS=90`
 - 清理策略同时看大小和过期时间。
 
 缓存键包含：
@@ -306,7 +320,7 @@ mimo-v2.5-tts
 - 风格/音色描述
 - 文本优化选项
 
-因此切换音色不会删除旧缓存；以后切回同一音色、同一文本、同一配置时仍可命中。命中服务器缓存时不会调用 MiMo API，不消耗 token。
+因此切换音色不会删除旧的服务器缓存；以后切回同一音色、同一文本、同一配置时仍可命中。命中服务器缓存时不会调用 MiMo API，不消耗 token。
 
 听书会按当前句长度动态预取后续句子：当前句较短时多预取几句，当前句较长时少预取，尽量减少句与句之间的卡顿，同时控制并发和资源占用。
 
@@ -373,20 +387,23 @@ mimo-v2.5-tts
 
 - 登录密码不会返回前端。
 - API Key 保存到 `.env`。
+- MiMo 余额 Cookie 保存到 `.env`，普通页面配置文件不保存真实 Cookie。
 - 浏览器配置页只允许提交新 Key。
-- 服务端不会把真实 Key 返回给浏览器。
+- 服务端不会把真实 Key 或已保存的余额 Cookie 返回给浏览器。
 - 配置页只显示“已配置，留空不修改”。
 - `.env` 写入会清洗换行，避免注入额外环境变量。
 - Session Cookie 设置了 `HttpOnly` 和 `SameSite=Lax`。
 - 可通过 `SESSION_COOKIE_SECURE=true` 强制会话 Cookie 仅在 HTTPS 下发送。
-- 登录失败带轻量限速，降低暴力尝试风险。
+- 登录失败带轻量限速：同一 IP 在 5 分钟内失败 8 次后会暂时拒绝继续尝试。
 - 写请求会检查 `Origin` 和 `Referer`，降低 CSRF 风险。
 - 响应头包含 `X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: same-origin`。
 - 监控接口只读取固定 `/proc` 信息和项目目录磁盘占用，不接受浏览器传路径。
-- 重启接口不通过 shell 拼接浏览器参数。
+- 重启接口不通过 shell 拼接浏览器参数，但登录用户可以触发服务重启，因此密码必须足够强。
 - 书籍导入只写入 `reader_data/books/<book_id>`，`book_id` 限制为 32 位十六进制字符串。
+- 书籍导入限制文件大小和扩展名，EPUB 解析限制解压总量和单图片大小，降低异常文件消耗资源的风险。
 - EPUB 图片资源只允许读取书籍 EPUB 内部的图片文件，并限制单图大小。
 - EPUB 不执行书内脚本，只提取文本和图片。
+- DeepSeek 和 MiMo 的自定义接口地址默认关闭；即使开启，也会拒绝本机、内网、保留地址等非公网地址，降低 SSRF 风险。
 
 如果通过公网访问本工具，建议在 Nginx 上配置 HTTPS。否则浏览器首次提交密码或 API Key 时，请求会经过当前 HTTP 连接，存在明文传输风险。
 

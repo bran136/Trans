@@ -47,12 +47,15 @@ MAX_BOOK_TEXT_CHARS = 3_000_000
 MAX_EPUB_UNCOMPRESSED_BYTES = 80 * 1024 * 1024
 CHAPTER_CACHE_VERSION = 5
 OFFICIAL_DEEPSEEK_HOSTS = {"api.deepseek.com"}
-OFFICIAL_MIMO_HOSTS = {"api.xiaomimimo.com"}
+OFFICIAL_MIMO_HOSTS = {"api.xiaomimimo.com", "platform.xiaomimimo.com"}
 DEEPSEEK_BALANCE_TTL = 900
-DEEPSEEK_BALANCE_RETRY_INTERVAL = 60
+DEEPSEEK_BALANCE_RETRY_INTERVAL = 15
+MIMO_BALANCE_TTL = 900
+MIMO_BALANCE_RETRY_INTERVAL = 15
 RESTART_COOLDOWN_SECONDS = 30
 TRANSLATION_CACHE = OrderedDict()
 DEEPSEEK_BALANCE_CACHE = {"time": 0.0, "attempt_time": 0.0, "data": None}
+MIMO_BALANCE_CACHE = {"time": 0.0, "attempt_time": 0.0, "data": None}
 RESTART_STATE = {"time": 0.0}
 PROCESS_START_TIME = time.time()
 CPU_SAMPLE = {"time": time.time(), "cpu": 0.0}
@@ -115,6 +118,8 @@ DEFAULT_CONFIG = {
         "provider": "mimo",
         "api_key": "",
         "base_url": "https://api.xiaomimimo.com/v1/chat/completions",
+        "balance_url": "https://platform.xiaomimimo.com/api/v1/balance",
+        "balance_cookie": "",
         "model": "mimo-v2.5-tts",
         "voice_id": "mimo_default",
         "format": "wav",
@@ -190,7 +195,18 @@ def load_dotenv():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ[key.strip()] = value.strip().strip('"').strip("'")
+        os.environ[key.strip()] = parse_env_value(value)
+
+
+def parse_env_value(value):
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        quote = value[0]
+        value = value[1:-1]
+        if quote == "'":
+            return value
+        value = value.replace('\\"', '"').replace("\\\\", "\\")
+    return value
 
 
 def quote_env_value(value):
@@ -298,6 +314,23 @@ def validate_mimo_tts_url(value, fallback):
     return candidate
 
 
+def validate_mimo_balance_url(value, fallback):
+    candidate = clean_single_line_value(value).rstrip("/")
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+        return fallback
+    if parsed.username or parsed.password:
+        return fallback
+    allow_custom = env_flag("ALLOW_CUSTOM_MIMO_BASE_URL", False)
+    if not allow_custom:
+        if parsed.scheme != "https" or parsed.hostname not in OFFICIAL_MIMO_HOSTS:
+            return DEFAULT_CONFIG["reader_tts"]["balance_url"]
+        return candidate
+    if not is_public_address(parsed.hostname):
+        return fallback
+    return candidate
+
+
 def save_dotenv_values(values):
     env_path = BASE_DIR / ".env"
     values = {key: clean_single_line_value(value) for key, value in values.items()}
@@ -332,6 +365,11 @@ def apply_env(config):
     reader_tts = config["reader_tts"]
     reader_tts["api_key"] = os.getenv("MIMO_API_KEY", reader_tts["api_key"])
     reader_tts["base_url"] = os.getenv("MIMO_TTS_BASE_URL", reader_tts["base_url"])
+    reader_tts["balance_url"] = validate_mimo_balance_url(
+        os.getenv("MIMO_BALANCE_URL", reader_tts.get("balance_url", DEFAULT_CONFIG["reader_tts"]["balance_url"])),
+        reader_tts.get("balance_url", DEFAULT_CONFIG["reader_tts"]["balance_url"]),
+    )
+    reader_tts["balance_cookie"] = os.getenv("MIMO_BALANCE_COOKIE", reader_tts.get("balance_cookie", ""))
     reader_tts["model"] = os.getenv("MIMO_TTS_MODEL", reader_tts["model"])
     if reader_tts["model"] not in TTS_MODEL_OPTIONS:
         reader_tts["model"] = TTS_MODEL_OPTIONS[0]
@@ -342,7 +380,8 @@ def apply_env(config):
 
 def load_config():
     CONFIG_DIR.mkdir(exist_ok=True)
-    if CONFIG_FILE.exists():
+    config_missing = not CONFIG_FILE.exists()
+    if not config_missing:
         saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     else:
         saved = {}
@@ -351,6 +390,8 @@ def load_config():
     config.pop("microsoft", None)
     config.pop("mymemory", None)
     config.pop("iciba", None)
+    if config_missing:
+        save_config(config)
     return config
 
 
@@ -362,6 +403,7 @@ def save_config(config):
         safe["deepseek"].pop("api_key", None)
     if "reader_tts" in safe:
         safe["reader_tts"].pop("api_key", None)
+        safe["reader_tts"].pop("balance_cookie", None)
     CONFIG_FILE.write_text(json.dumps(safe, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -1868,6 +1910,8 @@ def public_reader_tts_config(config):
     settings = json.loads(json.dumps(config.get("reader_tts", DEFAULT_CONFIG["reader_tts"])))
     settings["api_key_configured"] = bool(settings.get("api_key"))
     settings["api_key"] = ""
+    settings["balance_cookie_configured"] = bool(settings.get("balance_cookie"))
+    settings["balance_cookie"] = ""
     settings["allow_custom_base_url"] = env_flag("ALLOW_CUSTOM_MIMO_BASE_URL", False)
     settings["model_options"] = TTS_MODEL_OPTIONS
     settings["voice_options"] = TTS_VOICE_OPTIONS
@@ -1900,6 +1944,16 @@ def update_reader_tts_config(config, payload):
         settings["base_url"],
     )
     env_updates["MIMO_TTS_BASE_URL"] = settings["base_url"]
+    if payload.get("clear_balance_cookie"):
+        settings["balance_cookie"] = ""
+        env_updates["MIMO_BALANCE_COOKIE"] = ""
+        MIMO_BALANCE_CACHE["data"] = None
+        MIMO_BALANCE_CACHE["time"] = 0.0
+    elif payload.get("balance_cookie"):
+        settings["balance_cookie"] = clean_single_line_value(payload["balance_cookie"])
+        env_updates["MIMO_BALANCE_COOKIE"] = settings["balance_cookie"]
+        MIMO_BALANCE_CACHE["data"] = None
+        MIMO_BALANCE_CACHE["time"] = 0.0
     model = clean_single_line_value(payload.get("model", settings["model"]))
     settings["model"] = model if model in TTS_MODEL_OPTIONS else TTS_MODEL_OPTIONS[0]
     env_updates["MIMO_TTS_MODEL"] = settings["model"]
@@ -1996,7 +2050,7 @@ def tts_cache_limit_bytes():
         limit_mb = int(os.getenv("TTS_CACHE_LIMIT_MB", "80"))
     except ValueError:
         limit_mb = 80
-    return max(10, min(limit_mb, 2048)) * 1024 * 1024
+    return max(10, min(limit_mb, 8192)) * 1024 * 1024
 
 
 def tts_cache_ttl_seconds():
@@ -2374,6 +2428,78 @@ def fetch_deepseek_balance(config, force=False):
     return result
 
 
+def normalize_balance_payload(data, now, ttl):
+    balances = data.get("balance_infos") or data.get("balances") or []
+    preferred = {}
+    if isinstance(balances, list) and balances:
+        preferred = next((item for item in balances if item.get("currency") == "CNY"), None)
+        preferred = preferred or balances[0]
+    nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+    source = preferred if preferred else nested if nested else data
+    currency = source.get("currency") or source.get("currency_code") or data.get("currency") or ""
+    total = (
+        source.get("total_balance")
+        or source.get("balance")
+        or source.get("available_balance")
+        or source.get("available")
+        or source.get("remaining")
+        or source.get("amount")
+        or ""
+    )
+    return {
+        "available": bool(data.get("is_available", True)),
+        "currency": currency,
+        "total_balance": str(total) if total != "" else "",
+        "updated_at": int(now),
+        "ttl": ttl,
+    }
+
+
+def fetch_mimo_balance(config, force=False):
+    settings = config["reader_tts"]
+    if not settings.get("api_key"):
+        raise RuntimeError("MiMo API Key 未配置")
+    balance_url = validate_mimo_balance_url(
+        settings.get("balance_url", DEFAULT_CONFIG["reader_tts"]["balance_url"]),
+        DEFAULT_CONFIG["reader_tts"]["balance_url"],
+    )
+    now = time.time()
+    cached = MIMO_BALANCE_CACHE["data"]
+    if not force and cached and now - MIMO_BALANCE_CACHE["time"] < MIMO_BALANCE_TTL:
+        return cached
+    if not force and now - MIMO_BALANCE_CACHE["attempt_time"] < MIMO_BALANCE_RETRY_INTERVAL:
+        if cached:
+            return cached
+        raise RuntimeError("MiMo 余额查询过于频繁，请稍后再试")
+    MIMO_BALANCE_CACHE["attempt_time"] = now
+    balance_cookie = clean_single_line_value(settings.get("balance_cookie", ""))
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 TransTools/1.0",
+    }
+    if balance_cookie:
+        headers.update({
+            "Cookie": balance_cookie,
+            "Origin": "https://platform.xiaomimimo.com",
+            "Referer": "https://platform.xiaomimimo.com/",
+        })
+    else:
+        headers.update({
+            "api-key": settings["api_key"],
+            "Authorization": f"Bearer {settings['api_key']}",
+        })
+    response = requests.get(
+        balance_url,
+        headers=headers,
+        timeout=min(int(settings.get("timeout", 30)), 20),
+    )
+    response.raise_for_status()
+    result = normalize_balance_payload(response.json(), now, MIMO_BALANCE_TTL)
+    MIMO_BALANCE_CACHE["time"] = now
+    MIMO_BALANCE_CACHE["data"] = result
+    return result
+
+
 def translate_deepseek(text, source, target, config):
     settings = config["deepseek"]
     if not settings.get("api_key"):
@@ -2519,6 +2645,19 @@ def api_reader_tts_config_update():
     except Exception as exc:
         app.logger.warning("reader tts config failed ip=%s error=%s", request.remote_addr, exc)
         return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/reader/mimo-balance")
+def api_reader_mimo_balance():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    config = load_config()
+    try:
+        balance = fetch_mimo_balance(config)
+        return jsonify({"ok": True, "balance": balance})
+    except Exception as exc:
+        app.logger.warning("mimo balance failed ip=%s error=%s", request.remote_addr, exc)
+        return jsonify({"error": str(exc)}), 502
 
 
 @app.route("/api/reader/tts", methods=["POST"])

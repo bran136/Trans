@@ -10,6 +10,16 @@
   --shadow: 0 22px 60px rgba(48, 61, 118, 0.13);
 }
 
+html.reader-dark-root {
+  color-scheme: dark;
+  background: #0e1320;
+}
+
+html.reader-dark-root,
+html.reader-dark-root body {
+  min-height: 100%;
+}
+
 @font-face {
   font-family: "ReaderJasonHandwriting";
   src: url("/static/fonts/JasonHandwriting1.woff2") format("woff2");
@@ -73,6 +83,17 @@ body.reader-body.dialog-scroll-locked {
   background:
     radial-gradient(circle at 10% 0%, rgba(107, 125, 227, 0.14), transparent 28%),
     linear-gradient(135deg, #0e1320 0%, #171d2a 52%, #101823 100%);
+  background-color: #0e1320;
+}
+
+.reader-body.reader-dark::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(circle at 10% 0%, rgba(107, 125, 227, 0.14), transparent 28%),
+    linear-gradient(135deg, #0e1320 0%, #171d2a 52%, #101823 100%);
 }
 
 button,
@@ -130,6 +151,7 @@ button {
   gap: 8px;
 }
 
+.reader-actions a,
 .reader-actions button,
 .reader-toolbar button,
 .dialog-head button {
@@ -143,8 +165,10 @@ button {
   background: rgba(255, 255, 255, 0.78);
   color: var(--ink);
   font-weight: 800;
+  text-decoration: none;
 }
 
+.reader-actions a,
 .reader-actions button {
   min-height: 30px;
   padding: 0 12px;
@@ -509,6 +533,15 @@ button {
   min-width: 72px;
 }
 
+.mimo-balance {
+  min-height: 22px;
+  padding: 2px 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
 .sleep-panel {
   display: grid;
   gap: 12px;
@@ -601,6 +634,7 @@ button {
 }
 
 .reader-dark .reader-toolbar select,
+.reader-dark .reader-actions a,
 .reader-dark .reader-actions button,
 .reader-dark .reader-toolbar button,
 .reader-dark .dialog-head button,
@@ -703,6 +737,10 @@ button {
   backdrop-filter: blur(1.5px);
 }
 
+.reader-dark .reader-dialog::backdrop {
+  background: rgba(3, 7, 14, 0.34);
+}
+
 .dialog-panel {
   display: grid;
   gap: 12px;
@@ -720,6 +758,10 @@ button {
 .reader-dark .dialog-panel {
   border-color: rgba(120, 137, 184, 0.2);
   background: rgba(18, 23, 33, 0.96);
+}
+
+.reader-dark .reader-figure img {
+  background: rgba(12, 16, 24, 0.92);
 }
 
 .manage-layout {
@@ -945,6 +987,24 @@ button {
   grid-column: 1 / -1;
 }
 
+.tts-cookie-clear {
+  justify-self: start;
+  margin-top: -2px;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgba(180, 35, 24, 0.22);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.78);
+  color: #b42318;
+  font-weight: 800;
+}
+
+.reader-dark .tts-cookie-clear {
+  background: rgba(25, 32, 45, 0.92);
+  color: #ffb4a8;
+  border-color: rgba(255, 180, 168, 0.24);
+}
+
 .tts-cache-row {
   display: flex;
   align-items: center;
@@ -967,6 +1027,13 @@ button {
   border-color: var(--line);
   background: rgba(25, 32, 45, 0.92);
   color: var(--ink);
+}
+
+.reader-dark .tts-settings-grid input:-webkit-autofill,
+.reader-dark .tts-settings-grid textarea:-webkit-autofill,
+.reader-dark .tts-settings-grid select:-webkit-autofill {
+  -webkit-text-fill-color: var(--ink);
+  box-shadow: 0 0 0 1000px rgb(25, 32, 45) inset;
 }
 
 @media (min-width: 761px) {
@@ -1185,11 +1252,13 @@ button {
     gap: 6px;
   }
 
+  .reader-actions a,
   .reader-actions button {
     min-height: 32px;
     padding: 0 6px;
     border-radius: 999px;
     font-size: 14px;
+    white-space: nowrap;
   }
 
   .shelf-view,
@@ -1215,8 +1284,9 @@ button {
   }
 
   .book-list {
-    grid-template-columns: repeat(auto-fill, minmax(142px, 168px));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     grid-auto-rows: 228px;
+    justify-content: stretch;
     overflow: visible;
   }
 

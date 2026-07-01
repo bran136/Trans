@@ -14,6 +14,7 @@
           <span id="readerStatus">本地书架</span>
         </div>
         <nav class="reader-actions">
+          <a href="/login">主页</a>
           <button id="shelfBtn" type="button">书架</button>
           <button id="manageBtn" type="button">管理</button>
           <button id="tocBtn" type="button">目录</button>
@@ -128,6 +129,7 @@
         </div>
         <section class="tts-config-panel">
           <div id="ttsConfigMessage" class="reader-config-message" hidden></div>
+          <div id="mimoBalance" class="mimo-balance" hidden></div>
           <label class="setting-check"><input id="ttsEnabled" type="checkbox"> 启用 Xiaomi MiMo 听书</label>
           <div class="tts-settings-grid">
             <label>API Key
@@ -148,7 +150,11 @@
             <label class="tts-wide">风格 / 音色描述
               <textarea id="ttsStylePrompt" rows="3"></textarea>
             </label>
+            <label class="tts-wide">余额 Cookie
+              <textarea id="ttsBalanceCookie" rows="2" autocomplete="off"></textarea>
+            </label>
           </div>
+          <button id="ttsClearBalanceCookieBtn" class="tts-cookie-clear" type="button">清空余额 Cookie</button>
           <div class="tts-cache-row">
             <label class="setting-check"><input id="ttsCacheEnabled" type="checkbox"> 启用服务端音频缓存</label>
             <span id="ttsCacheStats" class="tts-cache-stats"></span>

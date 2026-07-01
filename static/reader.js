@@ -24,11 +24,21 @@ const readerState = {
   importPollTimer: null,
   importDisplayTimer: null,
   scrollLockTop: 0,
+  lastUserScrollAt: 0,
+  deferredAutoScrollTimer: null,
+  lastSentenceTapIndex: -1,
+  lastSentenceTapAt: 0,
   sleepTimerId: null,
   sleepCountdownId: null,
   sleepDeadline: 0,
   sleepPausePending: false,
   sleepFadeStarted: false,
+  wakeLock: null,
+  wakeLockWanted: false,
+  mimoBalance: null,
+  mimoBalanceLoadedAt: 0,
+  mimoBalanceTimer: null,
+  mimoBalanceRetryTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -37,17 +47,32 @@ const TTS_BROWSER_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const TTS_PREFETCH_MIN_ITEMS = 2;
 const TTS_PREFETCH_MAX_ITEMS = 5;
 const FONT_OPTIONS = [
-  { id: "system", name: "系统字体", family: '"Microsoft YaHei", "微软雅黑", Arial, sans-serif' },
-  { id: "jason", name: "清松手写体", family: '"ReaderJasonHandwriting", "Microsoft YaHei", sans-serif' },
-  { id: "source-serif", name: "思源宋体", family: '"ReaderSourceHanSerif", SimSun, "宋体", serif' },
-  { id: "source-sans", name: "思源黑体", family: '"ReaderSourceHanSans", "Microsoft YaHei", sans-serif' },
-  { id: "lxgw-wenkai", name: "霞鹜文楷", family: '"ReaderLXGWWenKai", KaiTi, "楷体", serif' },
-  { id: "song", name: "宋体", family: 'SimSun, "宋体", serif' },
-  { id: "hei", name: "黑体", family: 'SimHei, "黑体", "Microsoft YaHei", sans-serif' },
-  { id: "kai", name: "楷体", family: 'KaiTi, "楷体", serif' },
-  { id: "serif", name: "衬线", family: 'Georgia, "Times New Roman", SimSun, serif' },
+  { id: "system", name: "系统字体", family: '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "微软雅黑", Arial, sans-serif', reliableOnIOS: true },
+  { id: "jason", name: "清松手写体", family: '"ReaderJasonHandwriting", "清松手写体", "JasonHandwriting", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
+  { id: "source-serif", name: "思源宋体", family: '"ReaderSourceHanSerif", "Source Han Serif CN", "思源宋体", SimSun, "宋体", serif', reliableOnIOS: true },
+  { id: "source-sans", name: "思源黑体", family: '"ReaderSourceHanSans", "Source Han Sans CN", "思源黑体", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
+  { id: "lxgw-wenkai", name: "霞鹜文楷", family: '"ReaderLXGWWenKai", "LXGW WenKai", "霞鹜文楷", KaiTi, "楷体", serif', reliableOnIOS: true },
+  { id: "song", name: "宋体", family: 'SimSun, "宋体", serif', reliableOnIOS: false },
+  { id: "hei", name: "黑体", family: 'SimHei, "黑体", "Microsoft YaHei", sans-serif', reliableOnIOS: false },
+  { id: "kai", name: "楷体", family: 'KaiTi, "楷体", serif', reliableOnIOS: false },
+  { id: "serif", name: "衬线", family: 'Georgia, "Times New Roman", SimSun, serif', reliableOnIOS: false },
 ];
 const FONT_FAMILIES = Object.fromEntries(FONT_OPTIONS.map((font) => [font.id, font.family]));
+
+function isIOSLike() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+function availableFontOptions() {
+  if (!isIOSLike()) return FONT_OPTIONS;
+  return FONT_OPTIONS.filter((font) => font.reliableOnIOS);
+}
+
+function normalizeFontId(fontId) {
+  const options = availableFontOptions();
+  return options.some((font) => font.id === fontId) ? fontId : "system";
+}
 
 function lockReaderScroll() {
   if (document.body.classList.contains("dialog-scroll-locked")) return;
@@ -68,6 +93,42 @@ function openReaderDialog(dialog) {
   if (!dialog) return;
   lockReaderScroll();
   if (!dialog.open) dialog.showModal();
+}
+
+function markUserScrollIntent() {
+  readerState.lastUserScrollAt = Date.now();
+}
+
+async function requestReaderWakeLock() {
+  if (!("wakeLock" in navigator) || readerState.wakeLock || document.visibilityState !== "visible") return;
+  try {
+    const lock = await navigator.wakeLock.request("screen");
+    readerState.wakeLock = lock;
+    lock.addEventListener("release", () => {
+      if (readerState.wakeLock === lock) readerState.wakeLock = null;
+      if (readerState.wakeLockWanted && readerState.reading && !readerState.paused && document.visibilityState === "visible") {
+        window.setTimeout(() => requestReaderWakeLock(), 250);
+      }
+    });
+  } catch {
+    readerState.wakeLock = null;
+  }
+}
+
+function releaseReaderWakeLock() {
+  const lock = readerState.wakeLock;
+  readerState.wakeLock = null;
+  if (lock) lock.release().catch(() => {});
+}
+
+function syncReaderWakeLock() {
+  const shouldKeepAwake = readerState.reading && !readerState.paused;
+  readerState.wakeLockWanted = shouldKeepAwake;
+  if (shouldKeepAwake) {
+    requestReaderWakeLock();
+  } else {
+    releaseReaderWakeLock();
+  }
 }
 
 async function api(path, options = {}) {
@@ -505,7 +566,10 @@ function renderToc() {
     button.type = "button";
     button.textContent = chapter.title;
     button.addEventListener("click", async () => {
+      const shouldResume = readerState.reading && !readerState.paused;
+      stopListening(false, false);
       await loadChapter(chapter.index, 0);
+      if (shouldResume) await startListeningFrom(0);
       if ($("tocDialog").open) $("tocDialog").close();
     });
     list.appendChild(button);
@@ -570,11 +634,7 @@ function renderChapter(chapter) {
       span.textContent = sentence.text;
       span.addEventListener("click", (event) => {
         event.currentTarget.blur?.();
-        focusSentence(sentence.index, false);
-      });
-      span.addEventListener("dblclick", (event) => {
-        event.currentTarget.blur?.();
-        focusSentence(sentence.index, true);
+        handleSentenceTap(event, sentence.index);
       });
       p.appendChild(span);
       p.appendChild(document.createTextNode(" "));
@@ -589,19 +649,60 @@ function renderChapter(chapter) {
   }
 }
 
+function handleSentenceTap(event, index) {
+  const normalizedIndex = Number(index);
+  const now = Date.now();
+  const sameSentence = readerState.lastSentenceTapIndex === normalizedIndex;
+  const isDoubleTap = sameSentence && now - readerState.lastSentenceTapAt <= 460;
+  readerState.lastSentenceTapIndex = normalizedIndex;
+  readerState.lastSentenceTapAt = now;
+  if (isDoubleTap) {
+    event.preventDefault();
+    focusSentence(normalizedIndex, true);
+    return;
+  }
+  focusSentence(normalizedIndex, false);
+}
+
 function focusSentence(index, read = false) {
   highlightSentence(index, true);
   saveProgressSoon();
   if (read) startListeningFrom(index).catch((error) => setListenStatus(error.message));
 }
 
+function activeSentenceElement() {
+  return document.querySelector(`.reader-sentence[data-index="${readerState.currentSentence}"]`);
+}
+
+function scrollActiveSentence(behavior = "smooth") {
+  const active = activeSentenceElement();
+  if (active) active.scrollIntoView({ block: "center", behavior });
+}
+
+function scheduleAutoCenterSentence() {
+  window.clearTimeout(readerState.deferredAutoScrollTimer);
+  const elapsed = Date.now() - Number(readerState.lastUserScrollAt || 0);
+  const delay = Math.max(0, 5000 - elapsed);
+  readerState.deferredAutoScrollTimer = window.setTimeout(() => {
+    if (readerState.reading && Date.now() - Number(readerState.lastUserScrollAt || 0) >= 5000) {
+      scrollActiveSentence("smooth");
+    }
+  }, delay + 30);
+}
+
 function highlightSentence(index, scroll = false) {
   readerState.currentSentence = Math.max(0, Math.min(Number(index) || 0, Math.max(readerState.sentences.length - 1, 0)));
   document.querySelectorAll(".reader-sentence.active").forEach((item) => item.classList.remove("active"));
-  const active = document.querySelector(`.reader-sentence[data-index="${readerState.currentSentence}"]`);
+  const active = activeSentenceElement();
   if (active) {
     active.classList.add("active");
-    if (scroll) active.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (scroll) {
+      if (readerState.reading && Date.now() - Number(readerState.lastUserScrollAt || 0) < 5000) {
+        scheduleAutoCenterSentence();
+      } else {
+        scrollActiveSentence("smooth");
+      }
+    }
   }
 }
 
@@ -781,6 +882,7 @@ function finishSleepPause(index) {
   if (readerState.ttsAudio) readerState.ttsAudio.volume = 1;
   clearSleepTimer(false);
   updateListenButtons();
+  syncReaderWakeLock();
   setListenStatus("定时已暂停");
 }
 
@@ -803,7 +905,9 @@ function hasReadableText(text) {
 }
 
 function nextReadableSentenceIndex(startIndex) {
-  for (let index = Math.max(0, Number(startIndex) || 0); index < readerState.sentences.length; index += 1) {
+  const normalizedStart = Number(startIndex);
+  if (!Number.isFinite(normalizedStart) || normalizedStart < 0) return -1;
+  for (let index = Math.max(0, normalizedStart); index < readerState.sentences.length; index += 1) {
     if (hasReadableText(sentenceText(index))) return index;
   }
   return -1;
@@ -931,6 +1035,7 @@ function stopListening(resetStatus = true, clearTimer = true) {
     readerState.ttsAudio.load();
   }
   updateListenButtons();
+  syncReaderWakeLock();
   if (resetStatus) setListenStatus("已停止");
 }
 
@@ -947,6 +1052,7 @@ async function startListeningFrom(index = readerState.currentSentence) {
   readerState.reading = true;
   readerState.paused = false;
   updateListenButtons();
+  syncReaderWakeLock();
   await playSentence(nextReadableSentenceIndex(index), readerState.ttsToken);
 }
 
@@ -1037,6 +1143,7 @@ async function toggleListeningPause() {
     setListenStatus("已暂停");
   }
   updateListenButtons();
+  syncReaderWakeLock();
 }
 
 async function moveChapter(delta) {
@@ -1044,8 +1151,10 @@ async function moveChapter(delta) {
   if (next < 0 || next >= readerState.chapters.length) {
     return;
   }
-  stopListening(false);
+  const shouldResume = readerState.reading && !readerState.paused;
+  stopListening(false, false);
   await loadChapter(next, 0);
+  if (shouldResume) await startListeningFrom(0);
 }
 
 function updateReaderFont() {
@@ -1055,9 +1164,9 @@ function updateReaderFont() {
   window.localStorage.setItem("readerFontSize", value);
 }
 
-function updateReaderFontFamily() {
+function updateReaderFontFamily(fontId = "") {
   const active = document.querySelector(".font-option.active");
-  const value = active?.dataset.font || "system";
+  const value = normalizeFontId(fontId || active?.dataset.font || "system");
   $("bookContent").style.setProperty("--reader-font-family", FONT_FAMILIES[value] || FONT_FAMILIES.system);
   window.localStorage.setItem("readerFontFamily", value);
   document.querySelectorAll(".font-option").forEach((button) => {
@@ -1068,6 +1177,7 @@ function updateReaderFontFamily() {
 function applyReaderTheme(value) {
   const dark = value === "dark";
   document.body.classList.toggle("reader-dark", dark);
+  document.documentElement.classList.toggle("reader-dark-root", dark);
   const button = $("darkModeBtn");
   if (button) {
     button.classList.toggle("active", dark);
@@ -1085,7 +1195,7 @@ function renderFontPicker() {
   const picker = $("fontPicker");
   if (!picker) return;
   picker.innerHTML = "";
-  FONT_OPTIONS.forEach((font) => {
+  availableFontOptions().forEach((font) => {
     const button = document.createElement("button");
     button.className = "font-option";
     button.type = "button";
@@ -1102,7 +1212,7 @@ function renderFontPicker() {
       document.querySelectorAll(".font-option").forEach((item) => item.classList.remove("active", "is-hovered"));
       button.classList.add("active");
       button.blur();
-      updateReaderFontFamily();
+      updateReaderFontFamily(font.id);
     });
     picker.appendChild(button);
   });
@@ -1113,7 +1223,8 @@ function restoreReaderSettings() {
   if (savedSize) $("fontInput").value = savedSize;
   renderFontPicker();
   const savedFamily = window.localStorage.getItem("readerFontFamily");
-  const fontId = FONT_FAMILIES[savedFamily] ? savedFamily : "system";
+  const fontId = normalizeFontId(FONT_FAMILIES[savedFamily] ? savedFamily : "system");
+  if (fontId !== savedFamily) window.localStorage.setItem("readerFontFamily", fontId);
   const activeFont = document.querySelector(`.font-option[data-font="${fontId}"]`);
   if (activeFont) activeFont.classList.add("active");
   applyReaderTheme(window.localStorage.getItem("readerTheme") === "dark" ? "dark" : "light");
@@ -1123,7 +1234,7 @@ function restoreReaderSettings() {
   }
   updatePlaybackRate();
   updateReaderFont();
-  updateReaderFontFamily();
+  updateReaderFontFamily(fontId);
 }
 
 function selectOption(label, value, selected = false) {
@@ -1156,6 +1267,63 @@ function formatCacheTime(timestamp) {
   if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
   if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
   return `${Math.floor(diff / 86400)} 天前`;
+}
+
+function formatBalanceTime(timestamp) {
+  if (!timestamp) return "未更新";
+  const date = new Date(Number(timestamp) * 1000);
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${hours}:${minutes}`;
+}
+
+function formatMimoBalance() {
+  const balance = readerState.mimoBalance;
+  if (!ttsReady()) return "";
+  if (!balance) return "MiMo 余额：查询失败，15 秒后重试";
+  if (!balance.total_balance || !balance.currency) return "MiMo 余额：未知";
+  const symbol = balance.currency === "CNY" ? "¥" : `${balance.currency} `;
+  return `MiMo 余额：${symbol}${balance.total_balance} · ${formatBalanceTime(balance.updated_at)}`;
+}
+
+function renderMimoBalance() {
+  const node = $("mimoBalance");
+  if (!node) return;
+  node.textContent = formatMimoBalance();
+  node.hidden = !ttsReady();
+}
+
+async function loadMimoBalance() {
+  if (document.hidden || !ttsReady()) return;
+  window.clearTimeout(readerState.mimoBalanceRetryTimer);
+  try {
+    const data = await api("/api/reader/mimo-balance");
+    readerState.mimoBalance = data.balance;
+    readerState.mimoBalanceLoadedAt = Date.now();
+  } catch {
+    readerState.mimoBalance = null;
+    readerState.mimoBalanceRetryTimer = window.setTimeout(loadMimoBalance, 15 * 1000);
+  }
+  renderMimoBalance();
+}
+
+function startMimoBalanceRefresh() {
+  window.clearInterval(readerState.mimoBalanceTimer);
+  window.clearTimeout(readerState.mimoBalanceRetryTimer);
+  if (!ttsReady()) {
+    readerState.mimoBalance = null;
+    renderMimoBalance();
+    return;
+  }
+  loadMimoBalance();
+  readerState.mimoBalanceTimer = window.setInterval(loadMimoBalance, 15 * 60 * 1000);
+}
+
+function refreshMimoBalanceWhenVisible() {
+  if (document.hidden || !ttsReady()) return;
+  if (Date.now() - readerState.mimoBalanceLoadedAt >= 15 * 60 * 1000) {
+    loadMimoBalance();
+  }
 }
 
 function renderTtsCacheStats(stats = {}) {
@@ -1193,11 +1361,14 @@ function renderTtsConfig() {
   renderTtsVoiceOptions(config);
   $("ttsChunkChars").value = config.chunk_chars ?? 260;
   $("ttsStylePrompt").value = config.style_prompt || "";
+  $("ttsBalanceCookie").value = "";
+  $("ttsBalanceCookie").placeholder = config.balance_cookie_configured ? "已配置，留空不修改" : "未配置，粘贴 platform.xiaomimimo.com 的 Cookie";
   $("ttsCacheEnabled").checked = config.cache_enabled !== false;
   renderTtsCacheStats(config.cache_stats || {});
   renderQuickVoiceOptions(config);
   if ($("listenToolbar")) $("listenToolbar").hidden = !ttsReady(config);
   setListenStatus(ttsReady(config) ? "点击句子可从该句开始读" : "听书未启用");
+  startMimoBalanceRefresh();
 }
 
 function ttsVoicesForModel(config = readerState.ttsConfig || {}, model = "") {
@@ -1266,6 +1437,7 @@ function ttsConfigPayload(overrides = {}) {
     model: $("ttsModel")?.value || config.model,
     voice_id: $("ttsVoiceId")?.value || config.voice_id,
     style_prompt: $("ttsStylePrompt")?.value ?? config.style_prompt ?? "",
+    balance_cookie: $("ttsBalanceCookie")?.value || "",
     chunk_chars: Number($("ttsChunkChars")?.value || config.chunk_chars || 260),
     cache_enabled: $("ttsCacheEnabled") ? $("ttsCacheEnabled").checked : config.cache_enabled !== false,
     ...overrides,
@@ -1288,6 +1460,27 @@ async function saveTtsConfig() {
     showTtsConfigMessage("听书配置已保存", "success");
   } catch (error) {
     showTtsConfigMessage(error.message, "error");
+  }
+}
+
+async function clearMimoBalanceCookie() {
+  if (!window.confirm("确定清空已保存的 MiMo 余额 Cookie？清空后余额可能无法查询。")) return;
+  const button = $("ttsClearBalanceCookieBtn");
+  if (button) button.disabled = true;
+  try {
+    showTtsConfigMessage("正在清空余额 Cookie");
+    const data = await api("/api/reader/tts-config", {
+      method: "PUT",
+      body: JSON.stringify(ttsConfigPayload({ balance_cookie: "", clear_balance_cookie: true })),
+    });
+    readerState.ttsConfig = data.config;
+    readerState.mimoBalance = null;
+    renderTtsConfig();
+    showTtsConfigMessage("余额 Cookie 已清空", "success");
+  } catch (error) {
+    showTtsConfigMessage(error.message, "error");
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -1333,8 +1526,14 @@ $("bookFile").addEventListener("change", () => {
   if (file) $("uploadForm").requestSubmit();
 });
 $("chapterSelect").addEventListener("change", () => {
-  stopListening(false);
-  loadChapter(Number($("chapterSelect").value), 0);
+  const shouldResume = readerState.reading && !readerState.paused;
+  stopListening(false, false);
+  loadChapter(Number($("chapterSelect").value), 0)
+    .then(() => {
+      if (shouldResume) return startListeningFrom(0);
+      return null;
+    })
+    .catch((error) => setListenStatus(error.message));
 });
 $("prevChapterBtn").addEventListener("click", () => moveChapter(-1));
 $("nextChapterBtn").addEventListener("click", () => moveChapter(1));
@@ -1358,6 +1557,7 @@ document.querySelectorAll("[data-sleep-minutes]").forEach((button) => {
 $("fontInput").addEventListener("input", updateReaderFont);
 $("darkModeBtn").addEventListener("click", updateReaderTheme);
 $("saveTtsConfigBtn").addEventListener("click", () => saveTtsConfig());
+$("ttsClearBalanceCookieBtn")?.addEventListener("click", () => clearMimoBalanceCookie());
 $("ttsModel").addEventListener("change", () => renderTtsVoiceOptions());
 $("shelfBtn").addEventListener("click", showShelfView);
 $("manageBtn").addEventListener("click", () => {
@@ -1381,11 +1581,33 @@ $("closeSettingsBtn").addEventListener("click", () => $("settingsDialog").close(
 $("closeTtsBtn").addEventListener("click", () => $("ttsDialog").close());
 $("closeSleepTimerBtn")?.addEventListener("click", () => $("sleepTimerDialog").close());
 window.addEventListener("resize", resizeQuickVoiceSelect);
+window.addEventListener("wheel", markUserScrollIntent, { passive: true });
+window.addEventListener("touchmove", markUserScrollIntent, { passive: true });
+window.addEventListener("keydown", (event) => {
+  if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+    markUserScrollIntent();
+  }
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    syncReaderWakeLock();
+    refreshMimoBalanceWhenVisible();
+  } else {
+    releaseReaderWakeLock();
+  }
+});
+window.addEventListener("pagehide", () => {
+  readerState.wakeLockWanted = false;
+  releaseReaderWakeLock();
+  window.clearTimeout(readerState.mimoBalanceRetryTimer);
+});
 document.querySelectorAll(".reader-dialog").forEach((dialog) => {
   dialog.addEventListener("close", unlockReaderScroll);
   dialog.addEventListener("cancel", () => window.setTimeout(unlockReaderScroll, 0));
 });
 $("logoutBtn").addEventListener("click", async () => {
+  readerState.wakeLockWanted = false;
+  releaseReaderWakeLock();
   await api("/logout", { method: "POST", body: "{}" });
   window.location.href = "/login";
 });

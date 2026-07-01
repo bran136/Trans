@@ -191,11 +191,15 @@ textarea:disabled {
 
 .primary,
 .ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   height: 42px;
   border-radius: 14px;
   border: 1px solid transparent;
   padding: 0 18px;
   font-weight: 700;
+  text-decoration: none;
 }
 
 .login-form button,
