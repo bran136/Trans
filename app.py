@@ -590,7 +590,11 @@ def save_book_index(books):
 def write_json_atomic(path, data, indent=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=indent), encoding="utf-8")
+    if indent is None:
+        content = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    else:
+        content = json.dumps(data, ensure_ascii=False, indent=indent)
+    tmp_path.write_text(content, encoding="utf-8")
     tmp_path.replace(path)
 
 
@@ -611,6 +615,7 @@ def public_import_job(job):
         "name": job.get("name", ""),
         "status": job.get("status", ""),
         "message": job.get("message", ""),
+        "progress": job.get("progress", 0),
         "error": job.get("error", ""),
         "book": job.get("book"),
         "created_at": job.get("created_at", 0),
@@ -677,7 +682,7 @@ def write_book_record(book):
     target_dir = book_dir(book["id"])
     with READER_IO_LOCK:
         target_dir.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(book_record_path(book["id"]), book, indent=2)
+        write_json_atomic(book_record_path(book["id"]), book)
 
 
 def book_summary(book):
@@ -730,13 +735,13 @@ def decode_text_bytes(raw):
     return raw.decode("utf-8", errors="replace")
 
 
-def normalize_book_text(text):
+def normalize_book_text(text, max_chars=MAX_BOOK_TEXT_CHARS):
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t\f\v]+", " ", text)
     text = re.sub(r"\n{4,}", "\n\n\n", text)
     text = text.strip()
-    if len(text) > MAX_BOOK_TEXT_CHARS:
-        text = text[:MAX_BOOK_TEXT_CHARS]
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars]
     return text
 
 
@@ -749,11 +754,26 @@ CHAPTER_TITLE_PATTERNS = [
     re.compile(r"^([0-9０-９]{1,4}\s*[.．、]\s*[^，。！？!?]{1,70})$"),
     re.compile(r"^(Chapter\s+[0-9IVXLCDM]+[\s:：.-]*.{0,70})$", re.IGNORECASE),
 ]
+PLAIN_CHAPTER_TITLE_PATTERNS = [
+    re.compile(rf"^第[{CHAPTER_NUM_CHARS}]{{1,18}}[章节回部篇集卷]\s*[^。！？!?]{{0,90}}$", re.IGNORECASE),
+    re.compile(rf"^第[{CHAPTER_NUM_CHARS}]{{1,18}}卷[^。！？!?]{{0,50}}第[{CHAPTER_NUM_CHARS}]{{1,18}}章[^。！？!?]{{0,90}}$", re.IGNORECASE),
+    re.compile(r"^[上中下前后][卷部篇集]\s*[^。！？!?]{0,80}$", re.IGNORECASE),
+    re.compile(r"^(?:序章|楔子|引子|前言|后记|尾声|终章|番外|外传|附录|版权信息)\s*[^。！？!?]{0,80}$", re.IGNORECASE),
+    re.compile(r"^(?:[（(]\s*\d+\s*鲜币\s*[）)]\s*)?[0-9０-９]{1,5}\s*[.．、]\s*[^，。！？!?]{1,90}$", re.IGNORECASE),
+    re.compile(r"^Chapter\s+[0-9IVXLCDM]+[\s:：.-]*.{0,90}$", re.IGNORECASE),
+]
 
 
 def is_noisy_title(value):
     title = normalize_title_text(value, 120)
-    return title.strip().lower() in NOISY_CHAPTER_TITLES
+    lower = title.strip().lower()
+    if lower in NOISY_CHAPTER_TITLES:
+        return True
+    if re.fullmatch(r"\d{1,5}\.(?:gif|jpe?g|png|webp|bmp|svg)", lower):
+        return True
+    if re.fullmatch(r"(?:image|img|pic|figure)[-_]?\d{0,5}\.(?:gif|jpe?g|png|webp|bmp|svg)", lower):
+        return True
+    return False
 
 
 def is_structural_title(value):
@@ -776,6 +796,47 @@ def normalize_plain_chapter_title(value):
     text = re.sub(r"^([上中下前后])\s*([卷部篇集])", r"\1\2", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def could_be_plain_chapter_title(value):
+    text = str(value or "").strip()
+    if not text or len(text) > 140:
+        return False
+    lower = text.lower()
+    if re.fullmatch(r"\d{1,5}\.(?:gif|jpe?g|png|webp|bmp|svg)", lower):
+        return False
+    if re.search(r"(?:https?://|www\.|\.com|\.net|\.org|下载|书包网|更多精彩|点击|最新网址)", text, re.IGNORECASE):
+        return False
+    if re.match(r"^(?:[（(]\s*\d+\s*鲜币\s*[）)]\s*)?[0-9０-９]{1,5}\s*[.．、]\s*\S+", text):
+        return True
+    if re.match(r"^第\s*[" + CHAPTER_NUM_CHARS + r"\s]{1,22}\s*[章节回部篇集卷]", text):
+        return True
+    if re.match(r"^[上中下前后]\s*[卷部篇集]", text):
+        return True
+    if re.match(r"^(?:序章|楔子|引子|前言|后记|尾声|终章|番外|外传|附录|版权信息)", text):
+        return True
+    if re.match(r"^Chapter\s+[0-9IVXLCDM]+", text, re.IGNORECASE):
+        return True
+    return False
+
+
+def is_plain_chapter_title(value):
+    if not could_be_plain_chapter_title(value):
+        return False
+    title = normalize_plain_chapter_title(value)
+    if not title or is_noisy_title(title):
+        return False
+    if len(title) > 120:
+        return False
+    if re.search(r"(?:https?://|www\.|\.com|\.net|\.org|下载|书包网|更多精彩|点击|最新网址)", title, re.IGNORECASE):
+        return False
+    if title.count("。") + title.count("，") + title.count(",") >= 2:
+        return False
+    if re.search(r"[。！？!?]$", title) and not re.match(r"^(?:[（(]\s*\d+\s*鲜币\s*[）)]\s*)?[0-9０-９]{1,5}\s*[.．、]", title):
+        return False
+    if re.fullmatch(r"\d{1,5}\.[A-Za-z0-9_ -]{1,12}", title):
+        return False
+    return any(pattern.fullmatch(title) for pattern in PLAIN_CHAPTER_TITLE_PATTERNS)
 
 
 def infer_plain_prefix_title(text):
@@ -828,23 +889,15 @@ def chapter_title_from_text(text, fallback, href=""):
 
 
 def split_plain_chapters(text):
-    text = normalize_book_text(text)
+    text = normalize_book_text(text, max_chars=None)
     if not text:
         raise ValueError("没有识别到可阅读文本")
-    title_pattern = re.compile(
-        r"^(?:第[一二三四五六七八九十百千万零〇两\d０-９]{1,12}[章节回部篇集卷]\s*[^，。！？!?]{0,60}|"
-        r"[上中下前后][卷部篇集]\s*[^，。！？!?]{0,60}|"
-        r"(?:序章|楔子|引子|前言|后记|尾声|终章|番外|外传|附录)\s*[^，。！？!?]{0,60}|"
-        r"[0-9０-９]{1,4}\s*[.．、]\s*[^，。！？!?]{1,70}|"
-        r"Chapter\s+[0-9IVXLCDM]+[\s:：.-]*.{0,70})$",
-        re.IGNORECASE,
-    )
     matches = []
     cursor = 0
     for line in text.splitlines(keepends=True):
         stripped = line.strip()
         title = normalize_plain_chapter_title(stripped)
-        if stripped and len(title) <= 90 and title_pattern.fullmatch(title):
+        if stripped and is_plain_chapter_title(title):
             matches.append({"start": cursor, "title": title})
         cursor += len(line)
     chapters = []
@@ -1496,7 +1549,7 @@ def clear_txt_book_toc(book_id):
         raise ValueError("书籍源文件缺失")
     source_path = book_dir(book_id) / stored_name
     if source_path.exists():
-        text = normalize_book_text(decode_text_bytes(source_path.read_bytes()))
+        text = normalize_book_text(decode_text_bytes(source_path.read_bytes()), max_chars=None)
     else:
         text = normalize_book_text("\n\n".join(
             chapter.get("text", "") for chapter in book.get("chapters", []) if chapter.get("text")
@@ -1525,6 +1578,126 @@ def clear_txt_book_toc(book_id):
     write_book_record(updated)
     rebuild_book_index()
     return updated
+
+
+def reindex_chapters(chapters):
+    normalized = []
+    for index, chapter in enumerate(chapters):
+        text = chapter.get("text", "")
+        normalized.append({
+            **chapter,
+            "index": index,
+            "kind": chapter.get("kind", "chapter"),
+            "level": max(1, min(int(chapter.get("level") or 1), 4)),
+            "text": text,
+            "char_count": len(text),
+        })
+    return normalized
+
+
+def update_txt_chapter_title(book_id, chapter_index, title):
+    book = read_book_record(book_id)
+    if book.get("format") != "txt":
+        raise ValueError("目录编辑仅支持 TXT 文件")
+    chapters = book.get("chapters", [])
+    if chapter_index < 0 or chapter_index >= len(chapters):
+        raise ValueError("章节不存在")
+    title = clean_display_text(title, 120)
+    if not title:
+        raise ValueError("标题不能为空")
+    chapters[chapter_index]["title"] = title
+    chapters[chapter_index]["char_count"] = len(chapters[chapter_index].get("text", ""))
+    book["chapters"] = reindex_chapters(chapters)
+    book["updated_at"] = int(time.time())
+    write_book_record(book)
+    rebuild_book_index()
+    return book
+
+
+def delete_txt_chapter_title(book_id, chapter_index):
+    book = read_book_record(book_id)
+    if book.get("format") != "txt":
+        raise ValueError("目录编辑仅支持 TXT 文件")
+    chapters = book.get("chapters", [])
+    if len(chapters) <= 1:
+        raise ValueError("至少需要保留一个章节")
+    if chapter_index < 0 or chapter_index >= len(chapters):
+        raise ValueError("章节不存在")
+    removed = chapters.pop(chapter_index)
+    if chapter_index == 0:
+        chapters[0]["text"] = "\n\n".join(part for part in [removed.get("text", ""), chapters[0].get("text", "")] if part)
+    else:
+        chapters[chapter_index - 1]["text"] = "\n\n".join(part for part in [chapters[chapter_index - 1].get("text", ""), removed.get("text", "")] if part)
+    progress = book.get("progress") or {"chapter": 0, "sentence": 0}
+    current = int(progress.get("chapter") or 0)
+    if current == chapter_index:
+        progress["chapter"] = max(0, chapter_index - 1)
+        progress["sentence"] = 0
+    elif current > chapter_index:
+        progress["chapter"] = current - 1
+    book["progress"] = progress
+    book["chapters"] = reindex_chapters(chapters)
+    book["updated_at"] = int(time.time())
+    write_book_record(book)
+    rebuild_book_index()
+    return book
+
+
+def txt_chapter_lines(book_id, chapter_index):
+    book = read_book_record(book_id)
+    if book.get("format") != "txt":
+        raise ValueError("目录编辑仅支持 TXT 文件")
+    chapters = book.get("chapters", [])
+    if chapter_index < 0 or chapter_index >= len(chapters):
+        raise ValueError("章节不存在")
+    text = chapters[chapter_index].get("text", "")
+    lines = []
+    for index, line in enumerate(text.splitlines()):
+        stripped = clean_display_text(line, 160)
+        if not stripped:
+            continue
+        lines.append({
+            "index": index,
+            "text": stripped,
+            "candidate": is_plain_chapter_title(stripped),
+        })
+    return book, lines
+
+
+def split_txt_chapter_at_line(book_id, chapter_index, line_index, title=""):
+    book = read_book_record(book_id)
+    if book.get("format") != "txt":
+        raise ValueError("目录编辑仅支持 TXT 文件")
+    chapters = book.get("chapters", [])
+    if chapter_index < 0 or chapter_index >= len(chapters):
+        raise ValueError("章节不存在")
+    chapter = chapters[chapter_index]
+    lines = chapter.get("text", "").splitlines(keepends=True)
+    if line_index < 0 or line_index >= len(lines):
+        raise ValueError("行不存在")
+    chosen = clean_display_text(title or lines[line_index], 120)
+    if not chosen:
+        raise ValueError("标题不能为空")
+    if line_index == 0:
+        chapter["title"] = chosen
+    else:
+        before = "".join(lines[:line_index]).strip()
+        after = "".join(lines[line_index:]).strip()
+        if not before or not after:
+            raise ValueError("请选择章节中间的非空行作为新标题")
+        chapter["text"] = before
+        chapters.insert(chapter_index + 1, {
+            "title": chosen,
+            "kind": "chapter",
+            "level": 1,
+            "text": after,
+            "char_count": len(after),
+        })
+    book["chapters"] = reindex_chapters(chapters)
+    book["updated_at"] = int(time.time())
+    write_book_record(book)
+    rebuild_book_index()
+    return book
 
 
 def refresh_epub_chapter_metadata(book):
@@ -1604,6 +1777,21 @@ def split_sentences(paragraph):
             continue
         sentences.extend(split_long_sentence(chunk))
     return sentences
+
+
+def plain_text_display_paragraphs(text):
+    lines = []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def fallback_display_paragraphs(book, text):
+    if book.get("format") == "txt":
+        return plain_text_display_paragraphs(text)
+    return [paragraph.strip() for paragraph in re.split(r"\n{2,}", str(text or "")) if paragraph.strip()]
 
 
 def ensure_chapter_text(book, chapter_index):
@@ -1729,10 +1917,7 @@ def chapter_payload(book, chapter_index):
             if sentences:
                 paragraphs.append({"index": paragraph_index, "sentences": sentences})
                 paragraph_index += 1
-    for paragraph_index, paragraph in enumerate(re.split(r"\n{2,}", chapter.get("text", "")) if not paragraphs else []):
-        paragraph = paragraph.strip()
-        if not paragraph:
-            continue
+    for paragraph_index, paragraph in enumerate(fallback_display_paragraphs(book, chapter.get("text", "")) if not paragraphs else []):
         sentences = []
         for sentence in split_sentences(paragraph):
             sentences.append({
@@ -2699,12 +2884,16 @@ def api_reader_tts():
 
 
 def process_book_import_job(job_id, book_id, original_path, original_name, safe_name, suffix, remote_addr):
-    update_import_job(job_id, status="parsing", message="正在解析书本")
+    job_started = time.perf_counter()
+    update_import_job(job_id, status="parsing", message="正在解析书本", progress=35)
     target_dir = book_dir(book_id)
     try:
         if suffix == ".epub" and unwrap_nested_epub_zip(original_path):
             app.logger.info("nested epub zip unwrapped ip=%s name=%s", remote_addr, original_name)
+        parse_started = time.perf_counter()
         parsed = parse_book_file(original_path, original_name)
+        parse_seconds = time.perf_counter() - parse_started
+        update_import_job(job_id, status="parsing", message="正在保存书籍", progress=76)
         cover_name = save_epub_cover(original_path, book_id, parsed.get("cover")) if suffix == ".epub" else ""
         now = int(time.time())
         book = {
@@ -2723,14 +2912,30 @@ def process_book_import_job(job_id, book_id, original_path, original_name, safe_
             "progress": {"chapter": 0, "sentence": 0},
             "chapters": parsed["chapters"],
         }
+        write_started = time.perf_counter()
         write_book_record(book)
+        write_seconds = time.perf_counter() - write_started
         summary = book_summary(book)
+        update_import_job(job_id, status="parsing", message="正在更新书架", progress=92)
+        index_started = time.perf_counter()
         rebuild_book_index()
-        update_import_job(job_id, status="done", message="导入完成", book=summary)
-        app.logger.info("book uploaded ip=%s id=%s name=%s", remote_addr, book_id, original_name)
+        index_seconds = time.perf_counter() - index_started
+        update_import_job(job_id, status="done", message="导入完成", progress=100, book=summary)
+        app.logger.info(
+            "book uploaded ip=%s id=%s name=%s size=%s parse=%.3fs write=%.3fs index=%.3fs total=%.3fs chapters=%s",
+            remote_addr,
+            book_id,
+            original_name,
+            original_path.stat().st_size,
+            parse_seconds,
+            write_seconds,
+            index_seconds,
+            time.perf_counter() - job_started,
+            len(parsed["chapters"]),
+        )
     except Exception as exc:
         shutil.rmtree(target_dir, ignore_errors=True)
-        update_import_job(job_id, status="error", message="导入失败", error=str(exc))
+        update_import_job(job_id, status="error", message="导入失败", progress=100, error=str(exc))
         app.logger.warning("book upload failed ip=%s name=%s error=%s", remote_addr, original_name, exc)
 
 
@@ -2775,16 +2980,27 @@ def api_books_upload():
             "name": original_name,
             "status": "uploading",
             "message": "正在上传",
+            "progress": 0,
             "error": "",
             "book": None,
             "created_at": now,
             "updated_at": now,
         }
     try:
+        save_started = time.perf_counter()
         upload.save(original_path)
+        save_seconds = time.perf_counter() - save_started
         if original_path.stat().st_size > MAX_BOOK_UPLOAD_BYTES:
             raise ValueError("书籍文件过大，最大 50MB")
-        update_import_job(job_id, status="parsing", message="正在解析书本")
+        update_import_job(job_id, status="parsing", message="服务器已接收文件", progress=25)
+        app.logger.info(
+            "book upload received ip=%s id=%s name=%s size=%s save=%.3fs",
+            request.remote_addr,
+            book_id,
+            original_name,
+            original_path.stat().st_size,
+            save_seconds,
+        )
         worker = threading.Thread(
             target=process_book_import_job,
             args=(job_id, book_id, original_path, original_name, safe_name, suffix, request.remote_addr),
@@ -2795,7 +3011,7 @@ def api_books_upload():
             return jsonify({"ok": True, "job": public_import_job(BOOK_IMPORT_JOBS[job_id])}), 202
     except Exception as exc:
         shutil.rmtree(target_dir, ignore_errors=True)
-        update_import_job(job_id, status="error", message="导入失败", error=str(exc))
+        update_import_job(job_id, status="error", message="导入失败", progress=100, error=str(exc))
         app.logger.warning("book upload failed before parsing ip=%s name=%s error=%s", request.remote_addr, original_name, exc)
         return jsonify({"error": str(exc)}), 400
 
@@ -2936,6 +3152,61 @@ def api_book_chapter(book_id, chapter_index):
     try:
         book = read_book_record(book_id)
         return jsonify(chapter_payload(book, chapter_index))
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/books/<book_id>/chapters/<int:chapter_index>/title", methods=["PATCH"])
+def api_txt_chapter_title_update(book_id, chapter_index):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    payload = request.get_json(force=True) or {}
+    try:
+        book = update_txt_chapter_title(book_id, chapter_index, payload.get("title", ""))
+        return jsonify({"ok": True, "book": book_summary(book)})
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/books/<book_id>/chapters/<int:chapter_index>/title", methods=["DELETE"])
+def api_txt_chapter_title_delete(book_id, chapter_index):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        book = delete_txt_chapter_title(book_id, chapter_index)
+        return jsonify({"ok": True, "book": book_summary(book)})
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/books/<book_id>/chapters/<int:chapter_index>/lines")
+def api_txt_chapter_lines(book_id, chapter_index):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        book, lines = txt_chapter_lines(book_id, chapter_index)
+        return jsonify({"book": book_summary(book), "lines": lines})
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/books/<book_id>/chapters/<int:chapter_index>/split", methods=["POST"])
+def api_txt_chapter_split(book_id, chapter_index):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    payload = request.get_json(force=True) or {}
+    try:
+        line_index = int(payload.get("line_index", -1))
+        book = split_txt_chapter_at_line(book_id, chapter_index, line_index, payload.get("title", ""))
+        return jsonify({"ok": True, "book": book_summary(book)})
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 404
     except Exception as exc:

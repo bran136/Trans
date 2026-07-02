@@ -98,6 +98,28 @@
       </section>
     </dialog>
 
+    <dialog id="tocEditDialog" class="reader-dialog toc-edit-dialog">
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2>TXT 目录编辑</h2>
+          <button id="closeTocEditBtn" type="button">关闭</button>
+        </div>
+        <div id="tocEditMessage" class="reader-config-message" hidden></div>
+        <div id="tocEditList" class="toc-edit-list"></div>
+      </section>
+    </dialog>
+
+    <dialog id="tocLineDialog" class="reader-dialog toc-line-dialog">
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2>选择标题行</h2>
+          <button id="closeTocLineBtn" type="button">关闭</button>
+        </div>
+        <input id="tocLineSearch" class="toc-line-search" type="search" placeholder="搜索这一章里的行">
+        <div id="tocLineList" class="toc-line-list"></div>
+      </section>
+    </dialog>
+
     <dialog id="settingsDialog" class="reader-dialog settings-dialog">
       <section class="dialog-panel">
         <div class="dialog-head">

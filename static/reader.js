@@ -39,6 +39,11 @@ const readerState = {
   mimoBalanceLoadedAt: 0,
   mimoBalanceTimer: null,
   mimoBalanceRetryTimer: null,
+  tocEditBookId: "",
+  tocEditBook: null,
+  tocEditChapters: [],
+  tocLineChapter: null,
+  tocLineRows: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -216,10 +221,10 @@ function hideUploadProgress() {
 }
 
 function activeImportCount() {
-  const serverActiveJobs = readerState.importJobs.filter((job) => ["uploading", "parsing"].includes(job.status));
+  const serverActiveJobs = readerState.importJobs.filter((job) => ["uploading", "receiving", "parsing"].includes(job.status));
   const serverIds = new Set(serverActiveJobs.map((job) => job.id));
   const localActive = readerState.localImportJobs.filter((job) => (
-    ["uploading", "parsing"].includes(job.status) && (!job.server_id || !serverIds.has(job.server_id))
+    ["uploading", "receiving", "parsing"].includes(job.status) && (!job.server_id || !serverIds.has(job.server_id))
   )).length;
   const serverActive = serverActiveJobs.length;
   return serverActive + localActive;
@@ -229,7 +234,8 @@ function statusText(job) {
   if (job.status === "done") return "导入完成";
   if (job.status === "error") return job.error || "导入失败";
   if (job.status === "uploading") return "正在上传";
-  return "正在解析";
+  if (job.status === "receiving") return "等待服务器接收";
+  return job.message || "正在解析";
 }
 
 function renderImportJobs() {
@@ -237,7 +243,7 @@ function renderImportJobs() {
   const now = Date.now() / 1000;
   const shouldShowJob = (job) => {
     const age = now - Number(job.updated_at || 0);
-    if (["uploading", "parsing"].includes(job.status)) return true;
+    if (["uploading", "receiving", "parsing"].includes(job.status)) return true;
     if (job.status === "done") return age < 20;
     if (job.status === "error") return age < 120;
     return age < 20;
@@ -254,6 +260,7 @@ function renderImportJobs() {
     `<div class="import-job ${escapeHtml(job.status)}">
       <strong>${escapeHtml(job.name)}</strong>
       <span>${escapeHtml(statusText(job))}</span>
+      <div class="import-job-progress"><i style="width: ${Math.max(0, Math.min(Number(job.progress || 0), 100))}%"></i></div>
     </div>`
   )).join("");
   const limited = activeImportCount() >= 2;
@@ -361,17 +368,169 @@ function renderManageBooks() {
       </div>
       <div class="manage-book-actions">
         ${book.format === "txt" ? '<button type="button" data-action="clear-toc">清除目录</button>' : '<span class="manage-action-spacer"></span>'}
+        ${book.format === "txt" ? '<button type="button" data-action="toc-edit">目录</button>' : '<span class="manage-action-spacer"></span>'}
         <button type="button" data-action="rename">编辑</button>
         <button type="button" data-action="reparse">重新解析</button>
         <button type="button" data-action="delete">删除</button>
       </div>
     `;
     row.querySelector('[data-action="rename"]').addEventListener("click", () => renameBook(book));
+    row.querySelector('[data-action="toc-edit"]')?.addEventListener("click", () => openTocEditor(book));
     row.querySelector('[data-action="reparse"]').addEventListener("click", () => reparseBook(book));
     row.querySelector('[data-action="clear-toc"]')?.addEventListener("click", () => clearBookToc(book));
     row.querySelector('[data-action="delete"]').addEventListener("click", () => deleteBook(book));
     list.appendChild(row);
   });
+}
+
+function showTocEditMessage(text, type = "") {
+  const node = $("tocEditMessage");
+  node.textContent = text || "";
+  node.className = `reader-config-message ${type}`.trim();
+  node.hidden = !text;
+}
+
+async function openTocEditor(book) {
+  if (book.format !== "txt") return;
+  readerState.tocEditBookId = book.id;
+  readerState.tocEditBook = book;
+  readerState.tocEditChapters = [];
+  showTocEditMessage("正在加载目录");
+  openReaderDialog($("tocEditDialog"));
+  await refreshTocEditor(book.id);
+}
+
+async function refreshTocEditor(bookId = readerState.tocEditBookId) {
+  if (!bookId) return;
+  const data = await api(`/api/books/${bookId}`);
+  readerState.tocEditBook = data.book;
+  readerState.tocEditChapters = data.chapters || [];
+  readerState.books = readerState.books.map((book) => (book.id === data.book.id ? data.book : book));
+  renderBooks();
+  renderTocEditor();
+  showTocEditMessage("");
+}
+
+function renderTocEditor() {
+  const list = $("tocEditList");
+  const chapters = readerState.tocEditChapters || [];
+  if (!chapters.length) {
+    list.innerHTML = '<div class="manage-empty">没有目录</div>';
+    return;
+  }
+  list.innerHTML = "";
+  chapters.forEach((chapter) => {
+    const row = document.createElement("div");
+    row.className = "toc-edit-row";
+    row.innerHTML = `
+      <div>
+        <strong>${escapeHtml(chapter.title)}</strong>
+        <span>第 ${Number(chapter.index) + 1} 章 · ${Number(chapter.char_count || 0)} 字</span>
+      </div>
+      <div class="toc-edit-actions">
+        <button type="button" data-action="rename">改名</button>
+        <button type="button" data-action="split">添加</button>
+        <button type="button" data-action="delete">删除</button>
+      </div>
+    `;
+    row.querySelector('[data-action="rename"]').addEventListener("click", () => renameTxtChapter(chapter));
+    row.querySelector('[data-action="split"]').addEventListener("click", () => openTocLineChooser(chapter));
+    row.querySelector('[data-action="delete"]').addEventListener("click", () => deleteTxtChapterTitle(chapter));
+    list.appendChild(row);
+  });
+}
+
+async function renameTxtChapter(chapter) {
+  const title = window.prompt("请输入新的章节标题", chapter.title || "");
+  if (title === null) return;
+  const trimmed = title.trim();
+  if (!trimmed) {
+    showTocEditMessage("标题不能为空", "error");
+    return;
+  }
+  try {
+    await api(`/api/books/${readerState.tocEditBookId}/chapters/${chapter.index}/title`, {
+      method: "PATCH",
+      body: JSON.stringify({ title: trimmed }),
+    });
+    await refreshTocEditor();
+    if (readerState.currentBookId === readerState.tocEditBookId) await openBook(readerState.currentBookId, readerState.currentChapter, readerState.currentSentence);
+    showTocEditMessage("标题已更新", "success");
+  } catch (error) {
+    showTocEditMessage(error.message, "error");
+  }
+}
+
+async function deleteTxtChapterTitle(chapter) {
+  if (!window.confirm(`确定删除标题“${chapter.title}”吗？正文会合并到相邻章节。`)) return;
+  try {
+    await api(`/api/books/${readerState.tocEditBookId}/chapters/${chapter.index}/title`, { method: "DELETE" });
+    await refreshTocEditor();
+    if (readerState.currentBookId === readerState.tocEditBookId) await openBook(readerState.currentBookId, Math.max(0, Math.min(readerState.currentChapter, readerState.tocEditChapters.length - 1)), 0);
+    showTocEditMessage("标题已删除", "success");
+  } catch (error) {
+    showTocEditMessage(error.message, "error");
+  }
+}
+
+async function openTocLineChooser(chapter) {
+  readerState.tocLineChapter = chapter;
+  readerState.tocLineRows = [];
+  $("tocLineSearch").value = "";
+  $("tocLineList").innerHTML = '<div class="manage-empty">正在加载章节内容</div>';
+  openReaderDialog($("tocLineDialog"));
+  try {
+    const data = await api(`/api/books/${readerState.tocEditBookId}/chapters/${chapter.index}/lines`);
+    readerState.tocLineRows = data.lines || [];
+    renderTocLineRows();
+  } catch (error) {
+    $("tocLineList").innerHTML = `<div class="manage-empty">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function renderTocLineRows() {
+  const list = $("tocLineList");
+  const keyword = $("tocLineSearch").value.trim().toLowerCase();
+  const rows = (readerState.tocLineRows || []).filter((line) => (
+    !keyword || String(line.text || "").toLowerCase().includes(keyword)
+  ));
+  if (!rows.length) {
+    list.innerHTML = '<div class="manage-empty">没有匹配的行</div>';
+    return;
+  }
+  list.innerHTML = "";
+  rows.slice(0, 1200).forEach((line) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `toc-line-row ${line.candidate ? "candidate" : ""}`;
+    button.innerHTML = `<span>${Number(line.index) + 1}</span><strong>${escapeHtml(line.text)}</strong>`;
+    button.addEventListener("click", () => splitTxtChapterAtLine(line));
+    list.appendChild(button);
+  });
+  if (rows.length > 1200) {
+    const note = document.createElement("div");
+    note.className = "manage-empty";
+    note.textContent = `还有 ${rows.length - 1200} 行未显示，请搜索缩小范围`;
+    list.appendChild(note);
+  }
+}
+
+async function splitTxtChapterAtLine(line) {
+  const chapter = readerState.tocLineChapter;
+  if (!chapter) return;
+  if (!window.confirm(`把这一行作为新标题吗？\n\n${line.text}`)) return;
+  try {
+    await api(`/api/books/${readerState.tocEditBookId}/chapters/${chapter.index}/split`, {
+      method: "POST",
+      body: JSON.stringify({ line_index: line.index, title: line.text }),
+    });
+    $("tocLineDialog").close();
+    await refreshTocEditor();
+    if (readerState.currentBookId === readerState.tocEditBookId) await openBook(readerState.currentBookId, chapter.index, 0);
+    showTocEditMessage("标题已添加", "success");
+  } catch (error) {
+    $("tocLineList").insertAdjacentHTML("afterbegin", `<div class="reader-config-message error">${escapeHtml(error.message)}</div>`);
+  }
 }
 
 async function renameBook(book) {
@@ -485,6 +644,7 @@ async function uploadBook(event) {
     status: "uploading",
     message: "正在上传",
     error: "",
+    progress: 0,
     updated_at: Date.now() / 1000,
   });
   renderImportJobs();
@@ -494,16 +654,29 @@ async function uploadBook(event) {
   setUploadMessage(`正在上传：${file.name}`);
   try {
     const data = await uploadWithProgress("/api/books", form, (percent) => {
+      const waitingForServer = percent >= 100;
+      readerState.localImportJobs = readerState.localImportJobs.map((job) => (
+        job.id === localJobId
+          ? {
+              ...job,
+              status: waitingForServer ? "receiving" : "uploading",
+              message: waitingForServer ? "等待服务器接收" : "正在上传",
+              progress: percent,
+              updated_at: Date.now() / 1000,
+            }
+          : job
+      ));
+      renderImportJobs();
       showUploadProgress(percent);
-      setUploadMessage(percent >= 100 ? "上传完成，正在解析书本" : `正在上传：${percent}%`);
-      if (percent >= 100) showUploadParsing();
+      setUploadMessage(waitingForServer ? "浏览器上传完成，等待服务器接收" : `正在上传：${percent}%`);
+      if (waitingForServer) showUploadParsing();
     });
     showUploadParsing();
     fileInput.value = "";
     $("selectedFileName").textContent = "TXT / EPUB / PDF，最大 50MB";
     if (data.job) {
       readerState.localImportJobs = readerState.localImportJobs.map((job) => (
-        job.id === localJobId ? { ...job, status: "parsing", server_id: data.job.id, updated_at: Date.now() / 1000 } : job
+        job.id === localJobId ? { ...job, status: "parsing", progress: 100, server_id: data.job.id, updated_at: Date.now() / 1000 } : job
       ));
       readerState.importJobs = [data.job, ...readerState.importJobs.filter((job) => job.id !== data.job.id)];
       renderImportJobs();
@@ -1577,6 +1750,9 @@ $("settingsBtn").addEventListener("click", () => {
 });
 $("closeManageBtn").addEventListener("click", () => $("manageDialog").close());
 $("closeTocBtn").addEventListener("click", () => $("tocDialog").close());
+$("closeTocEditBtn").addEventListener("click", () => $("tocEditDialog").close());
+$("closeTocLineBtn").addEventListener("click", () => $("tocLineDialog").close());
+$("tocLineSearch").addEventListener("input", renderTocLineRows);
 $("closeSettingsBtn").addEventListener("click", () => $("settingsDialog").close());
 $("closeTtsBtn").addEventListener("click", () => $("ttsDialog").close());
 $("closeSleepTimerBtn")?.addEventListener("click", () => $("sleepTimerDialog").close());
