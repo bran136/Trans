@@ -36,6 +36,7 @@ const readerState = {
   wakeLock: null,
   wakeLockWanted: false,
   mimoBalance: null,
+  mimoBalanceError: "",
   mimoBalanceLoadedAt: 0,
   mimoBalanceTimer: null,
   mimoBalanceRetryTimer: null,
@@ -143,7 +144,10 @@ async function api(path, options = {}) {
   });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || `请求失败：${response.status}`);
+    const error = new Error(data.error || `请求失败：${response.status}`);
+    error.code = data.code || "";
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -1453,7 +1457,10 @@ function formatBalanceTime(timestamp) {
 function formatMimoBalance() {
   const balance = readerState.mimoBalance;
   if (!ttsReady()) return "";
-  if (!balance) return "MiMo 余额：查询失败，15 秒后重试";
+  if (!balance) {
+    const reason = readerState.mimoBalanceError || "查询失败";
+    return `MiMo 余额：${reason}，15 秒后重试`;
+  }
   if (!balance.total_balance || !balance.currency) return "MiMo 余额：未知";
   const symbol = balance.currency === "CNY" ? "¥" : `${balance.currency} `;
   return `MiMo 余额：${symbol}${balance.total_balance} · ${formatBalanceTime(balance.updated_at)}`;
@@ -1472,9 +1479,11 @@ async function loadMimoBalance() {
   try {
     const data = await api("/api/reader/mimo-balance");
     readerState.mimoBalance = data.balance;
+    readerState.mimoBalanceError = "";
     readerState.mimoBalanceLoadedAt = Date.now();
-  } catch {
+  } catch (error) {
     readerState.mimoBalance = null;
+    readerState.mimoBalanceError = error.message || "查询失败";
     readerState.mimoBalanceRetryTimer = window.setTimeout(loadMimoBalance, 15 * 1000);
   }
   renderMimoBalance();
@@ -1485,6 +1494,7 @@ function startMimoBalanceRefresh() {
   window.clearTimeout(readerState.mimoBalanceRetryTimer);
   if (!ttsReady()) {
     readerState.mimoBalance = null;
+    readerState.mimoBalanceError = "";
     renderMimoBalance();
     return;
   }

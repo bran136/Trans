@@ -166,6 +166,7 @@ textarea {
   resize: none;
   padding: 14px;
   border: 0;
+  border-radius: 0;
   line-height: 1.7;
   background: transparent;
   font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif;
@@ -178,6 +179,11 @@ select:focus,
 textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 4px rgba(107, 125, 227, 0.16);
+}
+
+textarea:focus {
+  border-color: transparent;
+  box-shadow: none;
 }
 
 input:disabled,
@@ -308,7 +314,7 @@ textarea:disabled {
 }
 
 .app-shell {
-  width: min(1440px, calc(100vw - 28px));
+  width: min(1920px, calc(100vw - 28px));
   margin: 0 auto;
   padding: 10px 0;
 }
@@ -457,6 +463,10 @@ label {
   border-right: 1px solid var(--line);
 }
 
+.input-pane:focus-within {
+  box-shadow: inset 0 0 0 2px rgba(107, 125, 227, 0.22);
+}
+
 .pane-head {
   display: flex;
   align-items: center;
@@ -572,6 +582,21 @@ label {
   word-break: break-word;
   line-height: 1.7;
   font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif;
+}
+
+.visual-sentence {
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.16s ease, box-shadow 0.16s ease;
+}
+
+.visual-sentence:hover {
+  background: rgba(107, 125, 227, 0.08);
+}
+
+.visual-sentence.active {
+  background: rgba(107, 125, 227, 0.18);
+  box-shadow: 0 0 0 2px rgba(107, 125, 227, 0.12);
 }
 
 .result-card.error pre {
@@ -987,11 +1012,6 @@ dialog::backdrop {
 }
 
 @media (max-width: 980px) {
-  .workspace,
-  .panes {
-    grid-template-columns: 1fr;
-  }
-
   .app-body {
     height: auto;
     min-height: 100dvh;
@@ -1047,7 +1067,70 @@ dialog::backdrop {
   }
 }
 
+@media (min-width: 641px) and (max-width: 980px) {
+  .app-body {
+    height: 100dvh;
+    min-height: 100dvh;
+    padding-bottom: 30px;
+    overflow: hidden;
+  }
+
+  .app-body .app-shell {
+    display: flex;
+    flex-direction: column;
+    height: calc(100dvh - 30px);
+    min-height: 0;
+  }
+
+  .app-body .workspace,
+  .app-body .translator {
+    display: flex;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .app-body .translator {
+    flex-direction: column;
+  }
+
+  .panes {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .input-pane {
+    height: auto;
+    border-right: 1px solid var(--line);
+    border-bottom: 0;
+  }
+
+  .result-pane {
+    height: auto;
+  }
+
+  textarea {
+    min-height: 0;
+    max-height: none;
+  }
+
+  .results {
+    overflow: auto;
+  }
+
+  .result-card pre {
+    min-height: 0;
+    max-height: none;
+  }
+}
+
 @media (max-width: 640px) {
+  .workspace,
+  .panes {
+    grid-template-columns: 1fr;
+  }
+
   .home-shell {
     width: min(100vw - 24px, 760px);
   }
@@ -1083,7 +1166,7 @@ dialog::backdrop {
   }
 
   .app-shell {
-    width: min(100vw - 16px, 1440px);
+    width: calc(100vw - 16px);
     padding: 8px 0;
   }
 

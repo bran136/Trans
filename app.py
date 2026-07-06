@@ -2640,6 +2640,21 @@ def normalize_balance_payload(data, now, ttl):
     }
 
 
+def mimo_balance_error_message(response):
+    if response.status_code in {401, 403}:
+        return "MiMo 余额 Cookie 可能已过期，请在听书配置里更新 Cookie"
+    if response.status_code == 404:
+        return "MiMo 余额接口地址不可用，请检查余额接口配置"
+    if response.status_code == 429:
+        return "MiMo 余额接口请求过于频繁，请稍后再试"
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    message = payload.get("message") or payload.get("msg") or response.reason or "未知错误"
+    return f"MiMo 余额查询失败：HTTP {response.status_code} {message}"
+
+
 def fetch_mimo_balance(config, force=False):
     settings = config["reader_tts"]
     if not settings.get("api_key"):
@@ -2653,33 +2668,42 @@ def fetch_mimo_balance(config, force=False):
     if not force and cached and now - MIMO_BALANCE_CACHE["time"] < MIMO_BALANCE_TTL:
         return cached
     if not force and now - MIMO_BALANCE_CACHE["attempt_time"] < MIMO_BALANCE_RETRY_INTERVAL:
-        if cached:
-            return cached
         raise RuntimeError("MiMo 余额查询过于频繁，请稍后再试")
     MIMO_BALANCE_CACHE["attempt_time"] = now
     balance_cookie = clean_single_line_value(settings.get("balance_cookie", ""))
+    if not balance_cookie:
+        raise RuntimeError("MiMo 余额 Cookie 未配置，请在听书配置里填写 platform.xiaomimimo.com 的 Cookie")
     headers = {
         "Accept": "application/json, text/plain, */*",
         "User-Agent": "Mozilla/5.0 TransTools/1.0",
+        "Cookie": balance_cookie,
+        "Origin": "https://platform.xiaomimimo.com",
+        "Referer": "https://platform.xiaomimimo.com/",
     }
-    if balance_cookie:
-        headers.update({
-            "Cookie": balance_cookie,
-            "Origin": "https://platform.xiaomimimo.com",
-            "Referer": "https://platform.xiaomimimo.com/",
-        })
-    else:
-        headers.update({
-            "api-key": settings["api_key"],
-            "Authorization": f"Bearer {settings['api_key']}",
-        })
-    response = requests.get(
-        balance_url,
-        headers=headers,
-        timeout=min(int(settings.get("timeout", 30)), 20),
-    )
-    response.raise_for_status()
-    result = normalize_balance_payload(response.json(), now, MIMO_BALANCE_TTL)
+    try:
+        response = requests.get(
+            balance_url,
+            headers=headers,
+            timeout=min(int(settings.get("timeout", 30)), 20),
+        )
+    except requests.Timeout as exc:
+        raise RuntimeError("MiMo 余额查询超时，请检查服务器到小米平台的网络") from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(f"MiMo 余额查询网络错误：{exc}") from exc
+    if not response.ok:
+        raise RuntimeError(mimo_balance_error_message(response))
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("MiMo 余额接口返回内容不是 JSON") from exc
+    if payload.get("code") not in (None, 0, "0"):
+        message = payload.get("message") or payload.get("msg") or "未知错误"
+        if "login" in message.lower() or "cookie" in message.lower() or "auth" in message.lower():
+            raise RuntimeError("MiMo 余额 Cookie 可能已过期，请在听书配置里更新 Cookie")
+        raise RuntimeError(f"MiMo 余额查询失败：{message}")
+    result = normalize_balance_payload(payload, now, MIMO_BALANCE_TTL)
+    if not result.get("total_balance") or not result.get("currency"):
+        raise RuntimeError("MiMo 余额接口返回数据不完整，请检查 Cookie 是否仍然有效")
     MIMO_BALANCE_CACHE["time"] = now
     MIMO_BALANCE_CACHE["data"] = result
     return result

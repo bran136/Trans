@@ -13,6 +13,7 @@ const state = {
   sourceAutoMode: true,
   targetAutoMode: true,
   resultPanelCollapsed: {},
+  activeSentence: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -364,6 +365,173 @@ function renderResults(results) {
   });
 }
 
+const SENTENCE_END_MARKS = new Set(["。", ".", "？", "?", "！", "!", "；", ";"]);
+const URLISH_CHARS = /[A-Za-z0-9_%/#?=&:+~-]/;
+
+function isDecimalPoint(value, index) {
+  return value[index] === "." && /\d/.test(value[index - 1] || "") && /\d/.test(value[index + 1] || "");
+}
+
+function tokenAround(value, index) {
+  let start = index;
+  let end = index + 1;
+  while (start > 0 && !/\s/.test(value[start - 1])) start -= 1;
+  while (end < value.length && !/\s/.test(value[end])) end += 1;
+  return value.slice(start, end);
+}
+
+function isProtectedUrlPeriod(value, index) {
+  if (value[index] !== ".") return false;
+  const prev = value[index - 1] || "";
+  const next = value[index + 1] || "";
+  if (isDecimalPoint(value, index)) return true;
+  if (URLISH_CHARS.test(prev) && URLISH_CHARS.test(next)) return true;
+  const token = tokenAround(value, index).replace(/^[("'“‘]+|[)"'”’，,]+$/g, "");
+  if (/^(https?:\/\/|www\.)/i.test(token) || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(token)) {
+    return index < value.length - 1 && !/\s/.test(next);
+  }
+  return false;
+}
+
+function trimRange(value, start, end) {
+  let left = start;
+  let right = end;
+  while (left < right && /\s/.test(value[left])) left += 1;
+  while (right > left && /\s/.test(value[right - 1])) right -= 1;
+  return { start: left, end: right };
+}
+
+function paragraphBreakEnd(value, index) {
+  if (value[index] !== "\n") return -1;
+  let cursor = index + 1;
+  let newlineCount = 1;
+  while (cursor < value.length) {
+    const char = value[cursor];
+    if (char === "\n") {
+      newlineCount += 1;
+      cursor += 1;
+      continue;
+    }
+    if (char === "\r" || char === " " || char === "\t") {
+      cursor += 1;
+      continue;
+    }
+    break;
+  }
+  return newlineCount >= 2 ? cursor : -1;
+}
+
+function collectSentenceParts(value, includeNewlines) {
+  const text = String(value || "");
+  const parts = [];
+  let chunkStart = 0;
+  let paragraphIndex = 0;
+
+  function pushChunk(end) {
+    if (end <= chunkStart) return;
+    const chunk = text.slice(chunkStart, end);
+    parts.push({ text: chunk, sentence: chunk.trim().length > 0, start: chunkStart, end, paragraphIndex });
+  }
+
+  for (let index = 0; index < text.length;) {
+    const char = text[index];
+    if (char === "\n") {
+      const breakEnd = paragraphBreakEnd(text, index);
+      if (breakEnd > index) {
+        pushChunk(index);
+        if (includeNewlines) {
+          parts.push({ text: text.slice(index, breakEnd), sentence: false, start: index, end: breakEnd, paragraphIndex });
+        }
+        paragraphIndex += 1;
+        chunkStart = breakEnd;
+        index = breakEnd;
+        continue;
+      }
+      index += 1;
+      continue;
+    }
+    if (SENTENCE_END_MARKS.has(char) && !isProtectedUrlPeriod(text, index)) {
+      pushChunk(index + 1);
+      chunkStart = index + 1;
+    }
+    index += 1;
+  }
+
+  pushChunk(text.length);
+  return parts.length ? parts : [{ text, sentence: Boolean(text.trim()), start: 0, end: text.length, paragraphIndex: 0 }];
+}
+
+function visualSentences(text) {
+  return collectSentenceParts(text, true);
+}
+
+function sourceSentenceRanges() {
+  const value = $("sourceText").value || "";
+  const sentenceCounters = new Map();
+  const ranges = [];
+  collectSentenceParts(value, false).forEach((part) => {
+    if (!part.sentence) return;
+    const sentenceIndex = sentenceCounters.get(part.paragraphIndex) || 0;
+    sentenceCounters.set(part.paragraphIndex, sentenceIndex + 1);
+    const range = trimRange(value, part.start, part.end);
+    if (range.end > range.start) ranges.push({ ...range, paragraphIndex: part.paragraphIndex, sentenceIndex });
+  });
+  if (!ranges.length && value.trim()) {
+    const start = value.search(/\S/);
+    ranges.push({ start, end: value.trimEnd().length, paragraphIndex: 0, sentenceIndex: 0 });
+  }
+  return ranges;
+}
+
+function renderVisualText(pre, text) {
+  pre.innerHTML = "";
+  const sentenceCounters = new Map();
+  visualSentences(text).forEach((part) => {
+    const span = document.createElement("span");
+    span.textContent = part.text;
+    if (part.sentence) {
+      const sentenceIndex = sentenceCounters.get(part.paragraphIndex) || 0;
+      sentenceCounters.set(part.paragraphIndex, sentenceIndex + 1);
+      span.className = "visual-sentence";
+      span.dataset.paragraphIndex = part.paragraphIndex;
+      span.dataset.sentenceIndex = sentenceIndex;
+      span.addEventListener("click", (event) => {
+        event.stopPropagation();
+        highlightVisualSentence(Number(span.dataset.paragraphIndex), Number(span.dataset.sentenceIndex));
+      });
+    }
+    pre.appendChild(span);
+  });
+}
+
+function applyVisualSentenceHighlight(paragraphIndex, sentenceIndex) {
+  document.querySelectorAll(".visual-sentence.active").forEach((item) => item.classList.remove("active"));
+  if (!Number.isFinite(paragraphIndex) || !Number.isFinite(sentenceIndex)) return;
+  document
+    .querySelectorAll(`.visual-sentence[data-paragraph-index="${paragraphIndex}"][data-sentence-index="${sentenceIndex}"]`)
+    .forEach((item) => {
+      item.classList.add("active");
+    });
+}
+
+function highlightVisualSentence(paragraphIndex, sentenceIndex) {
+  if (!Number.isFinite(paragraphIndex) || !Number.isFinite(sentenceIndex)) return;
+  state.activeSentence = { paragraphIndex, sentenceIndex };
+  applyVisualSentenceHighlight(paragraphIndex, sentenceIndex);
+  const range = sourceSentenceRanges().find((item) => (
+    item.paragraphIndex === paragraphIndex && item.sentenceIndex === sentenceIndex
+  ));
+  if (range) {
+    const source = $("sourceText");
+    try {
+      source.focus({ preventScroll: true });
+    } catch {
+      source.focus();
+    }
+    source.setSelectionRange(range.start, range.end);
+  }
+}
+
 function fillResultCard(card, result, index) {
   card.dataset.engine = result.engine;
   card.className = `result-card ${result.ok === false ? "error" : ""}`;
@@ -375,8 +543,15 @@ function fillResultCard(card, result, index) {
     header.appendChild(createCopyButton(result.text));
   }
   const pre = document.createElement("pre");
-  pre.textContent = result.ok === false ? result.error : (result.text || "");
+  if (result.ok === false) {
+    pre.textContent = result.error;
+  } else {
+    renderVisualText(pre, result.text || "");
+  }
   card.replaceChildren(header, pre);
+  if (state.activeSentence) {
+    applyVisualSentenceHighlight(state.activeSentence.paragraphIndex, state.activeSentence.sentenceIndex);
+  }
 }
 
 function updateResultCard(result, index) {
@@ -554,6 +729,8 @@ function updateCharCount() {
 
 function handleSourceInput() {
   updateCharCount();
+  state.activeSentence = null;
+  applyVisualSentenceHighlight(null, null);
   if (!$("sourceText").value.trim()) {
     state.sourceAutoMode = true;
     state.targetAutoMode = true;
@@ -572,6 +749,8 @@ async function translate() {
   const requestId = ++state.requestId;
   const text = $("sourceText").value.trim();
   const engines = selectedEngines();
+  state.activeSentence = null;
+  applyVisualSentenceHighlight(null, null);
   if (!text) {
     setStatus("待翻译");
     renderEngineShells();
