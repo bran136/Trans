@@ -39,9 +39,12 @@ READER_DIR = BASE_DIR / "reader_data"
 READER_BOOK_DIR = READER_DIR / "books"
 READER_INDEX_FILE = READER_DIR / "books.json"
 TTS_CACHE_DIR = READER_DIR / "tts_cache"
-CACHE_LIMIT = 100
+CACHE_LIMIT = 500
 CACHE_MAX_TEXT_CHARS = 12000
 MAX_TRANSLATE_CHARS = 20000
+DEEPSEEK_TRANSLATION_PROMPT_VERSION = 4
+DEEPSEEK_BATCH_MAX_CHARS = 5000
+DEEPSEEK_BATCH_MAX_SEGMENTS = 30
 MAX_BOOK_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_BOOK_TEXT_CHARS = 3_000_000
 MAX_EPUB_UNCOMPRESSED_BYTES = 80 * 1024 * 1024
@@ -135,23 +138,23 @@ DEFAULT_CONFIG = {
 DEEPSEEK_STYLES = {
     "default": {
         "name": "默认",
-        "prompt": "Translate faithfully and naturally. Keep formatting. Return only the translated text.",
+        "prompt": "Translate faithfully and naturally. Preserve all meaning, paragraph breaks, labels, numbering, and formatting. Return only the translated text.",
     },
     "academic": {
         "name": "学术翻译",
-        "prompt": "Translate in a formal academic style. Preserve terminology, logic, citations, numbers, and paragraph structure. Return only the translated text.",
+        "prompt": "Translate in a formal academic style. Preserve terminology, logic, citations, numbers, paragraph breaks, labels, and argument order. Return only the translated text.",
     },
     "literary": {
         "name": "文学创作",
-        "prompt": "Translate with literary fluency and expressive rhythm while preserving the original meaning, imagery, and tone. Return only the translated text.",
+        "prompt": "Translate with literary fluency and expressive rhythm while preserving every sentence, paragraph, meaning, imagery, and tone. Return only the translated text.",
     },
     "business": {
         "name": "商务正式",
-        "prompt": "Translate in a polished business style. Keep the wording professional, concise, and suitable for formal communication. Return only the translated text.",
+        "prompt": "Translate in a polished business style. Keep the wording professional while preserving every sentence, paragraph, number, and label. Return only the translated text.",
     },
     "plain": {
         "name": "通俗易懂",
-        "prompt": "Translate into clear, simple, easy-to-understand language while preserving the original meaning. Return only the translated text.",
+        "prompt": "Translate into clear, simple, easy-to-understand language while preserving every sentence, paragraph, number, and label. Return only the translated text.",
     },
 }
 
@@ -2201,6 +2204,8 @@ def update_nested_config(config, payload):
 def cache_key_for_deepseek(text, source, target, settings):
     payload = {
         "engine": "deepseek",
+        "scope": "paragraph",
+        "prompt_version": DEEPSEEK_TRANSLATION_PROMPT_VERSION,
         "text": text,
         "source": source,
         "target": target,
@@ -2212,6 +2217,31 @@ def cache_key_for_deepseek(text, source, target, settings):
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def split_translation_lines(text):
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return re.split(r"(\n+)", normalized)
+
+
+def normalize_translation_segment(value):
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\s*\n+\s*", " ", text)
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
+def normalize_translation_text(value, source_text=""):
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    source_paragraphs = [part for part in re.split(r"\n\s*\n", str(source_text or "").strip()) if part.strip()]
+    translated_paragraphs = [part for part in re.split(r"\n\s*\n", text) if part.strip()]
+    if source_paragraphs and len(translated_paragraphs) > max(len(source_paragraphs) * 2 + 2, 6):
+        text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
 
 
 def get_cached_translation(cache_key):
@@ -2709,28 +2739,30 @@ def fetch_mimo_balance(config, force=False):
     return result
 
 
-def translate_deepseek(text, source, target, config):
-    settings = config["deepseek"]
-    if not settings.get("api_key"):
-        raise RuntimeError("DeepSeek API Key 未配置")
-    cache_key = cache_key_for_deepseek(text, source, target, settings)
-    cached = get_cached_translation(cache_key)
-    if cached is not None:
-        return cached, True
-    source_label = "auto-detected language" if source == "auto" else source
-    style = DEEPSEEK_STYLES.get(settings.get("style"), DEEPSEEK_STYLES["default"])
+def mimo_balance_http_status(error):
+    message = str(error)
+    if "过于频繁" in message:
+        return 429
+    if "Cookie" in message or "未配置" in message or "接口地址" in message or "返回数据不完整" in message:
+        return 400
+    return 502
+
+
+def deepseek_system_prompt(style):
+    return (
+        "You are a precise translation engine. "
+        "Translate the complete source text. "
+        "Do not omit, summarize, deduplicate, rewrite as an abstract, or add commentary. "
+        "Translate every paragraph and sentence in order. "
+        "Preserve numbering, labels such as Q/A markers, figure/table references, units, dates, URLs, and technical terms. "
+        + style["prompt"]
+    )
+
+
+def deepseek_chat(settings, messages):
     body = {
         "model": settings["model"],
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a translation engine. " + style["prompt"],
-            },
-            {
-                "role": "user",
-                "content": f"Translate from {source_label} to {target}:\n\n{text}",
-            },
-        ],
+        "messages": messages,
         "temperature": settings["temperature"],
         "stream": False,
     }
@@ -2749,9 +2781,136 @@ def translate_deepseek(text, source, target, config):
     )
     response.raise_for_status()
     data = response.json()
-    translated = data["choices"][0]["message"]["content"].strip()
-    set_cached_translation(cache_key, translated)
-    return translated, False
+    return data["choices"][0]["message"]["content"]
+
+
+def strip_json_fence(value):
+    text = str(value or "").strip()
+    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, flags=re.S | re.I)
+    return match.group(1).strip() if match else text
+
+
+def parse_deepseek_translation_list(value, expected_count):
+    text = strip_json_fence(value)
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            payload = json.loads(text[start:end + 1])
+        except ValueError:
+            return None
+    translations = payload.get("translations") if isinstance(payload, dict) else payload
+    if not isinstance(translations, list) or len(translations) != expected_count:
+        return None
+    cleaned = [normalize_translation_segment(item) for item in translations]
+    return cleaned if all(cleaned) else None
+
+
+def translate_deepseek_segments_batch(segments, source, target, settings, style):
+    source_label = "auto-detected language" if source == "auto" else source
+    if len(segments) == 1:
+        user_prompt = (
+            f"Source language: {source_label}\n"
+            f"Target language: {target}\n\n"
+            "Translate this single paragraph. Return only the translated paragraph, with no blank lines:\n\n"
+            f"{segments[0]}"
+        )
+        raw = deepseek_chat(settings, [
+            {"role": "system", "content": deepseek_system_prompt(style)},
+            {"role": "user", "content": user_prompt},
+        ])
+        translated = normalize_translation_segment(raw)
+        if not translated:
+            raise RuntimeError("DeepSeek 返回了空翻译")
+        return [translated]
+    user_prompt = (
+        f"Source language: {source_label}\n"
+        f"Target language: {target}\n\n"
+        "Translate each item in the JSON array independently and completely. "
+        "Keep the same item count and order. "
+        "Return valid JSON only, exactly in this shape: {\"translations\":[\"...\"]}. "
+        "Each translated item must be a single paragraph with no blank lines.\n\n"
+        + json.dumps({"segments": segments}, ensure_ascii=False)
+    )
+    raw = deepseek_chat(settings, [
+        {"role": "system", "content": deepseek_system_prompt(style)},
+        {"role": "user", "content": user_prompt},
+    ])
+    translations = parse_deepseek_translation_list(raw, len(segments))
+    if translations is None:
+        translations = []
+        for segment in segments:
+            translations.extend(translate_deepseek_segments_batch([segment], source, target, settings, style))
+    return translations
+
+
+def chunk_deepseek_segments(segments):
+    batch = []
+    batch_chars = 0
+    for segment in segments:
+        segment_chars = len(segment)
+        if batch and (
+            len(batch) >= DEEPSEEK_BATCH_MAX_SEGMENTS
+            or batch_chars + segment_chars > DEEPSEEK_BATCH_MAX_CHARS
+        ):
+            yield batch
+            batch = []
+            batch_chars = 0
+        batch.append(segment)
+        batch_chars += segment_chars
+    if batch:
+        yield batch
+
+
+def translate_deepseek(text, source, target, config):
+    settings = config["deepseek"]
+    if not settings.get("api_key"):
+        raise RuntimeError("DeepSeek API Key 未配置")
+    style = DEEPSEEK_STYLES.get(settings.get("style"), DEEPSEEK_STYLES["default"])
+    parts = split_translation_lines(text)
+    translated_by_segment = {}
+    segment_keys = {}
+    uncached_segments = []
+    all_cached = True
+    for part in parts:
+        segment = part.strip()
+        if not segment or "\n" in part:
+            continue
+        if segment in translated_by_segment or segment in segment_keys:
+            continue
+        cache_key = cache_key_for_deepseek(segment, source, target, settings)
+        segment_keys[segment] = cache_key
+        cached = get_cached_translation(cache_key)
+        if cached is None:
+            uncached_segments.append(segment)
+            all_cached = False
+            continue
+        normalized_cached = normalize_translation_segment(cached)
+        if normalized_cached != cached:
+            set_cached_translation(cache_key, normalized_cached)
+        translated_by_segment[segment] = normalized_cached
+    for batch in chunk_deepseek_segments(uncached_segments):
+        translations = translate_deepseek_segments_batch(batch, source, target, settings, style)
+        for segment, translated in zip(batch, translations):
+            translated_by_segment[segment] = translated
+            set_cached_translation(segment_keys[segment], translated)
+    output_parts = []
+    for part in parts:
+        if "\n" in part:
+            output_parts.append(part)
+            continue
+        segment = part.strip()
+        if not segment:
+            output_parts.append(part)
+            continue
+        leading = part[:len(part) - len(part.lstrip(" \t"))]
+        trailing = part[len(part.rstrip(" \t")):]
+        output_parts.append(f"{leading}{translated_by_segment.get(segment, segment)}{trailing}")
+    return "".join(output_parts), all_cached
 
 
 ENGINES = {
@@ -2866,7 +3025,7 @@ def api_reader_mimo_balance():
         return jsonify({"ok": True, "balance": balance})
     except Exception as exc:
         app.logger.warning("mimo balance failed ip=%s error=%s", request.remote_addr, exc)
-        return jsonify({"error": str(exc)}), 502
+        return jsonify({"error": str(exc)}), mimo_balance_http_status(exc)
 
 
 @app.route("/api/reader/tts", methods=["POST"])

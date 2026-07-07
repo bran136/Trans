@@ -367,6 +367,9 @@ function renderResults(results) {
 
 const SENTENCE_END_MARKS = new Set(["。", ".", "？", "?", "！", "!", "；", ";"]);
 const URLISH_CHARS = /[A-Za-z0-9_%/#?=&:+~-]/;
+const ABBREVIATION_WORDS = new Set([
+  "fig", "figs", "eq", "eqs", "ref", "refs", "no", "nos", "dr", "mr", "mrs", "ms", "prof", "vs", "etc", "e.g", "i.e",
+]);
 
 function isDecimalPoint(value, index) {
   return value[index] === "." && /\d/.test(value[index - 1] || "") && /\d/.test(value[index + 1] || "");
@@ -380,11 +383,22 @@ function tokenAround(value, index) {
   return value.slice(start, end);
 }
 
+function wordBeforePeriod(value, index) {
+  let start = index - 1;
+  while (start >= 0 && /[A-Za-z.]/.test(value[start])) start -= 1;
+  return value.slice(start + 1, index).toLowerCase();
+}
+
+function isAbbreviationPeriod(value, index) {
+  return value[index] === "." && ABBREVIATION_WORDS.has(wordBeforePeriod(value, index));
+}
+
 function isProtectedUrlPeriod(value, index) {
   if (value[index] !== ".") return false;
   const prev = value[index - 1] || "";
   const next = value[index + 1] || "";
   if (isDecimalPoint(value, index)) return true;
+  if (isAbbreviationPeriod(value, index)) return true;
   if (URLISH_CHARS.test(prev) && URLISH_CHARS.test(next)) return true;
   const token = tokenAround(value, index).replace(/^[("'“‘]+|[)"'”’，,]+$/g, "");
   if (/^(https?:\/\/|www\.)/i.test(token) || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(token)) {
@@ -401,107 +415,75 @@ function trimRange(value, start, end) {
   return { start: left, end: right };
 }
 
-function paragraphBreakEnd(value, index) {
-  if (value[index] !== "\n") return -1;
+function newlineRunEnd(value, index) {
   let cursor = index + 1;
-  let newlineCount = 1;
-  while (cursor < value.length) {
-    const char = value[cursor];
-    if (char === "\n") {
-      newlineCount += 1;
-      cursor += 1;
-      continue;
-    }
-    if (char === "\r" || char === " " || char === "\t") {
-      cursor += 1;
-      continue;
-    }
-    break;
-  }
-  return newlineCount >= 2 ? cursor : -1;
+  while (cursor < value.length && /[\n\r \t]/.test(value[cursor])) cursor += 1;
+  return cursor;
 }
 
-function collectSentenceParts(value, includeNewlines) {
+function paragraphRanges(value) {
   const text = String(value || "");
-  const parts = [];
-  let chunkStart = 0;
-  let paragraphIndex = 0;
-
-  function pushChunk(end) {
-    if (end <= chunkStart) return;
-    const chunk = text.slice(chunkStart, end);
-    parts.push({ text: chunk, sentence: chunk.trim().length > 0, start: chunkStart, end, paragraphIndex });
-  }
-
-  for (let index = 0; index < text.length;) {
-    const char = text[index];
-    if (char === "\n") {
-      const breakEnd = paragraphBreakEnd(text, index);
-      if (breakEnd > index) {
-        pushChunk(index);
-        if (includeNewlines) {
-          parts.push({ text: text.slice(index, breakEnd), sentence: false, start: index, end: breakEnd, paragraphIndex });
-        }
-        paragraphIndex += 1;
-        chunkStart = breakEnd;
-        index = breakEnd;
-        continue;
-      }
-      index += 1;
-      continue;
-    }
-    if (SENTENCE_END_MARKS.has(char) && !isProtectedUrlPeriod(text, index)) {
-      pushChunk(index + 1);
-      chunkStart = index + 1;
-    }
-    index += 1;
-  }
-
-  pushChunk(text.length);
-  return parts.length ? parts : [{ text, sentence: Boolean(text.trim()), start: 0, end: text.length, paragraphIndex: 0 }];
-}
-
-function visualSentences(text) {
-  return collectSentenceParts(text, true);
-}
-
-function sourceSentenceRanges() {
-  const value = $("sourceText").value || "";
-  const sentenceCounters = new Map();
   const ranges = [];
-  collectSentenceParts(value, false).forEach((part) => {
-    if (!part.sentence) return;
-    const sentenceIndex = sentenceCounters.get(part.paragraphIndex) || 0;
-    sentenceCounters.set(part.paragraphIndex, sentenceIndex + 1);
-    const range = trimRange(value, part.start, part.end);
-    if (range.end > range.start) ranges.push({ ...range, paragraphIndex: part.paragraphIndex, sentenceIndex });
-  });
-  if (!ranges.length && value.trim()) {
-    const start = value.search(/\S/);
-    ranges.push({ start, end: value.trimEnd().length, paragraphIndex: 0, sentenceIndex: 0 });
+  let start = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== "\n") continue;
+    if (index > start) ranges.push({ start, end: index });
+    start = newlineRunEnd(text, index);
+    index = start - 1;
   }
+  if (start < text.length) ranges.push({ start, end: text.length });
   return ranges;
 }
 
-function renderVisualText(pre, text) {
-  pre.innerHTML = "";
-  const sentenceCounters = new Map();
-  visualSentences(text).forEach((part) => {
-    const span = document.createElement("span");
-    span.textContent = part.text;
-    if (part.sentence) {
-      const sentenceIndex = sentenceCounters.get(part.paragraphIndex) || 0;
-      sentenceCounters.set(part.paragraphIndex, sentenceIndex + 1);
-      span.className = "visual-sentence";
-      span.dataset.paragraphIndex = part.paragraphIndex;
-      span.dataset.sentenceIndex = sentenceIndex;
-      span.addEventListener("click", (event) => {
-        event.stopPropagation();
-        highlightVisualSentence(Number(span.dataset.paragraphIndex), Number(span.dataset.sentenceIndex));
-      });
+function isSentenceEnd(value, index) {
+  return SENTENCE_END_MARKS.has(value[index]) && !isProtectedUrlPeriod(value, index);
+}
+
+function sentenceRanges(value, paragraph, paragraphIndex) {
+  const ranges = [];
+  let start = paragraph.start;
+  let sentenceIndex = 0;
+  for (let index = paragraph.start; index < paragraph.end; index += 1) {
+    if (!isSentenceEnd(value, index)) continue;
+    const range = trimRange(value, start, index + 1);
+    if (range.end > range.start) {
+      ranges.push({ ...range, paragraphIndex, sentenceIndex });
+      sentenceIndex += 1;
     }
+    start = index + 1;
+  }
+  const tail = trimRange(value, start, paragraph.end);
+  if (tail.end > tail.start) ranges.push({ ...tail, paragraphIndex, sentenceIndex });
+  return ranges;
+}
+
+function buildHighlightRanges(value) {
+  const text = String(value || "");
+  return paragraphRanges(text).flatMap((paragraph, paragraphIndex) => (
+    sentenceRanges(text, paragraph, paragraphIndex)
+  ));
+}
+
+function renderVisualText(pre, text) {
+  const value = String(text || "");
+  const ranges = buildHighlightRanges(value);
+  pre.replaceChildren();
+  let cursor = 0;
+  ranges.forEach((range) => {
+    if (range.start > cursor) pre.appendChild(document.createTextNode(value.slice(cursor, range.start)));
+    const span = document.createElement("span");
+    span.className = "visual-sentence";
+    span.dataset.paragraphIndex = range.paragraphIndex;
+    span.dataset.sentenceIndex = range.sentenceIndex;
+    span.textContent = value.slice(range.start, range.end);
+    span.addEventListener("click", (event) => {
+      event.stopPropagation();
+      highlightVisualSentence(Number(span.dataset.paragraphIndex), Number(span.dataset.sentenceIndex), pre);
+    });
     pre.appendChild(span);
+    cursor = range.end;
   });
+  if (cursor < value.length) pre.appendChild(document.createTextNode(value.slice(cursor)));
 }
 
 function applyVisualSentenceHighlight(paragraphIndex, sentenceIndex) {
@@ -514,13 +496,33 @@ function applyVisualSentenceHighlight(paragraphIndex, sentenceIndex) {
     });
 }
 
-function highlightVisualSentence(paragraphIndex, sentenceIndex) {
+function paragraphFallbackRange(value, paragraphIndex) {
+  const paragraphs = paragraphRanges(value);
+  if (!paragraphs.length) return null;
+  const index = Math.max(0, Math.min(paragraphIndex, paragraphs.length - 1));
+  const range = trimRange(value, paragraphs[index].start, paragraphs[index].end);
+  return range.end > range.start ? range : null;
+}
+
+function sourceRangeForVisualSentence(paragraphIndex, sentenceIndex, resultRoot) {
+  const sourceValue = $("sourceText").value || "";
+  const sourceRanges = buildHighlightRanges(sourceValue);
+  const sourceParagraphRanges = sourceRanges.filter((item) => item.paragraphIndex === paragraphIndex);
+  const resultSentenceCount = resultRoot
+    ? resultRoot.querySelectorAll(`.visual-sentence[data-paragraph-index="${paragraphIndex}"]`).length
+    : 0;
+  if (sourceParagraphRanges.length && sourceParagraphRanges.length === resultSentenceCount) {
+    const exact = sourceParagraphRanges.find((item) => item.sentenceIndex === sentenceIndex);
+    if (exact) return exact;
+  }
+  return paragraphFallbackRange(sourceValue, paragraphIndex) || sourceParagraphRanges[0] || null;
+}
+
+function highlightVisualSentence(paragraphIndex, sentenceIndex, resultRoot = null) {
   if (!Number.isFinite(paragraphIndex) || !Number.isFinite(sentenceIndex)) return;
   state.activeSentence = { paragraphIndex, sentenceIndex };
   applyVisualSentenceHighlight(paragraphIndex, sentenceIndex);
-  const range = sourceSentenceRanges().find((item) => (
-    item.paragraphIndex === paragraphIndex && item.sentenceIndex === sentenceIndex
-  ));
+  const range = sourceRangeForVisualSentence(paragraphIndex, sentenceIndex, resultRoot);
   if (range) {
     const source = $("sourceText");
     try {

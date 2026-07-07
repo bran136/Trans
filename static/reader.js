@@ -38,8 +38,10 @@ const readerState = {
   mimoBalance: null,
   mimoBalanceError: "",
   mimoBalanceLoadedAt: 0,
+  mimoBalanceRetryAt: 0,
   mimoBalanceTimer: null,
   mimoBalanceRetryTimer: null,
+  mimoBalanceCountdownTimer: null,
   tocEditBookId: "",
   tocEditBook: null,
   tocEditChapters: [],
@@ -1459,7 +1461,10 @@ function formatMimoBalance() {
   if (!ttsReady()) return "";
   if (!balance) {
     const reason = readerState.mimoBalanceError || "查询失败";
-    return `MiMo 余额：${reason}，15 秒后重试`;
+    const retryLeft = Math.max(0, Math.ceil((readerState.mimoBalanceRetryAt - Date.now()) / 1000));
+    return retryLeft > 0
+      ? `MiMo 余额：${reason}，${retryLeft} 秒后重试`
+      : `MiMo 余额：${reason}，正在重试`;
   }
   if (!balance.total_balance || !balance.currency) return "MiMo 余额：未知";
   const symbol = balance.currency === "CNY" ? "¥" : `${balance.currency} `;
@@ -1473,9 +1478,27 @@ function renderMimoBalance() {
   node.hidden = !ttsReady();
 }
 
+function stopMimoBalanceCountdown() {
+  window.clearInterval(readerState.mimoBalanceCountdownTimer);
+  readerState.mimoBalanceCountdownTimer = null;
+}
+
+function startMimoBalanceCountdown() {
+  stopMimoBalanceCountdown();
+  renderMimoBalance();
+  readerState.mimoBalanceCountdownTimer = window.setInterval(() => {
+    renderMimoBalance();
+    if (!readerState.mimoBalanceRetryAt || Date.now() >= readerState.mimoBalanceRetryAt) {
+      stopMimoBalanceCountdown();
+    }
+  }, 1000);
+}
+
 async function loadMimoBalance() {
   if (document.hidden || !ttsReady()) return;
   window.clearTimeout(readerState.mimoBalanceRetryTimer);
+  readerState.mimoBalanceRetryAt = 0;
+  stopMimoBalanceCountdown();
   try {
     const data = await api("/api/reader/mimo-balance");
     readerState.mimoBalance = data.balance;
@@ -1484,7 +1507,9 @@ async function loadMimoBalance() {
   } catch (error) {
     readerState.mimoBalance = null;
     readerState.mimoBalanceError = error.message || "查询失败";
+    readerState.mimoBalanceRetryAt = Date.now() + 15 * 1000;
     readerState.mimoBalanceRetryTimer = window.setTimeout(loadMimoBalance, 15 * 1000);
+    startMimoBalanceCountdown();
   }
   renderMimoBalance();
 }
@@ -1492,9 +1517,11 @@ async function loadMimoBalance() {
 function startMimoBalanceRefresh() {
   window.clearInterval(readerState.mimoBalanceTimer);
   window.clearTimeout(readerState.mimoBalanceRetryTimer);
+  stopMimoBalanceCountdown();
   if (!ttsReady()) {
     readerState.mimoBalance = null;
     readerState.mimoBalanceError = "";
+    readerState.mimoBalanceRetryAt = 0;
     renderMimoBalance();
     return;
   }
