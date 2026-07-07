@@ -4,7 +4,8 @@ This directory contains fonts used by the local reader UI.
 
 - `JasonHandwriting1.woff2`
   - Local user-provided font file.
-  - Keep the original authorization record with the deployment owner.
+  - License status: no copyright restriction.
+  - Redistribution and web embedding are allowed.
 
 - `SourceHanSerifCN-Regular.otf`
   - Source: Adobe Source Han Serif, official GitHub release branch.
