@@ -50,22 +50,49 @@ const readerState = {
 };
 
 const $ = (id) => document.getElementById(id);
+const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || "";
 const TTS_BROWSER_CACHE_LIMIT = 12;
 const TTS_BROWSER_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const TTS_PREFETCH_MIN_ITEMS = 2;
 const TTS_PREFETCH_MAX_ITEMS = 5;
 const FONT_OPTIONS = [
   { id: "system", name: "系统字体", family: '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "微软雅黑", Arial, sans-serif', reliableOnIOS: true },
-  { id: "jason", name: "清松手写体", family: '"ReaderJasonHandwriting", "清松手写体", "JasonHandwriting", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
+  { id: "kai", name: "楷体", family: 'KaiTi, "楷体", serif', reliableOnIOS: false },
+  { id: "lxgw-wenkai", name: "霞鹜文楷", family: '"ReaderLXGWWenKai", "LXGW WenKai", "霞鹜文楷", KaiTi, "楷体", serif', reliableOnIOS: true },
   { id: "source-serif", name: "思源宋体", family: '"ReaderSourceHanSerif", "Source Han Serif CN", "思源宋体", SimSun, "宋体", serif', reliableOnIOS: true },
   { id: "source-sans", name: "思源黑体", family: '"ReaderSourceHanSans", "Source Han Sans CN", "思源黑体", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
-  { id: "lxgw-wenkai", name: "霞鹜文楷", family: '"ReaderLXGWWenKai", "LXGW WenKai", "霞鹜文楷", KaiTi, "楷体", serif', reliableOnIOS: true },
-  { id: "song", name: "宋体", family: 'SimSun, "宋体", serif', reliableOnIOS: false },
-  { id: "hei", name: "黑体", family: 'SimHei, "黑体", "Microsoft YaHei", sans-serif', reliableOnIOS: false },
-  { id: "kai", name: "楷体", family: 'KaiTi, "楷体", serif', reliableOnIOS: false },
-  { id: "serif", name: "衬线", family: 'Georgia, "Times New Roman", SimSun, serif', reliableOnIOS: false },
+  { id: "jason", name: "清松手写体", family: '"ReaderJasonHandwriting", "清松手写体", "JasonHandwriting", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
+  { id: "yshi-written", name: "写意体", family: '"ReaderYShiWritten", "YShi-Written", "写意体", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
+  { id: "peak-plus", name: "随峰体Plus", family: '"ReaderThePeakFontPlus", "The Peak Font Plus", "随峰体Plus", "隨峰體Plus", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
 ];
 const FONT_FAMILIES = Object.fromEntries(FONT_OPTIONS.map((font) => [font.id, font.family]));
+const FONT_WEB_FAMILIES = {
+  jason: "ReaderJasonHandwriting",
+  "source-serif": "ReaderSourceHanSerif",
+  "source-sans": "ReaderSourceHanSans",
+  "lxgw-wenkai": "ReaderLXGWWenKai",
+  "yshi-written": "ReaderYShiWritten",
+  "peak-plus": "ReaderThePeakFontPlus",
+};
+const FONT_DOWNLOAD_SIZES = {
+  jason: "4.1 MiB",
+  "source-serif": "8.0 MiB",
+  "source-sans": "5.9 MiB",
+  "lxgw-wenkai": "7.6 MiB",
+  "yshi-written": "1.7 MiB",
+  "peak-plus": "8.0 MiB",
+};
+const FONT_ASSET_URLS = {
+  jason: "/static/fonts/JasonHandwriting1.woff2?v=a937a66f",
+  "source-serif": "/static/fonts/SourceHanSerifCN-Regular.woff2?v=46fe8158",
+  "source-sans": "/static/fonts/SourceHanSansCN-Regular.woff2?v=e766621f",
+  "lxgw-wenkai": "/static/fonts/LXGWWenKai-Regular.woff2?v=8c92d1b4",
+  "yshi-written": "/static/fonts/YShiWritten-Regular.woff2?v=943d3985",
+  "peak-plus": "/static/fonts/ThePeakFontPlus-Regular.woff2?v=5f91f0d2",
+};
+const FONT_LOAD_PROBE = "霞鹜文楷 天地玄黄 ABC 123";
+const fontLoadPromises = new Map();
+let fontApplyGeneration = 0;
 
 function isIOSLike() {
   return /iPad|iPhone|iPod/.test(navigator.userAgent)
@@ -141,7 +168,11 @@ function syncReaderWakeLock() {
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
-    headers: { ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }), ...(options.headers || {}) },
+    headers: {
+      ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+      ...(options.method && !["GET", "HEAD"].includes(options.method.toUpperCase()) ? { "X-CSRF-Token": CSRF_TOKEN } : {}),
+      ...(options.headers || {}),
+    },
     ...options,
   });
   if (!response.ok) {
@@ -154,18 +185,24 @@ async function api(path, options = {}) {
   return response.json();
 }
 
-async function apiBlob(path, options = {}) {
+async function apiBlob(path, options = {}, onResponse = null) {
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.method && !["GET", "HEAD"].includes(options.method.toUpperCase()) ? { "X-CSRF-Token": CSRF_TOKEN } : {}),
+      ...(options.headers || {}),
+    },
     ...options,
   });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
     throw new Error(data.error || `请求失败：${response.status}`);
   }
+  const cacheState = response.headers.get("X-TTS-Cache") || "";
+  if (typeof onResponse === "function") onResponse({ cacheState });
   return {
     blob: await response.blob(),
-    cacheState: response.headers.get("X-TTS-Cache") || "",
+    cacheState,
   };
 }
 
@@ -173,6 +210,7 @@ function uploadWithProgress(path, form, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", path);
+    xhr.setRequestHeader("X-CSRF-Token", CSRF_TOKEN);
     xhr.upload.addEventListener("progress", (event) => {
       if (!event.lengthComputable) return;
       onProgress(Math.round((event.loaded / event.total) * 100));
@@ -1169,18 +1207,24 @@ async function fetchTtsAudio(index, token = readerState.ttsToken, scope = reader
   if (readerState.ttsPending.has(pendingKey)) return readerState.ttsPending.get(pendingKey);
   const text = sentenceText(normalizedIndex);
   if (!text || !hasReadableText(text)) throw new Error("没有可朗读文本");
-  const pending = apiBlob("/api/reader/tts", {
-    method: "POST",
-    body: JSON.stringify({ text }),
-  }).then(({ blob, cacheState }) => {
+  const pending = apiBlob(
+    "/api/reader/tts",
+    {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    },
+    ({ cacheState }) => {
+      const isCurrentSentence = Number(readerState.currentSentence) === normalizedIndex;
+      if (token === readerState.ttsToken && scope === readerState.ttsScope && readerState.reading && isCurrentSentence) {
+        setListenStatus(cacheState === "hit" ? "正在读取缓存" : "正在生成语音");
+      }
+    },
+  ).then(({ blob }) => {
     const url = URL.createObjectURL(blob);
     readerState.ttsPending.delete(pendingKey);
     if (scope !== readerState.ttsScope) {
       URL.revokeObjectURL(url);
       return "";
-    }
-    if (token === readerState.ttsToken && readerState.reading && cacheState === "hit") {
-      setListenStatus("正在读取缓存");
     }
     rememberTtsUrl(normalizedIndex, url, blob.size);
     return url;
@@ -1253,7 +1297,7 @@ async function playSentence(index, token = readerState.ttsToken) {
   highlightSentence(index, true);
   const scope = readerState.ttsScope;
   saveProgressSoon();
-  setListenStatus(readerState.ttsUrls.has(Number(index)) ? "正在读取缓存" : "正在准备语音");
+  setListenStatus(readerState.ttsUrls.has(Number(index)) ? "正在读取浏览器缓存" : "正在检查语音缓存");
   try {
     const url = await fetchTtsAudio(index, token, scope);
     if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
@@ -1343,14 +1387,187 @@ function updateReaderFont() {
   window.localStorage.setItem("readerFontSize", value);
 }
 
-function updateReaderFontFamily(fontId = "") {
+function fontCacheMarkerKey(fontId) {
+  return `readerFontCached:${fontId}:${FONT_ASSET_URLS[fontId] || "unknown"}`;
+}
+
+function rememberCachedFont(fontId) {
+  try {
+    window.localStorage.setItem(fontCacheMarkerKey(fontId), "1");
+  } catch {
+    // Private browsing or storage policies may disable localStorage.
+  }
+}
+
+function hasCachedFontMarker(fontId) {
+  try {
+    return window.localStorage.getItem(fontCacheMarkerKey(fontId)) === "1";
+  } catch {
+    return false;
+  }
+}
+
+async function detectCachedFont(fontId) {
+  if (hasCachedFontMarker(fontId)) return true;
+  const url = FONT_ASSET_URLS[fontId];
+  if (!url) return false;
+  try {
+    const response = await fetch(url, {
+      cache: "only-if-cached",
+      credentials: "same-origin",
+      mode: "same-origin",
+    });
+    if (!response.ok) return false;
+    rememberCachedFont(fontId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function setFontLoadState(fontId, state) {
+  const status = document.querySelector(`.font-load-status[data-font="${fontId}"]`);
+  const loadButton = document.querySelector(`.font-load-button[data-font="${fontId}"]`);
+  if (!status) return;
+  const labels = {
+    idle: "未加载",
+    loading: "加载中",
+    ready: "已加载",
+    failed: "加载失败",
+  };
+  const size = FONT_DOWNLOAD_SIZES[fontId];
+  status.dataset.state = state;
+  status.textContent = `${labels[state] || labels.idle}${size ? ` · ${size}` : ""}`;
+  if (loadButton) {
+    loadButton.disabled = state === "loading" || state === "ready";
+    loadButton.textContent = state === "failed" ? "重试" : state === "ready" ? "完成" : state === "loading" ? "加载中" : "加载";
+  }
+}
+
+function waitForFontStatusPaint() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
+  });
+}
+
+async function loadFreshReaderFontFace(fontId) {
+  const webFamily = FONT_WEB_FAMILIES[fontId];
+  const url = FONT_ASSET_URLS[fontId];
+  if (typeof FontFace !== "function" || !document.fonts?.add || !url) {
+    const faces = await document.fonts.load(`400 18px "${webFamily}"`, FONT_LOAD_PROBE);
+    return faces.length > 0;
+  }
+  const face = new FontFace(webFamily, `url("${url}") format("woff2")`, {
+    style: "normal",
+    weight: "400",
+  });
+  document.fonts.add(face);
+  try {
+    await face.load();
+    return face.status === "loaded";
+  } catch {
+    document.fonts.delete?.(face);
+    return false;
+  }
+}
+
+async function ensureReaderFontLoaded(fontId, forceRetry = false) {
+  const webFamily = FONT_WEB_FAMILIES[fontId];
+  if (!webFamily) return true;
+  if (!document.fonts?.load) {
+    rememberCachedFont(fontId);
+    setFontLoadState(fontId, "ready");
+    return true;
+  }
+  if (document.fonts.check(`400 18px "${webFamily}"`, FONT_LOAD_PROBE)) {
+    rememberCachedFont(fontId);
+    setFontLoadState(fontId, "ready");
+    return true;
+  }
+  if (!fontLoadPromises.has(fontId)) {
+    setFontLoadState(fontId, "loading");
+    const loadPromise = (forceRetry
+      ? waitForFontStatusPaint().then(() => loadFreshReaderFontFace(fontId))
+      : document.fonts.load(`400 18px "${webFamily}"`, FONT_LOAD_PROBE).then((faces) => faces.length > 0))
+      .catch(() => false)
+      .finally(() => fontLoadPromises.delete(fontId));
+    fontLoadPromises.set(fontId, loadPromise);
+  }
+  const loaded = await fontLoadPromises.get(fontId);
+  if (loaded) rememberCachedFont(fontId);
+  setFontLoadState(fontId, loaded ? "ready" : "failed");
+  return loaded;
+}
+
+async function activateCachedReaderFont(fontId) {
+  const webFamily = FONT_WEB_FAMILIES[fontId];
+  if (!webFamily) return true;
+  if (document.fonts?.check?.(`400 18px "${webFamily}"`, FONT_LOAD_PROBE)) {
+    rememberCachedFont(fontId);
+    setFontLoadState(fontId, "ready");
+    return true;
+  }
+  if (fontLoadPromises.has(fontId)) return ensureReaderFontLoaded(fontId);
+  if (!(await detectCachedFont(fontId))) {
+    const status = document.querySelector(`.font-load-status[data-font="${fontId}"]`);
+    if (status?.dataset.state !== "loading") setFontLoadState(fontId, "idle");
+    return false;
+  }
+  const loaded = await ensureReaderFontLoaded(fontId);
+  if (!loaded) setFontLoadState(fontId, "idle");
+  return loaded;
+}
+
+function activateCachedReaderFonts() {
+  availableFontOptions().forEach((font) => {
+    if (!FONT_WEB_FAMILIES[font.id]) return;
+    activateCachedReaderFont(font.id).then((loaded) => {
+      if (!loaded) return;
+      const button = document.querySelector(`.font-option[data-font="${font.id}"]`);
+      if (button) button.style.fontFamily = font.family;
+    });
+  });
+}
+
+async function updateReaderFontFamily(fontId = "", announce = true) {
   const active = document.querySelector(".font-option.active");
   const value = normalizeFontId(fontId || active?.dataset.font || "system");
-  $("bookContent").style.setProperty("--reader-font-family", FONT_FAMILIES[value] || FONT_FAMILIES.system);
+  const generation = ++fontApplyGeneration;
+  const content = $("bookContent");
   window.localStorage.setItem("readerFontFamily", value);
   document.querySelectorAll(".font-option").forEach((button) => {
     button.classList.toggle("active", button.dataset.font === value);
   });
+  if (!FONT_WEB_FAMILIES[value]) {
+    content.dataset.fontState = "ready";
+    content.style.setProperty("--reader-font-family", FONT_FAMILIES[value] || FONT_FAMILIES.system);
+    return;
+  }
+  content.dataset.fontState = "loading";
+  if (announce && readerState.currentBook) {
+    const fontName = FONT_OPTIONS.find((font) => font.id === value)?.name || "字体";
+    setStatus(`正在加载${fontName}`);
+  }
+  const loaded = await ensureReaderFontLoaded(value);
+  if (generation !== fontApplyGeneration) return;
+  if (!loaded) {
+    content.dataset.fontState = "failed";
+    content.style.setProperty("--reader-font-family", FONT_FAMILIES.system);
+    if (announce) setStatus("字体加载失败，已临时使用系统字体");
+    return;
+  }
+  content.dataset.fontState = "ready";
+  content.style.removeProperty("--reader-font-family");
+  void content.offsetWidth;
+  content.style.setProperty("--reader-font-family", FONT_FAMILIES[value]);
+  if (announce && readerState.currentBook) setStatus(readerState.currentBook.title);
+  const selectedButton = document.querySelector(`.font-option[data-font="${value}"]`);
+  if (selectedButton) selectedButton.style.fontFamily = FONT_FAMILIES[value];
+}
+
+function refreshSelectedReaderFont() {
+  const value = normalizeFontId(window.localStorage.getItem("readerFontFamily") || "system");
+  updateReaderFontFamily(value, false);
 }
 
 function applyReaderTheme(value) {
@@ -1375,25 +1592,53 @@ function renderFontPicker() {
   if (!picker) return;
   picker.innerHTML = "";
   availableFontOptions().forEach((font) => {
+    const card = document.createElement("div");
+    card.className = "font-option-card";
     const button = document.createElement("button");
     button.className = "font-option";
     button.type = "button";
     button.dataset.font = font.id;
-    button.style.fontFamily = font.family;
     button.textContent = font.name;
-    button.addEventListener("pointerenter", () => {
-      document.querySelectorAll(".font-option").forEach((item) => item.classList.remove("is-hovered"));
-      button.classList.add("is-hovered");
-    });
-    button.addEventListener("pointerleave", () => button.classList.remove("is-hovered"));
-    button.addEventListener("pointercancel", () => button.classList.remove("is-hovered"));
     button.addEventListener("click", () => {
-      document.querySelectorAll(".font-option").forEach((item) => item.classList.remove("active", "is-hovered"));
+      document.querySelectorAll(".font-option").forEach((item) => item.classList.remove("active"));
       button.classList.add("active");
       button.blur();
       updateReaderFontFamily(font.id);
     });
-    picker.appendChild(button);
+    card.appendChild(button);
+
+    const tools = document.createElement("div");
+    tools.className = "font-load-tools";
+    const status = document.createElement("span");
+    status.className = "font-load-status";
+    status.dataset.font = font.id;
+    status.setAttribute("aria-live", "polite");
+    tools.appendChild(status);
+    if (FONT_WEB_FAMILIES[font.id]) {
+      const loadButton = document.createElement("button");
+      loadButton.className = "font-load-button";
+      loadButton.type = "button";
+      loadButton.dataset.font = font.id;
+      loadButton.setAttribute("aria-label", `预先加载${font.name}`);
+      loadButton.addEventListener("click", async () => {
+        const retry = status.dataset.state === "failed";
+        const loaded = await ensureReaderFontLoaded(font.id, retry);
+        if (loaded) {
+          button.style.fontFamily = font.family;
+          if (button.classList.contains("active")) updateReaderFontFamily(font.id, false);
+        }
+      });
+      tools.appendChild(loadButton);
+      const loaded = document.fonts?.check?.(`400 18px "${FONT_WEB_FAMILIES[font.id]}"`, FONT_LOAD_PROBE);
+      card.appendChild(tools);
+      picker.appendChild(card);
+      setFontLoadState(font.id, loaded ? "ready" : "idle");
+      return;
+    }
+    status.dataset.state = "ready";
+    status.textContent = "无需加载";
+    card.appendChild(tools);
+    picker.appendChild(card);
   });
 }
 
@@ -1558,9 +1803,7 @@ function renderTtsConfig() {
   $("ttsApiKey").placeholder = config.api_key_configured ? "已配置，留空不修改" : "未配置";
   $("ttsBaseUrl").value = config.base_url || "";
   $("ttsBaseUrl").disabled = !config.allow_custom_base_url;
-  $("ttsBaseUrl").title = config.allow_custom_base_url
-    ? "可在服务器 .env 中关闭自定义地址"
-    : "服务器 .env 中 ALLOW_CUSTOM_MIMO_BASE_URL=false，前端不可修改";
+  $("ttsBaseUrl").title = "服务端接口地址只能在服务器 .env 中修改";
   $("ttsModel").innerHTML = "";
   const modelOptions = config.model_options || [];
   const models = modelOptions.includes(config.model) ? modelOptions : [config.model, ...modelOptions].filter(Boolean);
@@ -1782,8 +2025,8 @@ $("ttsBtn").addEventListener("click", () => {
   openReaderDialog($("ttsDialog"));
 });
 $("settingsBtn").addEventListener("click", () => {
-  document.querySelectorAll(".font-option").forEach((item) => item.classList.remove("is-hovered"));
   openReaderDialog($("settingsDialog"));
+  activateCachedReaderFonts();
 });
 $("closeManageBtn").addEventListener("click", () => $("manageDialog").close());
 $("closeTocBtn").addEventListener("click", () => $("tocDialog").close());
@@ -1803,12 +2046,14 @@ window.addEventListener("keydown", (event) => {
 });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
+    refreshSelectedReaderFont();
     syncReaderWakeLock();
     refreshMimoBalanceWhenVisible();
   } else {
     releaseReaderWakeLock();
   }
 });
+window.addEventListener("pageshow", refreshSelectedReaderFont);
 window.addEventListener("pagehide", () => {
   readerState.wakeLockWanted = false;
   releaseReaderWakeLock();

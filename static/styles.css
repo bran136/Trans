@@ -13,8 +13,8 @@
 }
 
 @font-face {
-  font-family: "JasonHandwriting";
-  src: url("/static/fonts/JasonHandwriting1.woff2") format("woff2");
+  font-family: "AppYShiWritten";
+  src: url("/static/fonts/YShiWritten-Regular.woff2?v=943d3985") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: swap;
@@ -181,6 +181,15 @@ textarea:focus {
   box-shadow: 0 0 0 4px rgba(107, 125, 227, 0.16);
 }
 
+input[type="checkbox"] {
+  padding: 0;
+  accent-color: #1677ff;
+}
+
+input[type="checkbox"]:focus {
+  box-shadow: none;
+}
+
 textarea:focus {
   border-color: transparent;
   box-shadow: none;
@@ -276,6 +285,11 @@ textarea:disabled {
   font-weight: 800;
 }
 
+.home-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .tool-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -303,14 +317,11 @@ textarea:disabled {
   border-color: rgba(107, 125, 227, 0.42);
 }
 
-.tool-card span {
-  color: var(--accent-strong);
-  font-size: 13px;
-  font-weight: 900;
-}
-
 .tool-card strong {
-  font-size: 24px;
+  color: var(--accent-strong);
+  font-family: "AppYShiWritten", "Microsoft YaHei", "微软雅黑", sans-serif;
+  font-size: 30px;
+  font-weight: 700;
 }
 
 .app-shell {
@@ -352,8 +363,8 @@ textarea:disabled {
 .brand-title {
   display: inline-block;
   color: #3848bd;
-  font-family: "JasonHandwriting", "Microsoft YaHei", "微软雅黑", cursive;
-  font-weight: 400;
+  font-family: "AppYShiWritten", "Microsoft YaHei", "微软雅黑", sans-serif;
+  font-weight: 700;
   text-shadow: 0 2px 0 rgba(255, 255, 255, 0.94), 0 12px 28px rgba(107, 125, 227, 0.24);
 }
 
@@ -750,11 +761,79 @@ label {
   line-height: 1.35;
 }
 
+.metric-card small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.monitor-password-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr)) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.monitor-password-row input,
+.monitor-password-row button {
+  height: 34px;
+  border-radius: 10px;
+}
+
+.monitor-password-row button {
+  padding: 0 12px;
+}
+
+.monitor-password-row small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
 dialog {
   width: min(1180px, calc(100vw - 28px));
   border-radius: 16px;
   border: 0;
   padding: 0;
+}
+
+.deepseek-toggle-row {
+  align-items: center;
+  gap: 14px;
+}
+
+.cache-setting-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 25px;
+  padding-left: 12px;
+  border-left: 1px solid var(--line);
+}
+
+.cache-setting-inline span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.cache-setting-inline strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.cache-setting-inline .ghost {
+  flex: 0 0 auto;
+  height: 25px;
+  padding: 0 8px;
+  border-radius: 8px;
+  font-size: 11px;
 }
 
 #settingsDialog {
@@ -1194,6 +1273,14 @@ dialog::backdrop {
   .settings-grid,
   .metric-grid {
     grid-template-columns: 1fr;
+  }
+
+  .monitor-password-row {
+    grid-template-columns: 1fr;
+  }
+
+  .monitor-password-row small {
+    grid-column: 1;
   }
 
   .swap {

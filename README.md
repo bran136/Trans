@@ -2,7 +2,7 @@
 
 一个本地工具网站，共用一个密码登录入口，当前包含“在线翻译”和“在线读书”两个独立模块。
 
-在线翻译支持 DeepSeek 服务端代理、谷歌翻译浏览器直连、多引擎对比、历史记录、服务监控、DeepSeek 余额显示和本地缓存。在线读书支持本地书架、TXT/EPUB/PDF 导入、章节阅读、进度保存、字体切换、黑暗模式和 Xiaomi MiMo 听书。
+在线翻译支持 DeepSeek 服务端代理、谷歌翻译浏览器直连、多引擎对比、历史记录、服务监控、DeepSeek 余额显示和持久化缓存。在线读书支持本地书架、TXT/EPUB/PDF 导入、章节阅读、进度保存、字体切换、黑暗模式和 Xiaomi MiMo 听书。
 
 ## 功能概览
 
@@ -17,8 +17,12 @@
 ```bash
 cd ./path_dir
 cp .env.example .env
+python3 -m pip install -r requirements.txt
+# 先编辑 .env，至少替换 APP_PASSWORD
 python3 app.py
 ```
+
+`requirements.txt` 约束了 Flask、requests、pypdf、urllib3 和 idna 的安全最低版本。已有环境也应重新执行安装命令完成升级，不能只重启旧环境。
 
 默认地址：
 
@@ -26,7 +30,7 @@ python3 app.py
 http://127.0.0.1:31000
 ```
 
-默认端口由 `.env` 中的 `PORT` 控制。
+默认只监听 `127.0.0.1`，端口由 `.env` 中的 `PORT` 控制。需要从其他机器直接访问时，可以把 `HOST` 改为 `0.0.0.0` 并使用强密码；更推荐继续监听本机，通过 HTTPS 反向代理访问。
 
 主要入口：
 
@@ -43,12 +47,13 @@ http://127.0.0.1:31000
 ./path_dir/.env                    真实运行配置，包含密码和 API Key
 ./path_dir/.env.example            示例配置，不放真实密钥
 ./path_dir/config/app_config.json  普通页面配置，缺失时自动生成，不保存真实 API Key
+./path_dir/config/deepseek_cache.sqlite3  DeepSeek 翻译持久化缓存
 ./path_dir/logs/app.log            应用日志
 ./path_dir/reader_data             书籍、章节缓存、TTS 音频缓存
 ./path_dir/static/fonts            页面字体资产和许可说明
 ```
 
-`reader_data/`、`.env`、日志等运行数据已加入 `.gitignore`。
+`reader_data/`、`.env`、DeepSeek 缓存和日志等运行数据已加入 `.gitignore`。
 
 ## 环境配置
 
@@ -56,9 +61,11 @@ http://127.0.0.1:31000
 
 ```env
 PORT=31000
-APP_PASSWORD=changeme
-SECRET_KEY=replace-with-a-long-random-string
+HOST=127.0.0.1
+APP_PASSWORD=replace-with-a-strong-password
+SECRET_KEY=
 SESSION_COOKIE_SECURE=false
+ALLOW_ROOT_RUN=true
 
 DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
@@ -81,6 +88,9 @@ TTS_CACHE_TTL_DAYS=90
 
 - `.env` 是真实运行配置，可以放真实密码和 API Key。
 - `.env.example` 是示例文件，不应放真实密钥。
+- `APP_PASSWORD` 至少使用 12 位非默认密码；程序会拒绝用示例密码或常见弱密码提供服务。
+- `SECRET_KEY` 留空时会自动生成到 `config/secret_key`，文件权限为 `0600`；也可以自己填写至少 32 位随机值。
+- `HOST` 控制服务监听地址：`127.0.0.1` 仅允许本机访问；`0.0.0.0` 会监听所有网络接口，只有确实需要从其他机器直连时才应使用。
 - 网页配置页提交新 API Key 后，服务端会写入 `.env`；前端只能看到“已配置”，不会拿到真实 Key。
 - 如果只通过 HTTPS 域名访问，建议设置 `SESSION_COOKIE_SECURE=true`。
 - 如果直接用 `http://服务器IP:31000` 调试，`SESSION_COOKIE_SECURE=true` 会导致浏览器不发送登录 Cookie。
@@ -126,19 +136,27 @@ https://api.deepseek.com
 ALLOW_CUSTOM_DEEPSEEK_BASE_URL=true
 ```
 
-开启后仍会拒绝本机、内网、保留地址等非公网地址。
+开启后仍只接受 HTTPS，并拒绝本机、内网、保留地址等非公网地址。为避免浏览器用户改变携带 API Key 的服务端请求目的地，Base URL 只能在服务器 `.env` 中修改，网页中始终只读。
 
 ## DeepSeek 缓存与费用
 
-服务端有一层本地内存缓存：
+在线翻译的“配置 → DeepSeek”会显示当前缓存条数和容量上限，并提供带二次确认的清空缓存按钮。
+
+服务端使用 SQLite 持久化缓存：
 
 - 缓存上限：500 条
+- 每条翻译完成后立即通过事务写入 `config/deepseek_cache.sqlite3`
+- 服务重启后会继续读取原缓存，不会因进程退出而清空
+- 多个 Gunicorn worker 共用同一个缓存文件
+- 缓存按最近使用时间淘汰，超过 500 条时自动删除最久未使用的记录
 - DeepSeek 按非空段落缓存，不再按整篇原文缓存
 - 空白行不进入缓存，但展示结果会按原文换行结构拼回
 - 原文没有空白行时，DeepSeek 结果也不会额外插入空白行
 - 超过 12000 字符的单段翻译结果不缓存
 - 单次翻译文本上限：20000 字符
 - 命中本地缓存时不请求 DeepSeek API，不消耗 token
+
+缓存文件包含翻译结果，权限会收紧为 `0600`，其所在 `config/` 目录为 `0700`。缓存不会提交到 Git；如果翻译内容敏感，备份和迁移时也应按私人数据处理。可在“在线翻译 → 配置”中清空。
 
 缓存键包含：
 
@@ -206,7 +224,7 @@ GET /api/deepseek/balance
 - EPUB 会限制解压后总大小，避免异常文件占用过多资源。
 - EPUB 支持读取封面和正文图片。
 - TXT 会智能识别章节；书籍管理中可重新解析，TXT 还支持清除目录信息后作为全文阅读。
-- PDF 使用当前环境已有的 `pypdf` 提取文本；扫描版 PDF 如果没有文本层，无法直接阅读。
+- PDF 使用 `pypdf>=6.14.2` 提取文本；该最低版本包含多项恶意 PDF 资源耗尽修复。扫描版 PDF 如果没有文本层，无法直接阅读。
 - MOBI/AZW3 暂未启用。
 
 阅读功能：
@@ -217,19 +235,30 @@ GET /api/deepseek/balance
 - 保存当前章节和句子进度。
 - 支持目录跳转、上一章、下一章。
 - 支持字体大小、字体切换和黑暗模式。
+- 自定义字体全部使用 WOFF2；包含写意体和随峰体 Plus 后，原始字体资源约 68.9MiB，网页字体约 35.4MiB。字体按选择加载，不会在页面启动时下载全部资源。
+- 字体设置中会显示每款字体的大小和“未加载 / 加载中 / 已加载 / 加载失败”状态，并提供小型手动加载按钮。打开阅读设置时会自动激活已缓存的字体，鼠标经过字体不会触发下载。
+- 加载成功的带版本字体会进入浏览器私有长期缓存；字体文件升级时需同步更新 CSS 中的内容哈希，避免继续使用旧文件。
+- 浏览器会显式确认所选字体加载成功，并在页面从后台恢复时重新校验，避免 Chrome/macOS 长时间阅读后回退到系统字体。
 - 手机端顶部阅读控制区固定，方便长文阅读时切换章节。
 
 内置字体选项包括：
 
 - 系统字体
-- 清松手写体
+- 楷体
+- 霞鹜文楷
 - 思源宋体
 - 思源黑体
-- 霞鹜文楷
-- 宋体
-- 黑体
-- 楷体
-- 衬线
+- 清松手写体
+- 写意体
+- 随峰体Plus
+
+字体来源与版权声明：
+
+- 思源宋体来自 Adobe 官方的 [Source Han Serif](https://github.com/adobe-fonts/source-han-serif) 项目。字体内版权声明为 © 2017-2024 Adobe，保留字体名称 `Source`，使用 SIL Open Font License 1.1。
+- 思源黑体来自 Adobe 官方的 [Source Han Sans](https://github.com/adobe-fonts/source-han-sans) 项目。字体内版权声明为 © 2014-2025 Adobe，保留字体名称 `Source`，使用 SIL Open Font License 1.1。
+- 其他字体来源包括 [清松手写体官方仓库](https://github.com/jasonhandwriting/JasonHandwriting)、[霞鹜文楷官方仓库](https://github.com/lxgw/LxgwWenKai)、[写意体官方仓库](https://github.com/Steve-Yuu/YShi-Written) 和 [随峰体 Plus 官方页面](https://cjkfonts.io/blog/ThePeakFontPlus)。
+
+字体的完整来源、转换说明和许可证信息见 `static/fonts/FONT_LICENSES.md`；SIL Open Font License 1.1 全文见 `static/fonts/OFL-1.1.txt`。
 
 页面字体资产和许可说明放在：
 
@@ -249,8 +278,7 @@ https://mimo.xiaomi.com/mimo-v2-5-tts
 
 - 启用或关闭听书
 - MiMo API Key
-- 接口地址
-- 余额接口地址
+- 查看接口地址（地址只能由服务器 `.env` 修改）
 - 余额 Cookie
 - 模型
 - 音色
@@ -326,15 +354,16 @@ MiMo 余额显示：
 - 音色
 - 音频格式
 - 风格/音色描述
-- 文本优化选项
 
 因此切换音色不会删除旧的服务器缓存；以后切回同一音色、同一文本、同一配置时仍可命中。命中服务器缓存时不会调用 MiMo API，不消耗 token。
+
+缓存键只包含实际影响 MiMo 音频结果的参数。当前版本不再读取旧缓存规则生成的文件，升级时应清空旧音频缓存，之后所有音频只按新规则保存。页面会先显示“正在检查语音缓存”，收到服务器响应后再准确区分“正在读取缓存”和“正在生成语音”，后台预加载不会覆盖当前句的状态。
 
 听书会按当前句长度动态预取后续句子：当前句较短时多预取几句，当前句较长时少预取，尽量减少句与句之间的卡顿，同时控制并发和资源占用。
 
 ## 监控
 
-登录后点右上角“监控”，可以查看：
+登录后在主页点“监控”，可以查看：
 
 应用程序：
 
@@ -343,6 +372,7 @@ MiMo 余额显示：
 - CPU 占用率
 - 内存占用：占用量和占用率
 - DeepSeek 缓存条数
+- 听书音频缓存条数、容量、上限和有效期
 
 系统：
 
@@ -354,8 +384,8 @@ MiMo 余额显示：
 操作：
 
 - 刷新
-- 清空 DeepSeek 本地缓存，带二次确认
 - 重启服务，带二次确认
+- 验证当前密码后修改总入口访问密码；新旧密码不能相同，修改后其他浏览器中的旧会话会失效
 
 监控刷新频率为 5 秒。只有打开监控弹窗时才会轮询 `/api/status`，关闭后停止刷新。
 
@@ -394,28 +424,42 @@ MiMo 余额显示：
 ## 安全说明
 
 - 登录密码不会返回前端。
+- 修改总入口密码必须先验证当前密码，新旧密码不能相同；连续验证失败会触发限速。
 - API Key 保存到 `.env`。
 - MiMo 余额 Cookie 保存到 `.env`，普通页面配置文件不保存真实 Cookie。
 - 浏览器配置页只允许提交新 Key。
 - 服务端不会把真实 Key 或已保存的余额 Cookie 返回给浏览器。
 - 配置页只显示“已配置，留空不修改”。
 - `.env` 写入会清洗换行，避免注入额外环境变量。
+- `.env`、应用密钥、DeepSeek 缓存、书籍和音频缓存文件使用私有权限；它们仍属于服务器敏感数据，不应公开或提交到 Git。
 - Session Cookie 设置了 `HttpOnly` 和 `SameSite=Lax`。
 - 可通过 `SESSION_COOKIE_SECURE=true` 强制会话 Cookie 仅在 HTTPS 下发送。
 - 登录失败带轻量限速：同一 IP 在 5 分钟内失败 8 次后会暂时拒绝继续尝试。
 - 写请求会检查 `Origin` 和 `Referer`，降低 CSRF 风险。
-- 响应头包含 `X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: same-origin`。
+- 所有写请求还必须携带会话内 CSRF token；只伪造表单或省略 `Origin` 无法绕过。
+- 响应头包含 CSP、HSTS、`X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: same-origin` 和收紧的 `Permissions-Policy`。
+- 登录页、功能页和 API 响应使用 `Cache-Control: no-store`，避免私人书籍和配置残留在共享缓存。
+- 修改访问密码后，其他浏览器中的旧登录 Cookie 会立即失效。
 - 监控接口只读取固定 `/proc` 信息和项目目录磁盘占用，不接受浏览器传路径。
 - 重启接口不通过 shell 拼接浏览器参数，但登录用户可以触发服务重启，因此密码必须足够强。
 - 书籍导入只写入 `reader_data/books/<book_id>`，`book_id` 限制为 32 位十六进制字符串。
 - 书籍导入限制文件大小和扩展名，EPUB 解析限制解压总量和单图片大小，降低异常文件消耗资源的风险。
 - EPUB 图片资源只允许读取书籍 EPUB 内部的图片文件，并限制单图大小。
 - EPUB 不执行书内脚本，只提取文本和图片。
-- DeepSeek 和 MiMo 的自定义接口地址默认关闭；即使开启，也会拒绝本机、内网、保留地址等非公网地址，降低 SSRF 风险。
+- DeepSeek 和 MiMo 的自定义接口地址默认关闭；即使在服务器开启，也会拒绝本机、内网、保留地址，不跟随上游重定向，并且浏览器无权修改地址，降低 SSRF 和 API Key 外泄风险。
+- EPUB 限制文件数、单文件大小和总解压大小；普通外部 `DOCTYPE` 会在解析前移除且不会访问外部 DTD，实体声明和内部 DTD 会被拒绝；PDF 限制页数和总提取文本量。
 
-如果通过公网访问本工具，建议在 Nginx 上配置 HTTPS。否则浏览器首次提交密码或 API Key 时，请求会经过当前 HTTP 连接，存在明文传输风险。
+如果通过公网访问本工具，必须在 Nginx、Caddy 或 Cloudflare 上配置 HTTPS，并设置 `SESSION_COOKIE_SECURE=true`。使用 Cloudflare 时应选择 `Full (strict)`，避免 Cloudflare 到源站之间退回明文 HTTP。浏览器请求里的密码不是客户端哈希值，而是由 HTTPS 连接加密传输；服务端 `.env` 仍属于必须保护的敏感文件。
 
-服务如果以 root 运行，风险会更高。更稳妥的生产做法是使用单独低权限用户运行，并交给 systemd、gunicorn 或类似进程管理器管理。
+示例配置为了兼容当前部署，设置了 `ALLOW_ROOT_RUN=true`，因此允许服务由 root 启动。如果删除该配置或改为 `false`，程序会拒绝以 root 启动或处理请求。这个开关只是显式解除保护，并不能降低 root 服务被利用后的系统风险；公开部署仍建议使用单独低权限用户，并交给 systemd、gunicorn 或类似进程管理器管理。
+
+如果之前曾用 root 运行，切换用户前要把 `.env`、`config/`、`logs/` 和 `reader_data/` 的所有权交给新的服务用户；不要把整个系统目录开放成可写。例如服务用户叫 `trans` 时，可按实际存在的路径执行 `chown -R trans:trans ...`。书籍、缓存、配置和日志会使用尽量收紧的目录/文件权限。
+
+生产环境示例（仍只监听本机，由 Nginx/Caddy 提供 HTTPS）：
+
+```bash
+gunicorn --workers 2 --bind 127.0.0.1:31000 app:app
+```
 
 ## 命令行操作
 
@@ -452,9 +496,11 @@ ss -ltnp 'sport = :31000'
 ## 注意
 
 - 本项目使用 GNU Affero General Public License v3.0，许可证全文见 `LICENSE`。
+- `static/fonts/` 中的字体不适用项目 AGPL；其版权和再分发条件见 `static/fonts/FONT_LICENSES.md` 与 `static/fonts/OFL-1.1.txt`。
 - 如果基于本项目修改后作为在线服务提供给用户使用，也需要按 AGPL-3.0 向这些用户提供对应源码。
 - 外部贡献默认按 AGPL-3.0 许可进入本项目。
 - 不要把真实 `.env` 提交到公开仓库。
+- 不要把 `config/deepseek_cache.sqlite3` 提交到公开仓库，其中包含翻译结果。
 - 不要把 `reader_data/` 提交到公开仓库，里面可能包含私人书籍和 TTS 音频缓存。
 - 修改 `.env` 后需要重启服务。
 - 修改模板或后端代码后需要重启服务。

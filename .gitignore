@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 .env
 config/app_config.json
+config/secret_key
+config/deepseek_cache.sqlite3
+config/deepseek_cache.sqlite3-*
 logs/*.log
 logs/*.log.*
 nohup.out

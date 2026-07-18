@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Trans工具</title>
     <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
   </head>
@@ -13,25 +14,97 @@
           <h1>Trans工具</h1>
           <p>选择要使用的工具</p>
         </div>
-        <button class="ghost" id="logoutBtn" type="button">退出</button>
+        <div class="home-actions">
+          <button class="ghost" id="monitorBtn" type="button">监控</button>
+          <button class="ghost" id="logoutBtn" type="button">退出</button>
+        </div>
       </header>
       <section class="tool-grid">
         <a class="tool-card" href="{{ url_for('translate_page') }}">
-          <span>在线翻译</span>
-          <strong>实时在线翻译</strong>
+          <strong>在线翻译</strong>
         </a>
         <a class="tool-card" href="{{ url_for('reader_page') }}">
-          <span>在线读书</span>
-          <strong>本地书架与听书</strong>
+          <strong>在线读书</strong>
         </a>
       </section>
     </main>
+
+    <dialog id="monitorDialog">
+      <section class="monitor-panel">
+        <div class="dialog-head">
+          <h2>服务监控</h2>
+          <div class="dialog-actions compact-actions">
+            <button class="ghost" id="refreshStatusBtn" type="button">刷新</button>
+            <button class="danger-btn" id="restartServiceBtn" type="button">重启服务</button>
+            <button class="ghost" id="closeMonitorBtn" type="button">关闭</button>
+          </div>
+        </div>
+        <div id="monitorMessage" class="config-message" hidden></div>
+        <div class="monitor-sections">
+          <section class="monitor-section">
+            <h3>应用服务</h3>
+            <div class="metric-grid service-metrics">
+              <div class="metric-card">
+                <span>进程 PID</span>
+                <strong id="metricPid">-</strong>
+              </div>
+              <div class="metric-card">
+                <span>运行时间</span>
+                <strong id="metricUptime">-</strong>
+              </div>
+              <div class="metric-card">
+                <span>CPU 占用率</span>
+                <strong id="metricAppCpu">-</strong>
+              </div>
+              <div class="metric-card">
+                <span>内存占用</span>
+                <strong id="metricAppMemory">-</strong>
+              </div>
+              <div class="metric-card">
+                <span>DeepSeek 缓存</span>
+                <strong id="metricCache">-</strong>
+              </div>
+              <div class="metric-card">
+                <span>音频缓存</span>
+                <strong id="metricTtsCacheEntries">-</strong>
+                <small id="metricTtsCacheDetail">-</small>
+              </div>
+            </div>
+          </section>
+          <section class="monitor-section">
+            <h3>系统</h3>
+            <div class="metric-grid system-metrics">
+              <div class="metric-card">
+                <span>CPU 占用率</span>
+                <strong id="metricSystemCpu">-</strong>
+              </div>
+              <div class="metric-card">
+                <span>内存占用</span>
+                <strong id="metricSystemMemory">-</strong>
+              </div>
+              <div class="metric-card">
+                <span>系统负载</span>
+                <strong id="metricLoad">-</strong>
+              </div>
+              <div class="metric-card">
+                <span>磁盘</span>
+                <strong id="metricDisk">-</strong>
+              </div>
+            </div>
+          </section>
+          <section class="monitor-section">
+            <h3>访问密码</h3>
+            <div class="monitor-password-row">
+              <input id="currentPassword" type="password" maxlength="256" autocomplete="current-password" aria-label="当前访问密码" placeholder="输入当前密码">
+              <input id="newPassword" type="password" minlength="12" maxlength="256" autocomplete="new-password" aria-label="新的总入口访问密码" placeholder="输入新密码（至少 12 位）">
+              <button class="primary" id="savePasswordBtn" type="button">修改密码</button>
+              <small>验证当前密码后才能修改；其他浏览器需要重新登录</small>
+            </div>
+          </section>
+        </div>
+      </section>
+    </dialog>
     <div class="version-badge">v{{ app_version() }}</div>
-    <script>
-      document.getElementById("logoutBtn").addEventListener("click", async () => {
-        await fetch("/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-        window.location.href = "/login";
-      });
-    </script>
+    <script src="{{ asset_url('home.js') }}"></script>
   </body>
 </html>

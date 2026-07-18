@@ -22,25 +22,49 @@ html.reader-dark-root body {
 
 @font-face {
   font-family: "ReaderJasonHandwriting";
-  src: url("/static/fonts/JasonHandwriting1.woff2") format("woff2");
+  src: url("/static/fonts/JasonHandwriting1.woff2?v=a937a66f") format("woff2");
+  font-style: normal;
+  font-weight: 400;
   font-display: swap;
 }
 
 @font-face {
   font-family: "ReaderSourceHanSerif";
-  src: url("/static/fonts/SourceHanSerifCN-Regular.otf") format("opentype");
+  src: url("/static/fonts/SourceHanSerifCN-Regular.woff2?v=46fe8158") format("woff2");
+  font-style: normal;
+  font-weight: 400;
   font-display: swap;
 }
 
 @font-face {
   font-family: "ReaderSourceHanSans";
-  src: url("/static/fonts/SourceHanSansCN-Regular.otf") format("opentype");
+  src: url("/static/fonts/SourceHanSansCN-Regular.woff2?v=e766621f") format("woff2");
+  font-style: normal;
+  font-weight: 400;
   font-display: swap;
 }
 
 @font-face {
   font-family: "ReaderLXGWWenKai";
-  src: url("/static/fonts/LXGWWenKai-Regular.ttf") format("truetype");
+  src: url("/static/fonts/LXGWWenKai-Regular.woff2?v=8c92d1b4") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "ReaderYShiWritten";
+  src: url("/static/fonts/YShiWritten-Regular.woff2?v=943d3985") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "ReaderThePeakFontPlus";
+  src: url("/static/fonts/ThePeakFontPlus-Regular.woff2?v=5f91f0d2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
   font-display: swap;
 }
 
@@ -133,7 +157,9 @@ button {
 .reader-topbar h1 {
   margin: 0;
   color: #3746bd;
+  font-family: "ReaderYShiWritten", "Microsoft YaHei", "微软雅黑", sans-serif;
   font-size: clamp(20px, 2.1vw, 30px);
+  font-weight: 700;
   line-height: 1.05;
 }
 
@@ -1095,7 +1121,12 @@ button {
   gap: 8px;
 }
 
+.font-option-card {
+  min-width: 0;
+}
+
 .font-option {
+  width: 100%;
   min-height: 50px;
   padding: 0 10px;
   border: 1px solid transparent;
@@ -1106,6 +1137,63 @@ button {
   font-weight: 500;
   line-height: 1.2;
   transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
+}
+
+.font-load-tools {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-height: 25px;
+  padding: 3px 4px 0;
+}
+
+.font-load-status {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.font-load-status[data-state="ready"] {
+  color: #07834f;
+}
+
+.font-load-status[data-state="loading"] {
+  color: #876800;
+}
+
+.font-load-status[data-state="failed"] {
+  color: #b42318;
+}
+
+.font-load-button {
+  min-height: 23px;
+  padding: 2px 8px;
+  border: 1px solid rgba(107, 125, 227, 0.38);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.font-load-button:hover:not(:disabled) {
+  background: rgba(107, 125, 227, 0.08);
+}
+
+.font-load-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.reader-dark .font-load-button {
+  border-color: rgba(143, 180, 255, 0.4);
+  color: #a9c2ff;
 }
 
 .reader-dark .font-option {
@@ -1123,11 +1211,6 @@ button {
   box-shadow: none;
 }
 
-.font-option.is-hovered:not(.active) {
-  border-color: rgba(107, 125, 227, 0.2);
-  background: rgba(255, 255, 255, 0.98);
-}
-
 .font-option.active {
   border-color: var(--accent);
   background: rgba(107, 125, 227, 0.08);
@@ -1137,12 +1220,6 @@ button {
 .font-option.active:hover {
   background: rgba(107, 125, 227, 0.08);
   color: #1677ff;
-}
-
-.reader-dark .font-option.is-hovered:not(.active) {
-  border-color: rgba(143, 180, 255, 0.18);
-  background: rgba(30, 38, 52, 0.96);
-  color: #e6ebf3;
 }
 
 .reader-dark .font-option:focus {
@@ -1357,6 +1434,10 @@ button {
 }
 
 @media (max-width: 760px) {
+  .font-picker {
+    grid-template-columns: 1fr;
+  }
+
   .reader-body {
     position: relative;
     height: auto;
@@ -1376,6 +1457,9 @@ button {
     grid-template-columns: 1fr;
     gap: 8px;
     margin-bottom: 8px;
+  }
+
+  .reader-topbar > div {
     padding-right: 82px;
   }
 
@@ -1385,16 +1469,17 @@ button {
 
   .reader-actions {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-    gap: 6px;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 4px;
   }
 
   .reader-actions a,
   .reader-actions button {
-    min-height: 32px;
-    padding: 0 6px;
+    min-width: 0;
+    min-height: 30px;
+    padding: 0 2px;
     border-radius: 999px;
-    font-size: 14px;
+    font-size: clamp(12px, 3.4vw, 14px);
     white-space: nowrap;
   }
 

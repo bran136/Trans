@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Trans工具</title>
     <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
   </head>
@@ -18,21 +19,15 @@
           </svg>
         </div>
         <h1>Trans工具</h1>
-        <p>{% if authenticated %}选择要使用的功能{% else %}输入访问密码并选择功能{% endif %}</p>
-        {% if authenticated %}
-        <div class="login-targets">
-          <a href="{{ url_for('translate_page') }}">在线翻译</a>
-          <a href="{{ url_for('reader_page') }}">在线读书</a>
-        </div>
-        {% else %}
+        <p>输入访问密码并选择功能</p>
         <form method="post" class="login-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="password" name="password" placeholder="访问密码" autocomplete="current-password" autofocus required>
           <div class="login-targets">
             <button type="submit" name="target" value="translate">在线翻译</button>
             <button type="submit" name="target" value="reader">在线读书</button>
           </div>
         </form>
-        {% endif %}
         {% if error %}
         <div class="form-error">{{ error }}</div>
         {% endif %}

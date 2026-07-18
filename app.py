@@ -1,6 +1,7 @@
 import json
 import logging
 import hashlib
+import hmac
 import ipaddress
 import base64
 import binascii
@@ -9,6 +10,7 @@ import posixpath
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -28,6 +30,7 @@ from xml.etree import ElementTree
 
 import requests
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
+from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 
@@ -39,6 +42,7 @@ READER_DIR = BASE_DIR / "reader_data"
 READER_BOOK_DIR = READER_DIR / "books"
 READER_INDEX_FILE = READER_DIR / "books.json"
 TTS_CACHE_DIR = READER_DIR / "tts_cache"
+TRANSLATION_CACHE_DB = CONFIG_DIR / "deepseek_cache.sqlite3"
 CACHE_LIMIT = 500
 CACHE_MAX_TEXT_CHARS = 12000
 MAX_TRANSLATE_CHARS = 20000
@@ -48,15 +52,21 @@ DEEPSEEK_BATCH_MAX_SEGMENTS = 30
 MAX_BOOK_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_BOOK_TEXT_CHARS = 3_000_000
 MAX_EPUB_UNCOMPRESSED_BYTES = 80 * 1024 * 1024
+MAX_EPUB_ENTRY_BYTES = 12 * 1024 * 1024
+MAX_EPUB_XML_BYTES = 4 * 1024 * 1024
+MAX_EPUB_ENTRIES = 10_000
+MAX_PDF_PAGES = 5_000
+MAX_JSON_REQUEST_BYTES = 256 * 1024
+MAX_TTS_AUDIO_BYTES = 20 * 1024 * 1024
 CHAPTER_CACHE_VERSION = 5
 OFFICIAL_DEEPSEEK_HOSTS = {"api.deepseek.com"}
-OFFICIAL_MIMO_HOSTS = {"api.xiaomimimo.com", "platform.xiaomimimo.com"}
+OFFICIAL_MIMO_TTS_HOSTS = {"api.xiaomimimo.com"}
+OFFICIAL_MIMO_BALANCE_HOSTS = {"platform.xiaomimimo.com"}
 DEEPSEEK_BALANCE_TTL = 900
 DEEPSEEK_BALANCE_RETRY_INTERVAL = 15
 MIMO_BALANCE_TTL = 900
 MIMO_BALANCE_RETRY_INTERVAL = 15
 RESTART_COOLDOWN_SECONDS = 30
-TRANSLATION_CACHE = OrderedDict()
 DEEPSEEK_BALANCE_CACHE = {"time": 0.0, "attempt_time": 0.0, "data": None}
 MIMO_BALANCE_CACHE = {"time": 0.0, "attempt_time": 0.0, "data": None}
 RESTART_STATE = {"time": 0.0}
@@ -68,6 +78,8 @@ BOOK_EXTENSION_ALIASES = {
     ".epub.zip": ".epub",
 }
 READER_IO_LOCK = threading.RLock()
+CONFIG_IO_LOCK = threading.RLock()
+TRANSLATION_CACHE_LOCK = threading.RLock()
 CHAPTER_PARSE_LOCKS = {}
 CHAPTER_PARSE_LOCKS_LOCK = threading.Lock()
 MAX_ACTIVE_BOOK_IMPORTS = 2
@@ -78,7 +90,11 @@ LOGIN_FAILURE_WINDOW_SECONDS = 5 * 60
 LOGIN_FAILURE_LIMIT = 8
 LOGIN_FAILURES = {}
 LOGIN_FAILURE_LOCK = threading.Lock()
+LOGIN_FAILURE_MAX_IPS = 10_000
 TTS_CACHE_LOCK = threading.RLock()
+UNSAFE_APP_PASSWORDS = {"", "changeme", "password", "admin", "123456", "replace-with-a-strong-password"}
+UNSAFE_SECRET_KEYS = {"", "replace-with-a-long-random-string", "changeme", "secret"}
+SECRET_KEY_FILE = CONFIG_DIR / "secret_key"
 TTS_AUDIO_FORMATS = {
     "wav": "audio/wav",
 }
@@ -127,7 +143,6 @@ DEFAULT_CONFIG = {
         "voice_id": "mimo_default",
         "format": "wav",
         "style_prompt": "自然清晰地朗读，适合小说听书，语速适中，情绪跟随文本。",
-        "optimize_text_preview": True,
         "timeout": 30,
         "chunk_chars": 260,
         "cache_enabled": True,
@@ -182,10 +197,11 @@ LANGUAGE_CODES = {language["code"] for language in LANGUAGES}
 def deep_merge(base, override):
     merged = dict(base)
     for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = deep_merge(merged[key], value)
-        else:
-            merged[key] = value
+        if isinstance(merged.get(key), dict):
+            if isinstance(value, dict):
+                merged[key] = deep_merge(merged[key], value)
+            continue
+        merged[key] = value
     return merged
 
 
@@ -198,7 +214,7 @@ def load_dotenv():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        os.environ[key.strip()] = parse_env_value(value)
+        os.environ.setdefault(key.strip(), parse_env_value(value))
 
 
 def parse_env_value(value):
@@ -222,6 +238,67 @@ def quote_env_value(value):
 
 def clean_single_line_value(value):
     return str(value or "").replace("\r", " ").replace("\n", " ").strip()
+
+
+def ensure_private_directory(path):
+    path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def write_private_text_atomic(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_private_bytes_atomic(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def load_or_create_secret_key():
+    configured = clean_single_line_value(os.getenv("SECRET_KEY", ""))
+    if configured not in UNSAFE_SECRET_KEYS and len(configured) >= 32:
+        return configured
+    ensure_private_directory(CONFIG_DIR)
+    with CONFIG_IO_LOCK:
+        try:
+            stored = clean_single_line_value(SECRET_KEY_FILE.read_text(encoding="utf-8"))
+        except OSError:
+            stored = ""
+        if len(stored) >= 32:
+            return stored
+        generated = secrets.token_urlsafe(48)
+        write_private_text_atomic(SECRET_KEY_FILE, f"{generated}\n")
+        return generated
 
 
 def detect_book_suffix(filename):
@@ -286,13 +363,17 @@ def is_public_address(hostname):
 def validate_server_api_url(value, fallback):
     candidate = clean_single_line_value(value).rstrip("/")
     parsed = urlparse(candidate)
-    if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+    if parsed.scheme != "https" or not parsed.hostname or parsed.query or parsed.fragment:
+        return fallback
+    try:
+        port = parsed.port
+    except ValueError:
         return fallback
     if parsed.username or parsed.password:
         return fallback
     allow_custom = os.getenv("ALLOW_CUSTOM_DEEPSEEK_BASE_URL", "").lower() in {"1", "true", "yes"}
     if not allow_custom:
-        if parsed.scheme != "https" or parsed.hostname not in OFFICIAL_DEEPSEEK_HOSTS:
+        if parsed.hostname not in OFFICIAL_DEEPSEEK_HOSTS or port not in {None, 443}:
             return DEFAULT_CONFIG["deepseek"]["base_url"]
         return candidate
     if not is_public_address(parsed.hostname):
@@ -303,13 +384,17 @@ def validate_server_api_url(value, fallback):
 def validate_mimo_tts_url(value, fallback):
     candidate = clean_single_line_value(value).rstrip("/")
     parsed = urlparse(candidate)
-    if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+    if parsed.scheme != "https" or not parsed.hostname or parsed.query or parsed.fragment:
+        return fallback
+    try:
+        port = parsed.port
+    except ValueError:
         return fallback
     if parsed.username or parsed.password:
         return fallback
     allow_custom = env_flag("ALLOW_CUSTOM_MIMO_BASE_URL", False)
     if not allow_custom:
-        if parsed.scheme != "https" or parsed.hostname not in OFFICIAL_MIMO_HOSTS:
+        if parsed.hostname not in OFFICIAL_MIMO_TTS_HOSTS or port not in {None, 443}:
             return DEFAULT_CONFIG["reader_tts"]["base_url"]
         return candidate
     if not is_public_address(parsed.hostname):
@@ -320,13 +405,17 @@ def validate_mimo_tts_url(value, fallback):
 def validate_mimo_balance_url(value, fallback):
     candidate = clean_single_line_value(value).rstrip("/")
     parsed = urlparse(candidate)
-    if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+    if parsed.scheme != "https" or not parsed.hostname or parsed.query or parsed.fragment:
+        return fallback
+    try:
+        port = parsed.port
+    except ValueError:
         return fallback
     if parsed.username or parsed.password:
         return fallback
     allow_custom = env_flag("ALLOW_CUSTOM_MIMO_BASE_URL", False)
     if not allow_custom:
-        if parsed.scheme != "https" or parsed.hostname not in OFFICIAL_MIMO_HOSTS:
+        if parsed.hostname not in OFFICIAL_MIMO_BALANCE_HOSTS or port not in {None, 443}:
             return DEFAULT_CONFIG["reader_tts"]["balance_url"]
         return candidate
     if not is_public_address(parsed.hostname):
@@ -335,42 +424,49 @@ def validate_mimo_balance_url(value, fallback):
 
 
 def save_dotenv_values(values):
-    env_path = BASE_DIR / ".env"
-    values = {key: clean_single_line_value(value) for key, value in values.items()}
-    existing = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-    seen = set()
-    updated_lines = []
-    for line in existing:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in line:
-            updated_lines.append(line)
-            continue
-        key = line.split("=", 1)[0].strip()
-        if key in values:
-            updated_lines.append(f"{key}={quote_env_value(values[key])}")
-            os.environ[key] = str(values[key])
-            seen.add(key)
-        else:
-            updated_lines.append(line)
-    for key, value in values.items():
-        if key not in seen:
-            updated_lines.append(f"{key}={quote_env_value(value)}")
-            os.environ[key] = str(value)
-    env_path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
+    with CONFIG_IO_LOCK:
+        env_path = BASE_DIR / ".env"
+        values = {key: clean_single_line_value(value) for key, value in values.items()}
+        existing = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+        seen = set()
+        updated_lines = []
+        for line in existing:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in line:
+                updated_lines.append(line)
+                continue
+            key = line.split("=", 1)[0].strip()
+            if key in values:
+                updated_lines.append(f"{key}={quote_env_value(values[key])}")
+                os.environ[key] = str(values[key])
+                seen.add(key)
+            else:
+                updated_lines.append(line)
+        for key, value in values.items():
+            if key not in seen:
+                updated_lines.append(f"{key}={quote_env_value(value)}")
+                os.environ[key] = str(value)
+        write_private_text_atomic(env_path, "\n".join(updated_lines).rstrip() + "\n")
 
 
 def apply_env(config):
     config["app_password"] = os.getenv("APP_PASSWORD", config["app_password"])
     deepseek = config["deepseek"]
     deepseek["api_key"] = os.getenv("DEEPSEEK_API_KEY", deepseek["api_key"])
-    deepseek["base_url"] = os.getenv("DEEPSEEK_BASE_URL", deepseek["base_url"])
+    deepseek["base_url"] = validate_server_api_url(
+        os.getenv("DEEPSEEK_BASE_URL", DEFAULT_CONFIG["deepseek"]["base_url"]),
+        DEFAULT_CONFIG["deepseek"]["base_url"],
+    )
     deepseek["model"] = os.getenv("DEEPSEEK_MODEL", deepseek["model"])
     reader_tts = config["reader_tts"]
     reader_tts["api_key"] = os.getenv("MIMO_API_KEY", reader_tts["api_key"])
-    reader_tts["base_url"] = os.getenv("MIMO_TTS_BASE_URL", reader_tts["base_url"])
+    reader_tts["base_url"] = validate_mimo_tts_url(
+        os.getenv("MIMO_TTS_BASE_URL", DEFAULT_CONFIG["reader_tts"]["base_url"]),
+        DEFAULT_CONFIG["reader_tts"]["base_url"],
+    )
     reader_tts["balance_url"] = validate_mimo_balance_url(
-        os.getenv("MIMO_BALANCE_URL", reader_tts.get("balance_url", DEFAULT_CONFIG["reader_tts"]["balance_url"])),
-        reader_tts.get("balance_url", DEFAULT_CONFIG["reader_tts"]["balance_url"]),
+        os.getenv("MIMO_BALANCE_URL", DEFAULT_CONFIG["reader_tts"]["balance_url"]),
+        DEFAULT_CONFIG["reader_tts"]["balance_url"],
     )
     reader_tts["balance_cookie"] = os.getenv("MIMO_BALANCE_COOKIE", reader_tts.get("balance_cookie", ""))
     reader_tts["model"] = os.getenv("MIMO_TTS_MODEL", reader_tts["model"])
@@ -378,36 +474,45 @@ def apply_env(config):
         reader_tts["model"] = TTS_MODEL_OPTIONS[0]
     reader_tts["voice_id"] = os.getenv("MIMO_TTS_VOICE", reader_tts["voice_id"])
     reader_tts["style_prompt"] = os.getenv("MIMO_TTS_STYLE_PROMPT", reader_tts.get("style_prompt", ""))
+    reader_tts.pop("optimize_text_preview", None)
+    config["google"]["endpoint"] = DEFAULT_CONFIG["google"]["endpoint"]
     return config
 
 
 def load_config():
-    CONFIG_DIR.mkdir(exist_ok=True)
-    config_missing = not CONFIG_FILE.exists()
-    if not config_missing:
-        saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    else:
-        saved = {}
-    config = apply_env(deep_merge(DEFAULT_CONFIG, saved))
-    config.pop("libretranslate", None)
-    config.pop("microsoft", None)
-    config.pop("mymemory", None)
-    config.pop("iciba", None)
-    if config_missing:
-        save_config(config)
-    return config
+    with CONFIG_IO_LOCK:
+        ensure_private_directory(CONFIG_DIR)
+        config_missing = not CONFIG_FILE.exists()
+        if not config_missing:
+            try:
+                saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                saved = {}
+        else:
+            saved = {}
+        if not isinstance(saved, dict):
+            saved = {}
+        config = apply_env(deep_merge(DEFAULT_CONFIG, saved))
+        config.pop("libretranslate", None)
+        config.pop("microsoft", None)
+        config.pop("mymemory", None)
+        config.pop("iciba", None)
+        if config_missing:
+            save_config(config)
+        return config
 
 
 def save_config(config):
-    CONFIG_DIR.mkdir(exist_ok=True)
-    safe = json.loads(json.dumps(config))
-    safe.pop("app_password", None)
-    if "deepseek" in safe:
-        safe["deepseek"].pop("api_key", None)
-    if "reader_tts" in safe:
-        safe["reader_tts"].pop("api_key", None)
-        safe["reader_tts"].pop("balance_cookie", None)
-    CONFIG_FILE.write_text(json.dumps(safe, ensure_ascii=False, indent=2), encoding="utf-8")
+    with CONFIG_IO_LOCK:
+        ensure_private_directory(CONFIG_DIR)
+        safe = json.loads(json.dumps(config))
+        safe.pop("app_password", None)
+        if "deepseek" in safe:
+            safe["deepseek"].pop("api_key", None)
+        if "reader_tts" in safe:
+            safe["reader_tts"].pop("api_key", None)
+            safe["reader_tts"].pop("balance_cookie", None)
+        write_json_atomic(CONFIG_FILE, safe, indent=2)
 
 
 class XHTMLTextExtractor(HTMLParser):
@@ -569,9 +674,14 @@ class XHTMLContentExtractor(HTMLParser):
 
 
 def ensure_reader_dirs():
-    READER_BOOK_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(READER_BOOK_DIR)
+    for directory in (READER_DIR, READER_BOOK_DIR):
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
     if not READER_INDEX_FILE.exists():
-        READER_INDEX_FILE.write_text("[]\n", encoding="utf-8")
+        write_private_text_atomic(READER_INDEX_FILE, "[]\n")
 
 
 def load_book_index():
@@ -591,14 +701,11 @@ def save_book_index(books):
 
 
 def write_json_atomic(path, data, indent=None):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     if indent is None:
         content = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     else:
         content = json.dumps(data, ensure_ascii=False, indent=indent)
-    tmp_path.write_text(content, encoding="utf-8")
-    tmp_path.replace(path)
+    write_private_text_atomic(path, content)
 
 
 def chapter_parse_lock(book_id, chapter_index):
@@ -684,7 +791,8 @@ def read_book_record(book_id):
 def write_book_record(book):
     target_dir = book_dir(book["id"])
     with READER_IO_LOCK:
-        target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(target_dir, 0o700)
         write_json_atomic(book_record_path(book["id"]), book)
 
 
@@ -948,12 +1056,35 @@ def zip_path_join(base, href):
     return target
 
 
-def read_zip_text(zf, name):
+def read_zip_text(zf, name, max_bytes=MAX_EPUB_ENTRY_BYTES):
     try:
+        info = zf.getinfo(name)
+        if info.file_size > max_bytes:
+            raise ValueError(f"EPUB 内文件过大：{name}")
         raw = zf.read(name)
     except KeyError as exc:
         raise ValueError(f"EPUB 缺少文件：{name}") from exc
     return decode_text_bytes(raw)
+
+
+def parse_epub_xml(markup, label="XML"):
+    raw = str(markup or "")
+    if len(raw.encode("utf-8", errors="ignore")) > MAX_EPUB_XML_BYTES:
+        raise ValueError(f"EPUB {label} 过大")
+    if re.search(r"<!\s*ENTITY\b", raw, re.IGNORECASE):
+        raise ValueError(f"EPUB {label} 包含不安全的实体声明")
+    # EPUB 2 NCX commonly contains a harmless external DOCTYPE. ElementTree
+    # does not need that DTD, so remove the declaration without resolving it.
+    # Internal subsets remain rejected because they can declare entities.
+    if re.search(r"<!\s*DOCTYPE\b[^>]*\[", raw, re.IGNORECASE | re.DOTALL):
+        raise ValueError(f"EPUB {label} 包含不安全的内部 DTD")
+    raw = re.sub(r"<!\s*DOCTYPE\b[^>]*>", "", raw, count=1, flags=re.IGNORECASE | re.DOTALL)
+    if re.search(r"<!\s*DOCTYPE\b", raw, re.IGNORECASE):
+        raise ValueError(f"EPUB {label} 的 DOCTYPE 格式无效")
+    try:
+        return ElementTree.fromstring(raw)
+    except ElementTree.ParseError as exc:
+        raise ValueError(f"EPUB {label} 格式无效") from exc
 
 
 def locate_epub_container(zf):
@@ -1108,7 +1239,7 @@ def nav_entries_from_html(zf, manifest):
     ]
     for item in nav_items:
         try:
-            root = ElementTree.fromstring(read_zip_text(zf, item["href"]))
+            root = parse_epub_xml(read_zip_text(zf, item["href"]), "导航文件")
         except Exception:
             continue
         nav_nodes = [
@@ -1155,7 +1286,7 @@ def ncx_entries(zf, manifest):
     if not ncx_item:
         return []
     try:
-        root = ElementTree.fromstring(read_zip_text(zf, ncx_item["href"]))
+        root = parse_epub_xml(read_zip_text(zf, ncx_item["href"]), "NCX 文件")
     except Exception:
         return []
     entries = []
@@ -1194,7 +1325,7 @@ def nav_titles_by_href(zf, manifest):
     ]
     for item in nav_items:
         try:
-            root = ElementTree.fromstring(read_zip_text(zf, item["href"]))
+            root = parse_epub_xml(read_zip_text(zf, item["href"]), "导航文件")
         except Exception:
             continue
         for anchor in root.findall(".//{*}a"):
@@ -1210,7 +1341,7 @@ def ncx_titles_by_href(zf, manifest):
     if not ncx_item:
         return {}
     try:
-        root = ElementTree.fromstring(read_zip_text(zf, ncx_item["href"]))
+        root = parse_epub_xml(read_zip_text(zf, ncx_item["href"]), "NCX 文件")
     except Exception:
         return {}
     titles = {}
@@ -1290,17 +1421,20 @@ def epub_cover_item(opf, manifest):
 
 def parse_epub_spine(path, fallback_title):
     with zipfile.ZipFile(path) as zf:
-        total_size = sum(info.file_size for info in zf.infolist())
+        infos = zf.infolist()
+        if len(infos) > MAX_EPUB_ENTRIES:
+            raise ValueError("EPUB 内文件数量过多")
+        total_size = sum(info.file_size for info in infos)
         if total_size > MAX_EPUB_UNCOMPRESSED_BYTES:
             raise ValueError("EPUB 解压后内容过大")
         container_path, root_prefix = locate_epub_container(zf)
-        container = ElementTree.fromstring(read_zip_text(zf, container_path))
+        container = parse_epub_xml(read_zip_text(zf, container_path), "container.xml")
         rootfile = container.find(".//{*}rootfile")
         if rootfile is None or not rootfile.attrib.get("full-path"):
             raise ValueError("EPUB 目录文件无效")
         opf_path = zip_path_join(root_prefix, rootfile.attrib["full-path"])
         opf_base = posixpath.dirname(opf_path)
-        opf = ElementTree.fromstring(read_zip_text(zf, opf_path))
+        opf = parse_epub_xml(read_zip_text(zf, opf_path), "OPF 文件")
         title = xml_find_text(opf, ["title"]) or fallback_title
         author = xml_find_text(opf, ["creator"])
         manifest = {}
@@ -1396,7 +1530,7 @@ def parse_epub_spine(path, fallback_title):
 def parse_epub_chapter_content(path, href, fragment="", end_fragment=""):
     with zipfile.ZipFile(path) as zf:
         info = zf.getinfo(href)
-        if info.file_size > MAX_EPUB_UNCOMPRESSED_BYTES:
+        if info.file_size > MAX_EPUB_ENTRY_BYTES:
             raise ValueError("EPUB 章节内容过大")
         markup = read_zip_text(zf, href)
         all_blocks = extract_html_content_blocks(markup, href, set(zf.namelist()))
@@ -1415,12 +1549,20 @@ def parse_pdf_book(path, fallback_title):
     except ImportError as exc:
         raise ValueError("当前环境未安装 pypdf，暂不能解析 PDF") from exc
     reader = PdfReader(str(path))
+    if len(reader.pages) > MAX_PDF_PAGES:
+        raise ValueError(f"PDF 页数过多，最多支持 {MAX_PDF_PAGES} 页")
     chapters = []
     page_buffer = []
     start_page = 1
+    total_chars = 0
     for index, page in enumerate(reader.pages, start=1):
         text = normalize_book_text(page.extract_text() or "")
         if text:
+            remaining = MAX_BOOK_TEXT_CHARS - total_chars
+            if remaining <= 0:
+                break
+            text = text[:remaining]
+            total_chars += len(text)
             page_buffer.append(text)
         if page_buffer and (len(page_buffer) >= 20 or index == len(reader.pages)):
             end_page = index
@@ -1430,6 +1572,13 @@ def parse_pdf_book(path, fallback_title):
             })
             start_page = index + 1
             page_buffer = []
+        if total_chars >= MAX_BOOK_TEXT_CHARS:
+            if page_buffer:
+                chapters.append({
+                    "title": f"第 {start_page}-{index} 页",
+                    "text": "\n\n".join(page_buffer),
+                })
+            break
     if not chapters:
         raise ValueError("PDF 中没有识别到可阅读文本")
     return {"title": fallback_title, "author": "", "chapters": chapters}
@@ -1502,7 +1651,7 @@ def save_epub_cover(path, book_id, cover):
         raw = zf.read(cover["href"])
     cover_name = f"cover{'.jpg' if suffix == '.jpeg' else suffix}"
     cover_path = book_dir(book_id) / cover_name
-    cover_path.write_bytes(raw)
+    write_private_bytes_atomic(cover_path, raw)
     return cover_name
 
 
@@ -1944,7 +2093,7 @@ def chapter_payload(book, chapter_index):
 
 load_dotenv()
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
+app.secret_key = load_or_create_secret_key()
 app.config.update(
     MAX_CONTENT_LENGTH=MAX_BOOK_UPLOAD_BYTES,
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
@@ -1956,7 +2105,8 @@ app.config.update(
 
 
 def setup_logging():
-    LOG_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(LOG_DIR, 0o700)
     handler = RotatingFileHandler(
         LOG_DIR / "app.log",
         maxBytes=2 * 1024 * 1024,
@@ -1967,6 +2117,10 @@ def setup_logging():
     handler.setLevel(logging.INFO)
     app.logger.setLevel(logging.INFO)
     app.logger.addHandler(handler)
+    try:
+        os.chmod(LOG_DIR / "app.log", 0o600)
+    except OSError:
+        pass
 
 
 setup_logging()
@@ -2008,6 +2162,9 @@ def record_login_failure(ip):
         ]
         failures.append(now)
         LOGIN_FAILURES[ip] = failures
+        if len(LOGIN_FAILURES) > LOGIN_FAILURE_MAX_IPS:
+            oldest_ip = min(LOGIN_FAILURES, key=lambda key: LOGIN_FAILURES[key][-1])
+            LOGIN_FAILURES.pop(oldest_ip, None)
 
 
 def clear_login_failures(ip):
@@ -2015,10 +2172,62 @@ def clear_login_failures(ip):
         LOGIN_FAILURES.pop(ip, None)
 
 
+def csrf_token():
+    token = session.get("csrf_token")
+    if not isinstance(token, str) or len(token) < 32:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def authentication_version(password):
+    key = str(app.secret_key).encode("utf-8")
+    return hmac.new(key, str(password or "").encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def request_json_object():
+    if not request.is_json:
+        raise BadRequest("请求必须使用 application/json")
+    payload = request.get_json(silent=False)
+    if not isinstance(payload, dict):
+        raise BadRequest("JSON 请求体必须是对象")
+    return payload
+
+
+@app.errorhandler(BadRequest)
+def handle_bad_request(error):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": error.description or "请求格式无效"}), 400
+    return error
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_request_too_large(error):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "请求内容过大"}), 413
+    return error
+
+
 @app.before_request
 def reject_cross_site_writes():
+    if (
+        hasattr(os, "geteuid")
+        and os.geteuid() == 0
+        and not env_flag("ALLOW_ROOT_RUN", False)
+        and not app.testing
+    ):
+        return jsonify({"error": "服务拒绝以 root 处理请求，请改用低权限用户"}), 503
+    if not app.testing:
+        configured_password = clean_single_line_value(load_config().get("app_password", ""))
+        if configured_password.lower() in UNSAFE_APP_PASSWORDS or len(configured_password) < 12:
+            return jsonify({"error": "服务拒绝使用默认或弱密码，请先配置至少 12 位的 APP_PASSWORD"}), 503
+    if request.path.startswith("/static/fonts/") and not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
     if request.method in {"GET", "HEAD", "OPTIONS"}:
         return None
+    if request.path != "/api/books":
+        if request.content_length is not None and request.content_length > MAX_JSON_REQUEST_BYTES:
+            return jsonify({"error": "请求内容过大"}), 413
     origin = request.headers.get("Origin")
     if origin and not request_host_matches(origin):
         app.logger.warning("blocked cross-site write ip=%s origin=%s path=%s", request.remote_addr, origin, request.path)
@@ -2027,6 +2236,15 @@ def reject_cross_site_writes():
     if referer and not request_host_matches(referer):
         app.logger.warning("blocked cross-site write ip=%s referer=%s path=%s", request.remote_addr, referer, request.path)
         return jsonify({"error": "forbidden"}), 403
+    supplied_token = request.headers.get("X-CSRF-Token", "")
+    if not supplied_token and request.path != "/api/books":
+        supplied_token = request.form.get("csrf_token", "")
+    expected_token = csrf_token()
+    if not supplied_token or not secrets.compare_digest(supplied_token, expected_token):
+        app.logger.warning("blocked write without valid csrf token ip=%s path=%s", request.remote_addr, request.path)
+        if request.path.startswith("/api/") or request.path == "/logout":
+            return jsonify({"error": "CSRF token 无效，请刷新页面后重试"}), 403
+        return "CSRF token invalid", 403
     return None
 
 
@@ -2035,6 +2253,22 @@ def add_security_headers(response):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; "
+        "object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
+        "connect-src 'self' https://translate.googleapis.com",
+    )
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    )
+    if request.path.startswith("/static/fonts/") and request.args.get("v"):
+        response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+    elif request.path.startswith("/api/") or request.path in {"/", "/login", "/translate", "/reader"}:
+        response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 
@@ -2057,6 +2291,7 @@ def inject_asset_url():
             BASE_DIR / "templates" / "reader.html",
             BASE_DIR / "static" / "styles.css",
             BASE_DIR / "static" / "app.js",
+            BASE_DIR / "static" / "home.js",
             BASE_DIR / "static" / "reader.css",
             BASE_DIR / "static" / "reader.js",
         ]
@@ -2068,13 +2303,22 @@ def inject_asset_url():
                 continue
         return time.strftime("%Y%m%d.%H%M", time.localtime(version or time.time()))
 
-    return {"asset_url": asset_url, "app_version": app_version}
+    return {"asset_url": asset_url, "app_version": app_version, "csrf_token": csrf_token}
 
 
 def require_auth():
     authenticated = bool(session.get("authenticated"))
     if authenticated:
+        try:
+            expected = authentication_version(load_config().get("app_password", ""))
+        except Exception:
+            return False
+        authenticated = secrets.compare_digest(str(session.get("auth_version", "")), expected)
+    if authenticated:
         session.permanent = True
+    else:
+        session.pop("authenticated", None)
+        session.pop("auth_version", None)
     return authenticated
 
 
@@ -2082,10 +2326,10 @@ def public_config(config):
     safe = json.loads(json.dumps(config))
     safe["deepseek"]["api_key_configured"] = bool(safe["deepseek"].get("api_key"))
     safe["deepseek"]["api_key"] = ""
-    safe["deepseek"]["allow_custom_base_url"] = (
-        os.getenv("ALLOW_CUSTOM_DEEPSEEK_BASE_URL", "").lower() in {"1", "true", "yes"}
-    )
-    safe["app_password"] = "********" if safe.get("app_password") else ""
+    # Server-side upstreams may be configured in .env, but a browser session
+    # must never be able to redirect requests carrying server credentials.
+    safe["deepseek"]["allow_custom_base_url"] = False
+    safe.pop("app_password", None)
     if "reader_tts" in safe:
         safe["reader_tts"] = public_reader_tts_config(config)
     safe["deepseek_styles"] = [
@@ -2100,7 +2344,7 @@ def public_reader_tts_config(config):
     settings["api_key"] = ""
     settings["balance_cookie_configured"] = bool(settings.get("balance_cookie"))
     settings["balance_cookie"] = ""
-    settings["allow_custom_base_url"] = env_flag("ALLOW_CUSTOM_MIMO_BASE_URL", False)
+    settings["allow_custom_base_url"] = False
     settings["model_options"] = TTS_MODEL_OPTIONS
     settings["voice_options"] = TTS_VOICE_OPTIONS
     settings["cache_stats"] = tts_cache_stats()
@@ -2125,20 +2369,19 @@ def update_reader_tts_config(config, payload):
     settings["enabled"] = bool(payload.get("enabled"))
     settings["provider"] = "mimo"
     if payload.get("api_key"):
-        settings["api_key"] = clean_single_line_value(payload["api_key"])
+        settings["api_key"] = clean_single_line_value(payload["api_key"])[:1000]
         env_updates["MIMO_API_KEY"] = settings["api_key"]
     settings["base_url"] = validate_mimo_tts_url(
-        payload.get("base_url", settings["base_url"]),
         settings["base_url"],
+        DEFAULT_CONFIG["reader_tts"]["base_url"],
     )
-    env_updates["MIMO_TTS_BASE_URL"] = settings["base_url"]
     if payload.get("clear_balance_cookie"):
         settings["balance_cookie"] = ""
         env_updates["MIMO_BALANCE_COOKIE"] = ""
         MIMO_BALANCE_CACHE["data"] = None
         MIMO_BALANCE_CACHE["time"] = 0.0
     elif payload.get("balance_cookie"):
-        settings["balance_cookie"] = clean_single_line_value(payload["balance_cookie"])
+        settings["balance_cookie"] = clean_single_line_value(payload["balance_cookie"])[:16_000]
         env_updates["MIMO_BALANCE_COOKIE"] = settings["balance_cookie"]
         MIMO_BALANCE_CACHE["data"] = None
         MIMO_BALANCE_CACHE["time"] = 0.0
@@ -2151,7 +2394,6 @@ def update_reader_tts_config(config, payload):
     settings["format"] = audio_format if audio_format in TTS_AUDIO_FORMATS else "wav"
     settings["style_prompt"] = clean_single_line_value(payload.get("style_prompt", settings.get("style_prompt", "")))[:1000]
     env_updates["MIMO_TTS_STYLE_PROMPT"] = settings["style_prompt"]
-    settings["optimize_text_preview"] = bool(payload.get("optimize_text_preview", True))
     settings["timeout"] = int(parse_number(payload.get("timeout"), settings["timeout"], 5, 90))
     settings["chunk_chars"] = int(parse_number(payload.get("chunk_chars"), settings["chunk_chars"], 80, 800))
     settings["cache_enabled"] = bool(payload.get("cache_enabled", True))
@@ -2160,25 +2402,30 @@ def update_reader_tts_config(config, payload):
     return config
 
 
+def update_app_password(config, value):
+    new_password = clean_single_line_value(value)
+    if len(new_password) < 12 or len(new_password) > 256 or new_password.lower() in UNSAFE_APP_PASSWORDS:
+        raise ValueError("访问密码至少需要 12 位，且不能使用示例或常见弱密码")
+    config["app_password"] = new_password
+    save_dotenv_values({"APP_PASSWORD": new_password})
+    return config
+
+
 def update_nested_config(config, payload):
     env_updates = {}
-    if payload.get("app_password") and payload["app_password"] != "********":
-        config["app_password"] = clean_single_line_value(payload["app_password"])
-        env_updates["APP_PASSWORD"] = config["app_password"]
 
     deepseek = payload.get("deepseek", {})
     if deepseek:
         target = config["deepseek"]
         target["enabled"] = bool(deepseek.get("enabled"))
         if deepseek.get("api_key"):
-            target["api_key"] = clean_single_line_value(deepseek["api_key"])
+            target["api_key"] = clean_single_line_value(deepseek["api_key"])[:1000]
             env_updates["DEEPSEEK_API_KEY"] = target["api_key"]
         target["base_url"] = validate_server_api_url(
-            deepseek.get("base_url", target["base_url"]),
             target["base_url"],
+            DEFAULT_CONFIG["deepseek"]["base_url"],
         )
-        env_updates["DEEPSEEK_BASE_URL"] = target["base_url"]
-        target["model"] = clean_single_line_value(deepseek.get("model", target["model"]))
+        target["model"] = clean_single_line_value(deepseek.get("model", target["model"]))[:200]
         env_updates["DEEPSEEK_MODEL"] = target["model"]
         target["temperature"] = parse_number(deepseek.get("temperature"), target["temperature"], 0, 2)
         thinking = deepseek.get("thinking", target["thinking"])
@@ -2193,7 +2440,7 @@ def update_nested_config(config, payload):
     if google:
         target = config["google"]
         target["enabled"] = bool(google.get("enabled"))
-        target["endpoint"] = clean_single_line_value(google.get("endpoint", target["endpoint"]))
+        target["endpoint"] = DEFAULT_CONFIG["google"]["endpoint"]
         target["timeout"] = int(parse_number(google.get("timeout"), target["timeout"], 5, 120))
 
     if env_updates:
@@ -2245,19 +2492,108 @@ def normalize_translation_text(value, source_text=""):
 
 
 def get_cached_translation(cache_key):
-    value = TRANSLATION_CACHE.get(cache_key)
-    if value is not None:
-        TRANSLATION_CACHE.move_to_end(cache_key)
-    return value
+    if not re.fullmatch(r"[0-9a-f]{64}", str(cache_key or "")):
+        return None
+    with TRANSLATION_CACHE_LOCK:
+        connection = None
+        try:
+            connection = open_translation_cache()
+            row = connection.execute(
+                "SELECT value FROM translations WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+            if not row:
+                return None
+            value = row[0]
+            if not isinstance(value, str) or len(value) > CACHE_MAX_TEXT_CHARS:
+                connection.execute("DELETE FROM translations WHERE cache_key = ?", (cache_key,))
+                connection.commit()
+                return None
+            connection.execute(
+                "UPDATE translations SET touched_at = ? WHERE cache_key = ?",
+                (time.time_ns(), cache_key),
+            )
+            connection.commit()
+            return value
+        except sqlite3.Error as exc:
+            app.logger.error("deepseek cache read failed error=%s", exc)
+            return None
+        finally:
+            if connection is not None:
+                connection.close()
 
 
 def set_cached_translation(cache_key, value):
-    if len(value) > CACHE_MAX_TEXT_CHARS:
+    if not re.fullmatch(r"[0-9a-f]{64}", str(cache_key or "")):
         return
-    TRANSLATION_CACHE[cache_key] = value
-    TRANSLATION_CACHE.move_to_end(cache_key)
-    while len(TRANSLATION_CACHE) > CACHE_LIMIT:
-        TRANSLATION_CACHE.popitem(last=False)
+    if not isinstance(value, str) or len(value) > CACHE_MAX_TEXT_CHARS:
+        return
+    with TRANSLATION_CACHE_LOCK:
+        connection = None
+        try:
+            connection = open_translation_cache()
+            with connection:
+                connection.execute(
+                    "INSERT INTO translations(cache_key, value, touched_at) VALUES(?, ?, ?) "
+                    "ON CONFLICT(cache_key) DO UPDATE SET value = excluded.value, touched_at = excluded.touched_at",
+                    (cache_key, value, time.time_ns()),
+                )
+                connection.execute(
+                    "DELETE FROM translations WHERE cache_key NOT IN "
+                    "(SELECT cache_key FROM translations ORDER BY touched_at DESC LIMIT ?)",
+                    (CACHE_LIMIT,),
+                )
+        except sqlite3.Error as exc:
+            app.logger.error("deepseek cache write failed error=%s", exc)
+        finally:
+            if connection is not None:
+                connection.close()
+
+
+def open_translation_cache():
+    ensure_private_directory(CONFIG_DIR)
+    connection = sqlite3.connect(TRANSLATION_CACHE_DB, timeout=5)
+    try:
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS translations ("
+            "cache_key TEXT PRIMARY KEY, value TEXT NOT NULL, touched_at INTEGER NOT NULL"
+            ") WITHOUT ROWID"
+        )
+        connection.commit()
+        os.chmod(TRANSLATION_CACHE_DB, 0o600)
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def translation_cache_entries():
+    with TRANSLATION_CACHE_LOCK:
+        connection = None
+        try:
+            connection = open_translation_cache()
+            return int(connection.execute("SELECT COUNT(*) FROM translations").fetchone()[0])
+        except sqlite3.Error as exc:
+            app.logger.error("deepseek cache count failed error=%s", exc)
+            return 0
+        finally:
+            if connection is not None:
+                connection.close()
+
+
+def clear_translation_cache():
+    with TRANSLATION_CACHE_LOCK:
+        connection = None
+        try:
+            connection = open_translation_cache()
+            with connection:
+                count = int(connection.execute("SELECT COUNT(*) FROM translations").fetchone()[0])
+                connection.execute("DELETE FROM translations")
+            return count
+        finally:
+            if connection is not None:
+                connection.close()
 
 
 def tts_cache_limit_bytes():
@@ -2317,13 +2653,13 @@ def clean_tts_text(value, max_chars):
 
 def tts_cache_payload(text, settings):
     return {
+        "schema": 2,
         "provider": "mimo",
         "text": text,
         "model": settings.get("model"),
         "voice_id": settings.get("voice_id"),
         "format": settings.get("format"),
         "style_prompt": settings.get("style_prompt"),
-        "optimize_text_preview": settings.get("optimize_text_preview"),
     }
 
 
@@ -2337,8 +2673,26 @@ def tts_cache_path(cache_key, audio_format):
     return TTS_CACHE_DIR / f"{cache_key}.{suffix}"
 
 
+def find_cached_tts(cache_path):
+    if not cache_path.exists():
+        return None
+    try:
+        stat = cache_path.stat()
+        if not cache_path.is_file() or stat.st_size <= 0:
+            cache_path.unlink(missing_ok=True)
+            return None
+        if time.time() - stat.st_mtime > tts_cache_ttl_seconds():
+            cache_path.unlink()
+            return None
+        os.chmod(cache_path, 0o600)
+        os.utime(cache_path, None)
+        return cache_path
+    except OSError:
+        return None
+
+
 def prune_tts_cache():
-    TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(TTS_CACHE_DIR)
     files = []
     total = 0
     now = time.time()
@@ -2384,11 +2738,18 @@ def decode_mimo_audio_payload(payload):
         raise ValueError("MiMo TTS 未返回音频")
     audio = str(audio).strip()
     if re.fullmatch(r"[0-9a-fA-F]+", audio) and len(audio) % 2 == 0:
+        if len(audio) // 2 > MAX_TTS_AUDIO_BYTES:
+            raise ValueError("MiMo TTS 返回的音频过大")
         return bytes.fromhex(audio)
+    if len(audio) > (MAX_TTS_AUDIO_BYTES * 4 // 3) + 16:
+        raise ValueError("MiMo TTS 返回的音频过大")
     try:
-        return base64.b64decode(audio, validate=True)
+        data = base64.b64decode(audio, validate=True)
     except (ValueError, binascii.Error) as exc:
         raise ValueError("MiMo TTS 音频格式无法识别") from exc
+    if len(data) > MAX_TTS_AUDIO_BYTES:
+        raise ValueError("MiMo TTS 返回的音频过大")
+    return data
 
 
 def request_mimo_tts(text, settings):
@@ -2417,6 +2778,7 @@ def request_mimo_tts(text, settings):
         },
         json=body,
         timeout=int(settings.get("timeout", 30)),
+        allow_redirects=False,
     )
     try:
         response.raise_for_status()
@@ -2425,6 +2787,8 @@ def request_mimo_tts(text, settings):
         raise ValueError(f"MiMo TTS 请求失败：{detail}") from exc
     content_type = response.headers.get("Content-Type", "")
     if content_type.startswith("audio/"):
+        if len(response.content) > MAX_TTS_AUDIO_BYTES:
+            raise ValueError("MiMo TTS 返回的音频过大")
         return response.content
     payload = response.json()
     return decode_mimo_audio_payload(payload)
@@ -2436,7 +2800,6 @@ def synthesize_reader_tts(text, config):
         raise ValueError("听书服务未启用")
     if not settings.get("api_key"):
         raise ValueError("请先配置 MiMo API Key")
-    model = settings.get("model", "mimo-v2.5-tts")
     if not settings.get("voice_id"):
         raise ValueError("请先配置音色")
     text = clean_tts_text(text, int(settings.get("chunk_chars", 260)))
@@ -2449,26 +2812,20 @@ def synthesize_reader_tts(text, config):
     cache_path = tts_cache_path(cache_key, audio_format)
     if settings.get("cache_enabled", True):
         with TTS_CACHE_LOCK:
-            if cache_path.exists():
-                try:
-                    stat = cache_path.stat()
-                    if time.time() - stat.st_mtime > tts_cache_ttl_seconds():
-                        cache_path.unlink()
-                    else:
-                        os.utime(cache_path, None)
-                        return {
-                            "path": cache_path,
-                            "format": audio_format,
-                            "cached": True,
-                        }
-                except OSError:
-                    pass
+            cached_path = find_cached_tts(cache_path)
+            if cached_path is not None:
+                return {
+                    "path": cached_path,
+                    "format": audio_format,
+                    "cached": True,
+                    "cache_key": cache_key,
+                }
     data = request_mimo_tts(text, settings)
     if settings.get("cache_enabled", True) and data:
         with TTS_CACHE_LOCK:
-            TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            ensure_private_directory(TTS_CACHE_DIR)
             try:
-                cache_path.write_bytes(data)
+                write_private_bytes_atomic(cache_path, data)
                 os.utime(cache_path, None)
                 prune_tts_cache()
                 if cache_path.exists():
@@ -2476,6 +2833,7 @@ def synthesize_reader_tts(text, config):
                         "path": cache_path,
                         "format": audio_format,
                         "cached": False,
+                        "cache_key": cache_key,
                     }
             except OSError:
                 pass
@@ -2483,6 +2841,7 @@ def synthesize_reader_tts(text, config):
         "data": data,
         "format": audio_format,
         "cached": False,
+        "cache_key": cache_key,
     }
 
 
@@ -2582,11 +2941,21 @@ def system_status():
             "used_percent": round(disk.used / disk.total * 100, 2) if disk.total else 0,
         },
         "cache": {
-            "entries": len(TRANSLATION_CACHE),
+            "entries": translation_cache_entries(),
             "limit": CACHE_LIMIT,
             "max_text_chars": CACHE_MAX_TEXT_CHARS,
+            "persistent": True,
         },
+        "tts_cache": tts_cache_stats(),
     }
+
+
+def validate_runtime_security():
+    if hasattr(os, "geteuid") and os.geteuid() == 0 and not env_flag("ALLOW_ROOT_RUN", False):
+        raise RuntimeError("拒绝以 root 运行：请改用低权限用户，或显式设置 ALLOW_ROOT_RUN=true 承担风险")
+    password = clean_single_line_value(load_config().get("app_password", ""))
+    if password.lower() in UNSAFE_APP_PASSWORDS or len(password) < 12:
+        raise RuntimeError("拒绝启动：请先把 APP_PASSWORD 设置为至少 12 位的非默认密码")
 
 
 def restart_process_later(delay=0.35):
@@ -2625,6 +2994,7 @@ def fetch_deepseek_balance(config, force=False):
         f"{settings['base_url'].rstrip('/')}/user/balance",
         headers={"Authorization": f"Bearer {settings['api_key']}"},
         timeout=min(int(settings.get("timeout", 45)), 20),
+        allow_redirects=False,
     )
     response.raise_for_status()
     data = response.json()
@@ -2715,6 +3085,7 @@ def fetch_mimo_balance(config, force=False):
             balance_url,
             headers=headers,
             timeout=min(int(settings.get("timeout", 30)), 20),
+            allow_redirects=False,
         )
     except requests.Timeout as exc:
         raise RuntimeError("MiMo 余额查询超时，请检查服务器到小米平台的网络") from exc
@@ -2778,6 +3149,7 @@ def deepseek_chat(settings, messages):
         },
         json=body,
         timeout=settings["timeout"],
+        allow_redirects=False,
     )
     response.raise_for_status()
     data = response.json()
@@ -2928,7 +3300,7 @@ LOGIN_TARGETS = {
 def index():
     if not require_auth():
         return redirect(url_for("login"))
-    return redirect(url_for("login"))
+    return render_template("home.html")
 
 
 @app.route("/translate")
@@ -2947,6 +3319,8 @@ def reader_page():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    if require_auth():
+        return redirect(url_for("index"))
     error = ""
     config = load_config()
     if request.method == "POST":
@@ -2956,17 +3330,18 @@ def login():
         if login_is_limited(ip):
             app.logger.warning("login limited ip=%s", ip)
             error = "尝试次数过多，请稍后再试"
-            return render_template("login.html", error=error, authenticated=require_auth()), 429
+            return render_template("login.html", error=error), 429
         if secrets.compare_digest(password, config["app_password"]):
             session.permanent = True
             session["authenticated"] = True
+            session["auth_version"] = authentication_version(config["app_password"])
             clear_login_failures(ip)
             app.logger.info("login success ip=%s", ip)
             return redirect(url_for(LOGIN_TARGETS[target]))
         record_login_failure(ip)
         app.logger.warning("login failed ip=%s", ip)
         error = "密码不正确"
-    return render_template("login.html", error=error, authenticated=require_auth())
+    return render_template("login.html", error=error)
 
 
 @app.route("/logout", methods=["POST"])
@@ -3006,7 +3381,7 @@ def api_reader_tts_config_update():
         return jsonify({"error": "unauthorized"}), 401
     try:
         config = load_config()
-        updated = update_reader_tts_config(config, request.get_json(force=True) or {})
+        updated = update_reader_tts_config(config, request_json_object())
         save_config(updated)
         app.logger.info("reader tts config updated ip=%s", request.remote_addr)
         return jsonify({"ok": True, "config": public_reader_tts_config(updated)})
@@ -3033,7 +3408,7 @@ def api_reader_tts():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     try:
-        payload = request.get_json(force=True) or {}
+        payload = request_json_object()
         config = load_config()
         result = synthesize_reader_tts(payload.get("text", ""), config)
         audio_format = result.get("format", "wav")
@@ -3055,10 +3430,11 @@ def api_reader_tts():
             )
         response.headers["X-TTS-Cache"] = "hit" if result.get("cached") else "miss"
         app.logger.info(
-            "reader tts ok ip=%s cached=%s format=%s",
+            "reader tts ok ip=%s cached=%s format=%s key=%s",
             request.remote_addr,
             bool(result.get("cached")),
             audio_format,
+            str(result.get("cache_key", ""))[:12],
         )
         return response
     except Exception as exc:
@@ -3142,7 +3518,8 @@ def api_books_upload():
         return jsonify({"error": "书籍文件过大，最大 50MB"}), 413
     book_id = uuid.uuid4().hex
     target_dir = book_dir(book_id)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.chmod(target_dir, 0o700)
     safe_name = secure_filename(original_name)
     if not safe_name or Path(safe_name).suffix.lower() != suffix:
         safe_stem = Path(safe_name).stem or "book"
@@ -3172,6 +3549,7 @@ def api_books_upload():
     try:
         save_started = time.perf_counter()
         upload.save(original_path)
+        os.chmod(original_path, 0o600)
         save_seconds = time.perf_counter() - save_started
         if original_path.stat().st_size > MAX_BOOK_UPLOAD_BYTES:
             raise ValueError("书籍文件过大，最大 50MB")
@@ -3230,7 +3608,7 @@ def api_book_detail(book_id):
 def api_book_update(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True) or {}
+    payload = request_json_object()
     title = clean_display_text(payload.get("title"), 160)
     if not title:
         return jsonify({"error": "书名不能为空"}), 400
@@ -3345,7 +3723,7 @@ def api_book_chapter(book_id, chapter_index):
 def api_txt_chapter_title_update(book_id, chapter_index):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True) or {}
+    payload = request_json_object()
     try:
         book = update_txt_chapter_title(book_id, chapter_index, payload.get("title", ""))
         return jsonify({"ok": True, "book": book_summary(book)})
@@ -3385,7 +3763,7 @@ def api_txt_chapter_lines(book_id, chapter_index):
 def api_txt_chapter_split(book_id, chapter_index):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True) or {}
+    payload = request_json_object()
     try:
         line_index = int(payload.get("line_index", -1))
         book = split_txt_chapter_at_line(book_id, chapter_index, line_index, payload.get("title", ""))
@@ -3400,7 +3778,7 @@ def api_txt_chapter_split(book_id, chapter_index):
 def api_book_progress(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True) or {}
+    payload = request_json_object()
     try:
         book = read_book_record(book_id)
         chapter = int(payload.get("chapter", 0))
@@ -3450,11 +3828,55 @@ def bootstrap():
 def api_config():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    config = load_config()
-    updated = update_nested_config(config, request.get_json(force=True) or {})
-    save_config(updated)
-    app.logger.info("config updated ip=%s", request.remote_addr)
-    return jsonify({"ok": True, "config": public_config(updated)})
+    try:
+        config = load_config()
+        payload = request_json_object()
+        if "app_password" in payload:
+            raise ValueError("访问密码只能通过监控页的专用接口修改")
+        updated = update_nested_config(config, payload)
+        save_config(updated)
+        session["authenticated"] = True
+        session["auth_version"] = authentication_version(updated["app_password"])
+        app.logger.info("config updated ip=%s", request.remote_addr)
+        return jsonify({"ok": True, "config": public_config(updated)})
+    except Exception as exc:
+        app.logger.warning("config update failed ip=%s error=%s", request.remote_addr, exc)
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/password", methods=["PUT"])
+def api_password():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        payload = request_json_object()
+        current_password = payload.get("current_password")
+        new_password = payload.get("new_password")
+        if not isinstance(current_password, str) or not current_password:
+            raise ValueError("请输入当前访问密码")
+        if not isinstance(new_password, str) or not new_password:
+            raise ValueError("请输入新的访问密码")
+        ip = client_ip()
+        if login_is_limited(ip):
+            return jsonify({"error": "密码验证失败次数过多，请稍后再试"}), 429
+        config = load_config()
+        expected_password = str(config.get("app_password", ""))
+        if len(current_password) > 256 or not secrets.compare_digest(current_password, expected_password):
+            record_login_failure(ip)
+            app.logger.warning("access password verification failed ip=%s", ip)
+            return jsonify({"error": "当前密码不正确"}), 403
+        clear_login_failures(ip)
+        normalized_new_password = clean_single_line_value(new_password)
+        if secrets.compare_digest(normalized_new_password, expected_password):
+            raise ValueError("新密码不能与当前密码相同")
+        updated = update_app_password(config, normalized_new_password)
+        session["authenticated"] = True
+        session["auth_version"] = authentication_version(updated["app_password"])
+        app.logger.info("access password updated ip=%s", ip)
+        return jsonify({"ok": True})
+    except Exception as exc:
+        app.logger.warning("access password update failed ip=%s error=%s", request.remote_addr, exc)
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/status")
@@ -3464,14 +3886,19 @@ def api_status():
     return jsonify(system_status())
 
 
-@app.route("/api/cache", methods=["DELETE"])
+@app.route("/api/cache", methods=["GET", "DELETE"])
 def api_cache_clear():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    count = len(TRANSLATION_CACHE)
-    TRANSLATION_CACHE.clear()
+    if request.method == "GET":
+        return jsonify({"entries": translation_cache_entries(), "limit": CACHE_LIMIT, "persistent": True})
+    try:
+        count = clear_translation_cache()
+    except sqlite3.Error as exc:
+        app.logger.error("deepseek cache clear failed ip=%s error=%s", request.remote_addr, exc)
+        return jsonify({"error": "缓存清空失败"}), 500
     app.logger.info("cache cleared ip=%s entries=%s", request.remote_addr, count)
-    return jsonify({"ok": True, "cleared": count, "cache": {"entries": 0, "limit": CACHE_LIMIT}})
+    return jsonify({"ok": True, "cleared": count, "entries": 0, "limit": CACHE_LIMIT, "persistent": True})
 
 
 @app.route("/api/restart", methods=["POST"])
@@ -3504,7 +3931,7 @@ def api_deepseek_balance():
 def api_translate():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True) or {}
+    payload = request_json_object()
     text = (payload.get("text") or "").strip()
     source = payload.get("source") or "auto"
     target = payload.get("target") or "en"
@@ -3536,5 +3963,9 @@ def api_translate():
 
 
 if __name__ == "__main__":
+    host = clean_single_line_value(os.getenv("HOST", "127.0.0.1")) or "127.0.0.1"
     port = int(os.getenv("PORT", "31000"))
-    app.run(host="0.0.0.0", port=port)
+    if port < 1 or port > 65535:
+        raise RuntimeError("PORT 必须在 1 到 65535 之间")
+    validate_runtime_security()
+    app.run(host=host, port=port)

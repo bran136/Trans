@@ -1,10 +1,18 @@
+function storedHistory() {
+  try {
+    const value = JSON.parse(localStorage.getItem("trans-history") || "[]");
+    return Array.isArray(value) ? value.slice(0, 100) : [];
+  } catch {
+    return [];
+  }
+}
+
 const state = {
   languages: [],
   engines: [],
   config: null,
-  history: JSON.parse(localStorage.getItem("trans-history") || "[]"),
+  history: storedHistory(),
   translateTimer: null,
-  monitorTimer: null,
   balanceTimer: null,
   balanceRetryTimer: null,
   deepseekBalance: null,
@@ -17,6 +25,7 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || "";
 
 function option(label, value, selected = false) {
   const el = document.createElement("option");
@@ -28,7 +37,11 @@ function option(label, value, selected = false) {
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.method && !["GET", "HEAD"].includes(options.method.toUpperCase()) ? { "X-CSRF-Token": CSRF_TOKEN } : {}),
+      ...(options.headers || {}),
+    },
     ...options,
   });
   if (!response.ok) {
@@ -155,15 +168,12 @@ function formatBalanceTime(timestamp) {
 
 function renderConfig() {
   const c = state.config;
-  $("appPassword").value = c.app_password || "";
   $("deepseekEnabled").checked = c.deepseek.enabled;
   $("deepseekKey").value = "";
   $("deepseekKey").placeholder = c.deepseek.api_key_configured ? "已配置，留空不修改" : "未配置";
   $("deepseekBaseUrl").value = c.deepseek.base_url;
   $("deepseekBaseUrl").disabled = !c.deepseek.allow_custom_base_url;
-  $("deepseekBaseUrl").title = c.deepseek.allow_custom_base_url
-    ? "可在服务器 .env 中关闭自定义地址"
-    : "服务器 .env 中 ALLOW_CUSTOM_DEEPSEEK_BASE_URL=false，前端不可修改";
+  $("deepseekBaseUrl").title = "服务端接口地址只能在服务器 .env 中修改";
   $("deepseekModel").value = c.deepseek.model;
   $("deepseekStyle").innerHTML = "";
   (c.deepseek_styles || []).forEach((style) => {
@@ -175,6 +185,8 @@ function renderConfig() {
   $("deepseekTimeout").value = c.deepseek.timeout;
   $("googleEnabled").checked = c.google.enabled;
   $("googleEndpoint").value = c.google.endpoint;
+  $("googleEndpoint").disabled = true;
+  $("googleEndpoint").title = "谷歌翻译由浏览器直连固定官方接口";
   $("googleTimeout").value = c.google.timeout;
 }
 
@@ -216,78 +228,32 @@ function clearConfigMessage() {
   message.hidden = true;
 }
 
-function formatBytes(bytes) {
-  const value = Number(bytes) || 0;
-  if (value < 1024) return `${value} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let size = value / 1024;
-  let index = 0;
-  while (size >= 1024 && index < units.length - 1) {
-    size /= 1024;
-    index += 1;
-  }
-  return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[index]}`;
+function renderDeepSeekCacheStatus(cache = {}) {
+  const entries = Number(cache.entries || 0);
+  const limit = Number(cache.limit || 0);
+  $("deepseekCacheStats").textContent = `${entries} / ${limit} 条`;
 }
 
-function formatUptime(seconds) {
-  const total = Number(seconds) || 0;
-  const days = Math.floor(total / 86400);
-  const hours = Math.floor((total % 86400) / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  if (days) return `${days}天 ${hours}小时`;
-  if (hours) return `${hours}小时 ${minutes}分`;
-  return `${minutes}分`;
-}
-
-function setMonitorMessage(text, type = "success") {
-  const message = $("monitorMessage");
-  message.textContent = text;
-  message.className = `config-message ${type}`;
-  message.hidden = false;
-}
-
-function clearMonitorMessage() {
-  const message = $("monitorMessage");
-  message.textContent = "";
-  message.className = "config-message";
-  message.hidden = true;
-}
-
-function renderServiceStatus(data) {
-  const appMemoryPercent = data.system.memory_total_bytes
-    ? data.process.rss_bytes / data.system.memory_total_bytes * 100
-    : 0;
-  $("metricPid").textContent = data.pid;
-  $("metricUptime").textContent = formatUptime(data.uptime_seconds);
-  $("metricAppCpu").textContent = `${data.process.cpu_percent}%`;
-  $("metricAppMemory").textContent = `${formatBytes(data.process.rss_bytes)} | ${appMemoryPercent.toFixed(2)}%`;
-  $("metricCache").textContent = `${data.cache.entries} / ${data.cache.limit}`;
-  $("metricSystemCpu").textContent = `${data.system.cpu_percent}%`;
-  $("metricSystemMemory").textContent = `${data.system.memory_used_percent}% | ${formatBytes(data.system.memory_available_bytes)} 可用`;
-  $("metricLoad").textContent = data.system.load_avg.map((item) => Number(item).toFixed(2)).join(" / ");
-  $("metricDisk").textContent = `${data.disk.used_percent}% | ${formatBytes(data.disk.free_bytes)} 可用`;
-}
-
-async function loadServiceStatus(showError = true) {
+async function loadDeepSeekCacheStatus() {
   try {
-    const data = await api("/api/status");
-    renderServiceStatus(data);
-    return true;
+    renderDeepSeekCacheStatus(await api("/api/cache"));
   } catch (error) {
-    if (showError) setMonitorMessage(`状态获取失败：${error.message}`, "error");
-    return false;
+    $("deepseekCacheStats").textContent = "读取失败";
   }
 }
 
-function startMonitorRefresh() {
-  window.clearInterval(state.monitorTimer);
-  loadServiceStatus();
-  state.monitorTimer = window.setInterval(() => loadServiceStatus(false), 5000);
-}
-
-function stopMonitorRefresh() {
-  window.clearInterval(state.monitorTimer);
-  state.monitorTimer = null;
+async function clearDeepSeekCache() {
+  if (!window.confirm("确定清空 DeepSeek 本地翻译缓存？清空后相同内容会重新请求 API。")) return;
+  $("clearCacheBtn").disabled = true;
+  try {
+    const data = await api("/api/cache", { method: "DELETE" });
+    renderDeepSeekCacheStatus(data);
+    setConfigMessage(`已清空 ${data.cleared} 条 DeepSeek 缓存`, "success");
+  } catch (error) {
+    setConfigMessage(`清空缓存失败：${error.message}`, "error");
+  } finally {
+    $("clearCacheBtn").disabled = false;
+  }
 }
 
 async function loadDeepSeekBalance() {
@@ -315,42 +281,6 @@ function refreshBalanceWhenVisible() {
   if (document.hidden) return;
   if (Date.now() - state.deepseekBalanceLoadedAt >= 15 * 60 * 1000) {
     loadDeepSeekBalance();
-  }
-}
-
-async function clearServerCache() {
-  if (!window.confirm("确定清空 DeepSeek 本地翻译缓存？清空后相同内容会重新请求 API。")) return;
-  $("clearCacheBtn").disabled = true;
-  try {
-    const data = await api("/api/cache", { method: "DELETE" });
-    setMonitorMessage(`已清空 ${data.cleared} 条缓存`, "success");
-    await loadServiceStatus(false);
-  } catch (error) {
-    setMonitorMessage(`清空失败：${error.message}`, "error");
-  } finally {
-    $("clearCacheBtn").disabled = false;
-  }
-}
-
-async function restartService() {
-  if (!window.confirm("确定重启后端服务？正在进行的翻译请求会中断。")) return;
-  $("restartServiceBtn").disabled = true;
-  try {
-    await api("/api/restart", { method: "POST", body: "{}" });
-    setMonitorMessage("服务正在重启，稍后自动刷新状态", "success");
-    stopMonitorRefresh();
-    window.setTimeout(async function poll() {
-      if (await loadServiceStatus(false)) {
-        setMonitorMessage("服务已恢复", "success");
-        $("restartServiceBtn").disabled = false;
-        startMonitorRefresh();
-        return;
-      }
-      window.setTimeout(poll, 1000);
-    }, 1200);
-  } catch (error) {
-    setMonitorMessage(`重启失败：${error.message}`, "error");
-    $("restartServiceBtn").disabled = false;
   }
 }
 
@@ -566,7 +496,11 @@ function createResultToggle(name, meta, card, engineId) {
   const button = document.createElement("button");
   button.className = "result-toggle";
   button.type = "button";
-  button.innerHTML = `<span>${name}</span><span>${meta}</span>`;
+  const nameNode = document.createElement("span");
+  const metaNode = document.createElement("span");
+  nameNode.textContent = name;
+  metaNode.textContent = meta;
+  button.append(nameNode, metaNode);
   button.addEventListener("click", () => toggleResultPanel(card, engineId));
   return button;
 }
@@ -809,7 +743,6 @@ async function translate() {
 
 async function saveConfig() {
   const payload = {
-    app_password: $("appPassword").value,
     deepseek: {
       enabled: $("deepseekEnabled").checked,
       api_key: $("deepseekKey").value,
@@ -888,23 +821,12 @@ $("swapBtn").addEventListener("click", () => {
 });
 $("historyBtn").addEventListener("click", () => $("historyDialog").showModal());
 $("closeHistoryBtn").addEventListener("click", () => $("historyDialog").close());
-$("monitorBtn").addEventListener("click", () => {
-  clearMonitorMessage();
-  $("monitorDialog").showModal();
-  startMonitorRefresh();
-});
-$("closeMonitorBtn").addEventListener("click", () => {
-  $("monitorDialog").close();
-  stopMonitorRefresh();
-});
-$("refreshStatusBtn").addEventListener("click", () => loadServiceStatus());
-$("clearCacheBtn").addEventListener("click", clearServerCache);
-$("restartServiceBtn").addEventListener("click", restartService);
-$("monitorDialog").addEventListener("close", stopMonitorRefresh);
 document.addEventListener("visibilitychange", refreshBalanceWhenVisible);
 $("settingsBtn").addEventListener("click", () => {
   clearConfigMessage();
+  $("deepseekCacheStats").textContent = "正在读取";
   $("settingsDialog").showModal();
+  loadDeepSeekCacheStatus();
 });
 $("settingsDialog").addEventListener("click", (event) => {
   if (event.target.closest(".info-help")) return;
@@ -930,6 +852,7 @@ function placeHelpBox(help) {
   }
 }
 $("saveConfigBtn").addEventListener("click", saveConfig);
+$("clearCacheBtn").addEventListener("click", clearDeepSeekCache);
 $("logoutBtn").addEventListener("click", async () => {
   await api("/logout", { method: "POST", body: "{}" });
   window.location.href = "/login";
