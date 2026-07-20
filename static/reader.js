@@ -91,6 +91,7 @@ const FONT_ASSET_URLS = {
   "peak-plus": "/static/fonts/ThePeakFontPlus-Regular.woff2?v=5f91f0d2",
 };
 const FONT_LOAD_PROBE = "霞鹜文楷 天地玄黄 ABC 123";
+const FONT_CACHE_NAME = "reader-font-assets-v1";
 const fontLoadPromises = new Map();
 let fontApplyGeneration = 0;
 
@@ -199,10 +200,18 @@ async function apiBlob(path, options = {}, onResponse = null) {
     throw new Error(data.error || `请求失败：${response.status}`);
   }
   const cacheState = response.headers.get("X-TTS-Cache") || "";
-  if (typeof onResponse === "function") onResponse({ cacheState });
+  const serverTiming = {
+    cacheMs: Number(response.headers.get("X-TTS-Cache-Ms")) || 0,
+    generateMs: Number(response.headers.get("X-TTS-Generate-Ms")) || 0,
+    writeMs: Number(response.headers.get("X-TTS-Write-Ms")) || 0,
+    totalMs: Number(response.headers.get("X-TTS-Total-Ms")) || 0,
+  };
+  if (typeof onResponse === "function") onResponse({ cacheState, ...serverTiming });
+  const blob = await response.blob();
   return {
-    blob: await response.blob(),
+    blob,
     cacheState,
+    ...serverTiming,
   };
 }
 
@@ -945,7 +954,10 @@ async function saveProgress() {
 
 function setListenStatus(text) {
   const status = $("listenStatus");
-  if (status) status.textContent = text || "点击句子可从该句开始读";
+  if (!status) return;
+  const message = text || "点击句子可从该句开始读";
+  status.textContent = message;
+  status.title = message;
 }
 
 function audioErrorMessage(audio) {
@@ -1004,6 +1016,12 @@ function formatCountdown(ms) {
   const seconds = totalSeconds % 60;
   if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatStageDuration(ms) {
+  const value = Math.max(0, Number(ms) || 0);
+  if (value < 1000) return `${Math.max(1, Math.round(value))} 毫秒`;
+  return `${(value / 1000).toFixed(value >= 10000 ? 1 : 2)} 秒`;
 }
 
 function updateSleepTimerButton() {
@@ -1204,22 +1222,55 @@ async function fetchTtsAudio(index, token = readerState.ttsToken, scope = reader
     return readerState.ttsUrls.get(normalizedIndex);
   }
   const pendingKey = `${scope}:${normalizedIndex}`;
-  if (readerState.ttsPending.has(pendingKey)) return readerState.ttsPending.get(pendingKey);
+  if (readerState.ttsPending.has(pendingKey)) {
+    // Reuse an in-flight prefetch instead of spending a second MiMo request for the same sentence.
+    const isCurrentSentence = Number(readerState.currentSentence) === normalizedIndex;
+    if (token === readerState.ttsToken && scope === readerState.ttsScope && readerState.reading && isCurrentSentence) {
+      setListenStatus("预加载尚未完成｜等待语音");
+    }
+    return readerState.ttsPending.get(pendingKey);
+  }
   const text = sentenceText(normalizedIndex);
   if (!text || !hasReadableText(text)) throw new Error("没有可朗读文本");
-  const pending = apiBlob(
-    "/api/reader/tts",
-    {
-      method: "POST",
-      body: JSON.stringify({ text }),
-    },
-    ({ cacheState }) => {
-      const isCurrentSentence = Number(readerState.currentSentence) === normalizedIndex;
-      if (token === readerState.ttsToken && scope === readerState.ttsScope && readerState.reading && isCurrentSentence) {
-        setListenStatus(cacheState === "hit" ? "正在读取缓存" : "正在生成语音");
+  const isActiveCurrentSentence = () => (
+    token === readerState.ttsToken
+    && scope === readerState.ttsScope
+    && readerState.reading
+    && Number(readerState.currentSentence) === normalizedIndex
+  );
+  const pending = (async () => {
+    if (isActiveCurrentSentence()) {
+      setListenStatus("正在检查服务器音频缓存");
+      try {
+        const cacheStatus = await api("/api/reader/tts/cache", {
+          method: "POST",
+          body: JSON.stringify({ text }),
+        });
+        if (isActiveCurrentSentence()) {
+          setListenStatus(cacheStatus.cached
+            ? "服务器缓存命中｜读取音频中"
+            : "服务器缓存未命中｜等待 MiMo 生成");
+        }
+      } catch {
+        if (isActiveCurrentSentence()) setListenStatus("缓存状态检查失败，正在直接获取语音");
       }
-    },
-  ).then(({ blob }) => {
+    }
+    return apiBlob(
+      "/api/reader/tts",
+      {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      },
+      ({ cacheState, generateMs }) => {
+        if (!isActiveCurrentSentence()) return;
+        if (cacheState === "hit") {
+          setListenStatus("服务器缓存命中｜读取音频中");
+        } else {
+          setListenStatus(`MiMo 生成 ${formatStageDuration(generateMs)}｜下载音频中`);
+        }
+      },
+    );
+  })().then(({ blob }) => {
     const url = URL.createObjectURL(blob);
     readerState.ttsPending.delete(pendingKey);
     if (scope !== readerState.ttsScope) {
@@ -1236,11 +1287,16 @@ async function fetchTtsAudio(index, token = readerState.ttsToken, scope = reader
   return pending;
 }
 
-function prefetchUpcomingTtsAudio(index, token = readerState.ttsToken, scope = readerState.ttsScope) {
+async function prefetchUpcomingTtsAudio(index, token = readerState.ttsToken, scope = readerState.ttsScope) {
   const prefetches = ttsPrefetchIndexes(index);
-  prefetches.forEach((nextIndex) => {
-    fetchTtsAudio(nextIndex, token, scope).catch(() => {});
-  });
+  for (const nextIndex of prefetches) {
+    if (token !== readerState.ttsToken || scope !== readerState.ttsScope || !readerState.reading) return;
+    try {
+      await fetchTtsAudio(nextIndex, token, scope);
+    } catch {
+      // Prefetch failures are retried normally when the sentence becomes current.
+    }
+  }
 }
 
 function stopListening(resetStatus = true, clearTimer = true) {
@@ -1297,7 +1353,7 @@ async function playSentence(index, token = readerState.ttsToken) {
   highlightSentence(index, true);
   const scope = readerState.ttsScope;
   saveProgressSoon();
-  setListenStatus(readerState.ttsUrls.has(Number(index)) ? "正在读取浏览器缓存" : "正在检查语音缓存");
+  setListenStatus(readerState.ttsUrls.has(Number(index)) ? "浏览器内存缓存命中，正在准备播放" : "正在准备检查服务器缓存");
   try {
     const url = await fetchTtsAudio(index, token, scope);
     if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
@@ -1387,42 +1443,77 @@ function updateReaderFont() {
   window.localStorage.setItem("readerFontSize", value);
 }
 
-function fontCacheMarkerKey(fontId) {
-  return `readerFontCached:${fontId}:${FONT_ASSET_URLS[fontId] || "unknown"}`;
-}
-
-function rememberCachedFont(fontId) {
+async function openReaderFontCache() {
+  if (!("caches" in window)) return null;
   try {
-    window.localStorage.setItem(fontCacheMarkerKey(fontId), "1");
+    return await window.caches.open(FONT_CACHE_NAME);
   } catch {
-    // Private browsing or storage policies may disable localStorage.
+    return null;
   }
 }
 
-function hasCachedFontMarker(fontId) {
-  try {
-    return window.localStorage.getItem(fontCacheMarkerKey(fontId)) === "1";
-  } catch {
-    return false;
-  }
-}
-
-async function detectCachedFont(fontId) {
-  if (hasCachedFontMarker(fontId)) return true;
+async function locallyCachedFontResponse(fontId) {
   const url = FONT_ASSET_URLS[fontId];
-  if (!url) return false;
+  if (!url) return null;
+  const cache = await openReaderFontCache();
+  if (cache) {
+    const stored = await cache.match(url).catch(() => null);
+    if (stored?.ok) return stored;
+  }
   try {
     const response = await fetch(url, {
       cache: "only-if-cached",
       credentials: "same-origin",
       mode: "same-origin",
     });
-    if (!response.ok) return false;
-    rememberCachedFont(fontId);
-    return true;
+    if (!response.ok) return null;
+    if (cache) await cache.put(url, response.clone()).catch(() => {});
+    return response;
+  } catch {
+    return null;
+  }
+}
+
+async function persistReaderFontAsset(fontId) {
+  const url = FONT_ASSET_URLS[fontId];
+  const cache = await openReaderFontCache();
+  if (!url || !cache) return;
+  try {
+    const response = await fetch(url, {
+      cache: "force-cache",
+      credentials: "same-origin",
+      mode: "same-origin",
+    });
+    if (response.ok) await cache.put(url, response.clone());
+  } catch {
+    // The loaded font remains usable even if persistent browser storage is unavailable.
+  }
+}
+
+async function loadReaderFontFromResponse(fontId, response) {
+  const webFamily = FONT_WEB_FAMILIES[fontId];
+  if (!webFamily || typeof FontFace !== "function" || !document.fonts?.add || !response) return false;
+  try {
+    const face = new FontFace(webFamily, await response.arrayBuffer(), {
+      style: "normal",
+      weight: "400",
+    });
+    await face.load();
+    document.fonts.add(face);
+    return face.status === "loaded";
   } catch {
     return false;
   }
+}
+
+async function pruneStoredReaderFonts() {
+  const cache = await openReaderFontCache();
+  if (!cache) return;
+  const currentUrls = new Set(Object.values(FONT_ASSET_URLS).map((url) => new URL(url, window.location.href).href));
+  const requests = await cache.keys().catch(() => []);
+  await Promise.all(requests
+    .filter((request) => !currentUrls.has(request.url))
+    .map((request) => cache.delete(request)));
 }
 
 function setFontLoadState(fontId, state) {
@@ -1475,12 +1566,11 @@ async function ensureReaderFontLoaded(fontId, forceRetry = false) {
   const webFamily = FONT_WEB_FAMILIES[fontId];
   if (!webFamily) return true;
   if (!document.fonts?.load) {
-    rememberCachedFont(fontId);
     setFontLoadState(fontId, "ready");
     return true;
   }
   if (document.fonts.check(`400 18px "${webFamily}"`, FONT_LOAD_PROBE)) {
-    rememberCachedFont(fontId);
+    await persistReaderFontAsset(fontId);
     setFontLoadState(fontId, "ready");
     return true;
   }
@@ -1494,7 +1584,7 @@ async function ensureReaderFontLoaded(fontId, forceRetry = false) {
     fontLoadPromises.set(fontId, loadPromise);
   }
   const loaded = await fontLoadPromises.get(fontId);
-  if (loaded) rememberCachedFont(fontId);
+  if (loaded) await persistReaderFontAsset(fontId);
   setFontLoadState(fontId, loaded ? "ready" : "failed");
   return loaded;
 }
@@ -1503,18 +1593,19 @@ async function activateCachedReaderFont(fontId) {
   const webFamily = FONT_WEB_FAMILIES[fontId];
   if (!webFamily) return true;
   if (document.fonts?.check?.(`400 18px "${webFamily}"`, FONT_LOAD_PROBE)) {
-    rememberCachedFont(fontId);
     setFontLoadState(fontId, "ready");
     return true;
   }
   if (fontLoadPromises.has(fontId)) return ensureReaderFontLoaded(fontId);
-  if (!(await detectCachedFont(fontId))) {
+  const cachedResponse = await locallyCachedFontResponse(fontId);
+  if (!cachedResponse) {
     const status = document.querySelector(`.font-load-status[data-font="${fontId}"]`);
     if (status?.dataset.state !== "loading") setFontLoadState(fontId, "idle");
     return false;
   }
-  const loaded = await ensureReaderFontLoaded(fontId);
-  if (!loaded) setFontLoadState(fontId, "idle");
+  setFontLoadState(fontId, "loading");
+  const loaded = await loadReaderFontFromResponse(fontId, cachedResponse);
+  setFontLoadState(fontId, loaded ? "ready" : "idle");
   return loaded;
 }
 
@@ -1529,7 +1620,7 @@ function activateCachedReaderFonts() {
   });
 }
 
-async function updateReaderFontFamily(fontId = "", announce = true) {
+async function updateReaderFontFamily(fontId = "", announce = true, allowDownload = true) {
   const active = document.querySelector(".font-option.active");
   const value = normalizeFontId(fontId || active?.dataset.font || "system");
   const generation = ++fontApplyGeneration;
@@ -1548,7 +1639,9 @@ async function updateReaderFontFamily(fontId = "", announce = true) {
     const fontName = FONT_OPTIONS.find((font) => font.id === value)?.name || "字体";
     setStatus(`正在加载${fontName}`);
   }
-  const loaded = await ensureReaderFontLoaded(value);
+  const loaded = allowDownload
+    ? await ensureReaderFontLoaded(value)
+    : await activateCachedReaderFont(value);
   if (generation !== fontApplyGeneration) return;
   if (!loaded) {
     content.dataset.fontState = "failed";
@@ -1567,7 +1660,7 @@ async function updateReaderFontFamily(fontId = "", announce = true) {
 
 function refreshSelectedReaderFont() {
   const value = normalizeFontId(window.localStorage.getItem("readerFontFamily") || "system");
-  updateReaderFontFamily(value, false);
+  updateReaderFontFamily(value, false, false);
 }
 
 function applyReaderTheme(value) {
@@ -1658,7 +1751,7 @@ function restoreReaderSettings() {
   }
   updatePlaybackRate();
   updateReaderFont();
-  updateReaderFontFamily(fontId);
+  updateReaderFontFamily(fontId, false, false);
 }
 
 function selectOption(label, value, selected = false) {
@@ -2071,4 +2164,5 @@ $("logoutBtn").addEventListener("click", async () => {
 });
 
 restoreReaderSettings();
+pruneStoredReaderFonts();
 Promise.all([loadBooks(), loadImportJobs(), loadTtsConfig()]).catch((error) => setStatus(error.message));

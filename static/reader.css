@@ -1565,6 +1565,10 @@ button {
 
   .listen-toolbar span {
     grid-column: 1 / -1;
+    line-height: 1.35;
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
   }
 
   .reader-toolbar button {

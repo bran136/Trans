@@ -2221,8 +2221,6 @@ def reject_cross_site_writes():
         configured_password = clean_single_line_value(load_config().get("app_password", ""))
         if configured_password.lower() in UNSAFE_APP_PASSWORDS or len(configured_password) < 12:
             return jsonify({"error": "服务拒绝使用默认或弱密码，请先配置至少 12 位的 APP_PASSWORD"}), 503
-    if request.path.startswith("/static/fonts/") and not require_auth():
-        return jsonify({"error": "unauthorized"}), 401
     if request.method in {"GET", "HEAD", "OPTIONS"}:
         return None
     if request.path != "/api/books":
@@ -2266,7 +2264,7 @@ def add_security_headers(response):
         "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
     )
     if request.path.startswith("/static/fonts/") and request.args.get("v"):
-        response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     elif request.path.startswith("/api/") or request.path in {"/", "/login", "/translate", "/reader"}:
         response.headers.setdefault("Cache-Control", "no-store")
     return response
@@ -2794,7 +2792,7 @@ def request_mimo_tts(text, settings):
     return decode_mimo_audio_payload(payload)
 
 
-def synthesize_reader_tts(text, config):
+def prepare_reader_tts_request(text, config):
     settings = config["reader_tts"]
     if not settings.get("enabled"):
         raise ValueError("听书服务未启用")
@@ -2810,38 +2808,88 @@ def synthesize_reader_tts(text, config):
         audio_format = "wav"
     cache_key = tts_cache_key(text, settings)
     cache_path = tts_cache_path(cache_key, audio_format)
+    return settings, text, audio_format, cache_key, cache_path
+
+
+def reader_tts_cache_status(text, config):
+    settings, _, audio_format, cache_key, cache_path = prepare_reader_tts_request(text, config)
+    cache_started = time.perf_counter()
+    cached_path = None
+    if settings.get("cache_enabled", True):
+        with TTS_CACHE_LOCK:
+            cached_path = find_cached_tts(cache_path)
+    cache_ms = (time.perf_counter() - cache_started) * 1000
+    size_bytes = 0
+    if cached_path is not None:
+        try:
+            size_bytes = cached_path.stat().st_size
+        except OSError:
+            cached_path = None
+    return {
+        "cached": cached_path is not None,
+        "cache_enabled": bool(settings.get("cache_enabled", True)),
+        "cache_key": cache_key,
+        "format": audio_format,
+        "size_bytes": size_bytes,
+        "cache_ms": round(cache_ms, 2),
+    }
+
+
+def synthesize_reader_tts(text, config):
+    total_started = time.perf_counter()
+    settings, text, audio_format, cache_key, cache_path = prepare_reader_tts_request(text, config)
+    cache_started = time.perf_counter()
     if settings.get("cache_enabled", True):
         with TTS_CACHE_LOCK:
             cached_path = find_cached_tts(cache_path)
             if cached_path is not None:
+                cache_ms = (time.perf_counter() - cache_started) * 1000
                 return {
                     "path": cached_path,
                     "format": audio_format,
                     "cached": True,
                     "cache_key": cache_key,
+                    "cache_ms": round(cache_ms, 2),
+                    "generate_ms": 0.0,
+                    "write_ms": 0.0,
+                    "total_ms": round((time.perf_counter() - total_started) * 1000, 2),
                 }
+    cache_ms = (time.perf_counter() - cache_started) * 1000
+    generate_started = time.perf_counter()
     data = request_mimo_tts(text, settings)
+    generate_ms = (time.perf_counter() - generate_started) * 1000
+    write_ms = 0.0
     if settings.get("cache_enabled", True) and data:
         with TTS_CACHE_LOCK:
             ensure_private_directory(TTS_CACHE_DIR)
+            write_started = time.perf_counter()
             try:
                 write_private_bytes_atomic(cache_path, data)
                 os.utime(cache_path, None)
                 prune_tts_cache()
+                write_ms = (time.perf_counter() - write_started) * 1000
                 if cache_path.exists():
                     return {
                         "path": cache_path,
                         "format": audio_format,
                         "cached": False,
                         "cache_key": cache_key,
+                        "cache_ms": round(cache_ms, 2),
+                        "generate_ms": round(generate_ms, 2),
+                        "write_ms": round(write_ms, 2),
+                        "total_ms": round((time.perf_counter() - total_started) * 1000, 2),
                     }
             except OSError:
-                pass
+                write_ms = (time.perf_counter() - write_started) * 1000
     return {
         "data": data,
         "format": audio_format,
         "cached": False,
         "cache_key": cache_key,
+        "cache_ms": round(cache_ms, 2),
+        "generate_ms": round(generate_ms, 2),
+        "write_ms": round(write_ms, 2),
+        "total_ms": round((time.perf_counter() - total_started) * 1000, 2),
     }
 
 
@@ -3429,16 +3477,37 @@ def api_reader_tts():
                 max_age=0,
             )
         response.headers["X-TTS-Cache"] = "hit" if result.get("cached") else "miss"
+        response.headers["X-TTS-Cache-Ms"] = str(result.get("cache_ms", 0))
+        response.headers["X-TTS-Generate-Ms"] = str(result.get("generate_ms", 0))
+        response.headers["X-TTS-Write-Ms"] = str(result.get("write_ms", 0))
+        response.headers["X-TTS-Total-Ms"] = str(result.get("total_ms", 0))
         app.logger.info(
-            "reader tts ok ip=%s cached=%s format=%s key=%s",
+            "reader tts ok ip=%s cached=%s format=%s key=%s cache=%.1fms generate=%.1fms write=%.1fms total=%.1fms",
             request.remote_addr,
             bool(result.get("cached")),
             audio_format,
             str(result.get("cache_key", ""))[:12],
+            float(result.get("cache_ms", 0)),
+            float(result.get("generate_ms", 0)),
+            float(result.get("write_ms", 0)),
+            float(result.get("total_ms", 0)),
         )
         return response
     except Exception as exc:
         app.logger.warning("reader tts failed ip=%s error=%s", request.remote_addr, exc)
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/reader/tts/cache", methods=["POST"])
+def api_reader_tts_cache_status():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        payload = request_json_object()
+        status = reader_tts_cache_status(payload.get("text", ""), load_config())
+        return jsonify(status)
+    except Exception as exc:
+        app.logger.warning("reader tts cache check failed ip=%s error=%s", request.remote_addr, exc)
         return jsonify({"error": str(exc)}), 400
 
 
