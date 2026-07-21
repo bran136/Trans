@@ -20,54 +20,6 @@ html.reader-dark-root body {
   min-height: 100%;
 }
 
-@font-face {
-  font-family: "ReaderJasonHandwriting";
-  src: url("/static/fonts/JasonHandwriting1.woff2?v=a937a66f") format("woff2");
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "ReaderSourceHanSerif";
-  src: url("/static/fonts/SourceHanSerifCN-Regular.woff2?v=46fe8158") format("woff2");
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "ReaderSourceHanSans";
-  src: url("/static/fonts/SourceHanSansCN-Regular.woff2?v=e766621f") format("woff2");
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "ReaderLXGWWenKai";
-  src: url("/static/fonts/LXGWWenKai-Regular.woff2?v=8c92d1b4") format("woff2");
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "ReaderYShiWritten";
-  src: url("/static/fonts/YShiWritten-Regular.woff2?v=943d3985") format("woff2");
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "ReaderThePeakFontPlus";
-  src: url("/static/fonts/ThePeakFontPlus-Regular.woff2?v=5f91f0d2") format("woff2");
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-}
-
 * {
   box-sizing: border-box;
 }
@@ -585,13 +537,66 @@ button {
   min-width: 72px;
 }
 
+.mimo-balance-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mimo-balance-panel[hidden] {
+  display: none;
+}
+
 .mimo-balance {
   min-height: 22px;
   padding: 2px 0;
   color: var(--muted);
   font-size: 12px;
   font-weight: 800;
-  white-space: nowrap;
+}
+
+.mimo-balance-actions {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 6px;
+}
+
+.mimo-balance-actions a,
+.mimo-balance-actions button {
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--ink);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 18px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.mimo-balance-actions button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.reader-dark .mimo-balance-actions a,
+.reader-dark .mimo-balance-actions button {
+  border-color: var(--line);
+  background: rgba(25, 32, 45, 0.92);
+  color: var(--ink);
+}
+
+@media (max-width: 560px) {
+  .mimo-balance-panel {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
 }
 
 .sleep-panel {
@@ -1036,26 +1041,56 @@ button {
   line-height: 1.45;
 }
 
+#ttsBaseUrl:disabled {
+  border-color: #d7dde7;
+  background: #edf0f4;
+  color: #8a93a3;
+  cursor: not-allowed;
+  opacity: 1;
+  -webkit-text-fill-color: #8a93a3;
+}
+
 .tts-wide {
   grid-column: 1 / -1;
 }
 
-.tts-cookie-clear {
-  justify-self: start;
-  margin-top: -2px;
-  min-height: 32px;
-  padding: 0 12px;
-  border: 1px solid rgba(180, 35, 24, 0.22);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.78);
-  color: #b42318;
+.mimo-cookie-dialog {
+  width: min(560px, calc(100vw - 24px));
+}
+
+.mimo-cookie-field {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
   font-weight: 800;
 }
 
-.reader-dark .tts-cookie-clear {
+.mimo-cookie-field textarea {
+  width: 100%;
+  min-height: 128px;
+  padding: 10px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  line-height: 1.45;
+}
+
+.mimo-cookie-help {
+  margin: -4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.reader-dark .mimo-cookie-field textarea {
+  border-color: var(--line);
   background: rgba(25, 32, 45, 0.92);
-  color: #ffb4a8;
-  border-color: rgba(255, 180, 168, 0.24);
+  color: var(--ink);
 }
 
 .tts-cache-row {
@@ -1080,6 +1115,14 @@ button {
   border-color: var(--line);
   background: rgba(25, 32, 45, 0.92);
   color: var(--ink);
+}
+
+.reader-dark #ttsBaseUrl:disabled {
+  border-color: #303949;
+  background: #202633;
+  color: #7f8999;
+  opacity: 1;
+  -webkit-text-fill-color: #7f8999;
 }
 
 .reader-dark .tts-settings-grid input:-webkit-autofill,

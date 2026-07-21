@@ -48,6 +48,7 @@ http://127.0.0.1:31000
 ./path_dir/.env.example            示例配置，不放真实密钥
 ./path_dir/config/app_config.json  普通页面配置，缺失时自动生成，不保存真实 API Key
 ./path_dir/config/deepseek_cache.sqlite3  DeepSeek 翻译持久化缓存
+./path_dir/config/mimo_balance_state.json  MiMo 余额、过期状态和白名单 Cookie（私有）
 ./path_dir/logs/app.log            应用日志
 ./path_dir/reader_data             书籍、章节缓存、TTS 音频缓存
 ./path_dir/static/fonts            页面字体资产和许可说明
@@ -75,7 +76,6 @@ ALLOW_CUSTOM_DEEPSEEK_BASE_URL=false
 MIMO_API_KEY=
 MIMO_TTS_BASE_URL=https://api.xiaomimimo.com/v1/chat/completions
 MIMO_BALANCE_URL=https://platform.xiaomimimo.com/api/v1/balance
-MIMO_BALANCE_COOKIE=
 MIMO_TTS_MODEL=mimo-v2.5-tts
 MIMO_TTS_VOICE=mimo_default
 MIMO_TTS_STYLE_PROMPT=适合小说听书，自然清晰地朗读，情绪丰富一点。
@@ -236,7 +236,7 @@ GET /api/deepseek/balance
 - 支持目录跳转、上一章、下一章。
 - 支持字体大小、字体切换和黑暗模式。
 - 自定义字体全部使用 WOFF2；包含写意体和随峰体 Plus 后，原始字体资源约 68.9MiB，网页字体约 35.4MiB。字体按选择加载，不会在页面启动时下载全部资源。
-- 字体设置中会显示每款字体的大小和“未加载 / 加载中 / 已加载 / 加载失败”状态，并提供小型手动加载按钮。手动加载成功后，字体会同时保存到浏览器专用 Cache Storage；页面启动和打开阅读设置时直接从该本地仓库激活字体，不发起网络下载。本地没有的字体只有主动选择或点击“加载”时才会下载，鼠标经过不会触发下载。
+- 字体设置中会显示每款字体的大小和“未加载 / 加载中 / 已加载 / 加载失败”状态，并提供小型手动加载按钮。所有字体加载都先查询浏览器专用 Cache Storage；写意体是登录后标题必需字体，本地没有时会自动请求一次并保存，本地已有时直接激活；其他字体只有主动选择或点击“加载/重试”时才允许从服务器请求。打开阅读设置只检查并激活本地字体，不会自动下载其他字体。下载响应会直接注册为二进制 `FontFace` 并同时写入本地缓存，避免 CSP 拦截和重复请求。
 - 字体资源不经过登录 Session，使用公开的一年 `immutable` 浏览器缓存。字体 URL 带内容版本号；字体文件升级时同步更新版本号即可拉取新文件，不会继续使用旧字体。
 - 浏览器会显式确认所选字体加载成功，并在页面从后台恢复时重新校验，避免 Chrome/macOS 长时间阅读后回退到系统字体。
 - 手机端顶部阅读控制区固定，方便长文阅读时切换章节。
@@ -279,7 +279,7 @@ https://mimo.xiaomi.com/mimo-v2-5-tts
 - 启用或关闭听书
 - MiMo API Key
 - 查看接口地址（地址只能由服务器 `.env` 修改）
-- 余额 Cookie
+- 余额 Cookie（通过独立“配置Cookie”弹窗更新）
 - 模型
 - 音色
 - 单句最大字符数
@@ -315,14 +315,15 @@ mimo-v2.5-tts
 
 MiMo 余额显示：
 
-- 听书页面会显示 MiMo 余额和更新时间。
+- 听书页面会显示 MiMo 余额和最后更新时间，并提供“配置Cookie”“MiMo控制台”和“重新查询”按钮。
 - 余额查询通过后端代理请求 `MIMO_BALANCE_URL`。
 - 前端不会获得 MiMo API Key 或已保存的余额 Cookie。
-- 余额 Cookie 可以在听书配置页更新，也可以点击按钮清空。
-- Cookie 通常会随小米网页登录态变化而失效，失效后需要在页面里重新配置。
+- 余额 Cookie 通过独立弹窗更新，保存后立即查询余额。
+- 用户可以粘贴完整 Cookie，但后端只保留 `api-platform_serviceToken`、`userId`、`api-platform_ph` 和 `api-platform_slh` 四个白名单字段；前两个字段必须存在。
+- Cookie 通常会随小米网页登录态变化而失效。确认失效后会保留并持久化最后一次成功余额，标记“数据已过期”，同时暂停自动查询；更新 Cookie 后会立即查询并恢复刷新。
 - 后端不主动定时查询余额；只有前端页面请求时才会查询。
-- 余额查询成功后缓存 15 分钟，失败后 15 秒内不会反复请求。
-- 查询失败会显示具体原因和重试倒计时。
+- 余额查询成功后缓存 15 分钟；自动查询失败后等待 15 秒再重试，手动“重新查询”会立即结束倒计时并直接查询。
+- Cookie 未过期时，临时查询失败会保留已有余额，显示具体原因和 15 秒重试倒计时。
 - Cookie、配置、请求过快和上游网络错误会区分返回，便于判断是否需要更新 Cookie。
 
 ## 听书缓存
@@ -426,12 +427,12 @@ MiMo 余额显示：
 - 登录密码不会返回前端。
 - 修改总入口密码必须先验证当前密码，新旧密码不能相同；连续验证失败会触发限速。
 - API Key 保存到 `.env`。
-- MiMo 余额 Cookie 保存到 `.env`，普通页面配置文件不保存真实 Cookie。
+- MiMo 余额 Cookie 不从 `.env` 读取或写入，只保留四个白名单字段，与最后成功余额和过期状态一起保存在私有的 `config/mimo_balance_state.json` 中。
 - 浏览器配置页只允许提交新 Key。
 - 服务端不会把真实 Key 或已保存的余额 Cookie 返回给浏览器。
 - 配置页只显示“已配置，留空不修改”。
 - `.env` 写入会清洗换行，避免注入额外环境变量。
-- `.env`、应用密钥、DeepSeek 缓存、书籍和音频缓存文件使用私有权限；它们仍属于服务器敏感数据，不应公开或提交到 Git。
+- `.env`、应用密钥、MiMo 余额状态、DeepSeek 缓存、书籍和音频缓存文件使用私有权限；它们仍属于服务器敏感数据，不应公开、备份到不可信位置或提交到 Git。
 - Session Cookie 设置了 `HttpOnly` 和 `SameSite=Lax`。
 - 可通过 `SESSION_COOKIE_SECURE=true` 强制会话 Cookie 仅在 HTTPS 下发送。
 - 登录失败带轻量限速：同一 IP 在 5 分钟内失败 8 次后会暂时拒绝继续尝试。

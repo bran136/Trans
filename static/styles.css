@@ -12,14 +12,6 @@
   --shadow: 0 24px 70px rgba(44, 57, 120, 0.14);
 }
 
-@font-face {
-  font-family: "AppYShiWritten";
-  src: url("/static/fonts/YShiWritten-Regular.woff2?v=943d3985") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-
 * {
   box-sizing: border-box;
 }

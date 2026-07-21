@@ -42,6 +42,7 @@ const readerState = {
   mimoBalanceTimer: null,
   mimoBalanceRetryTimer: null,
   mimoBalanceCountdownTimer: null,
+  mimoBalanceRequestId: 0,
   tocEditBookId: "",
   tocEditBook: null,
   tocEditChapters: [],
@@ -90,9 +91,10 @@ const FONT_ASSET_URLS = {
   "yshi-written": "/static/fonts/YShiWritten-Regular.woff2?v=943d3985",
   "peak-plus": "/static/fonts/ThePeakFontPlus-Regular.woff2?v=5f91f0d2",
 };
-const FONT_LOAD_PROBE = "霞鹜文楷 天地玄黄 ABC 123";
 const FONT_CACHE_NAME = "reader-font-assets-v1";
 const fontLoadPromises = new Map();
+const fontActivationPromises = new Map();
+const loadedReaderFontIds = new Set();
 let fontApplyGeneration = 0;
 
 function isIOSLike() {
@@ -181,6 +183,7 @@ async function api(path, options = {}) {
     const error = new Error(data.error || `请求失败：${response.status}`);
     error.code = data.code || "";
     error.status = response.status;
+    error.data = data;
     throw error;
   }
   return response.json();
@@ -1456,37 +1459,26 @@ async function locallyCachedFontResponse(fontId) {
   const url = FONT_ASSET_URLS[fontId];
   if (!url) return null;
   const cache = await openReaderFontCache();
-  if (cache) {
-    const stored = await cache.match(url).catch(() => null);
-    if (stored?.ok) return stored;
-  }
-  try {
-    const response = await fetch(url, {
-      cache: "only-if-cached",
-      credentials: "same-origin",
-      mode: "same-origin",
-    });
-    if (!response.ok) return null;
-    if (cache) await cache.put(url, response.clone()).catch(() => {});
-    return response;
-  } catch {
-    return null;
-  }
+  if (!cache) return null;
+  const stored = await cache.match(url).catch(() => null);
+  return stored?.ok ? stored : null;
 }
 
-async function persistReaderFontAsset(fontId) {
+async function downloadAndStoreReaderFont(fontId, forceRetry = false) {
   const url = FONT_ASSET_URLS[fontId];
-  const cache = await openReaderFontCache();
-  if (!url || !cache) return;
+  if (!url) return false;
   try {
     const response = await fetch(url, {
-      cache: "force-cache",
+      cache: forceRetry ? "reload" : "default",
       credentials: "same-origin",
       mode: "same-origin",
     });
-    if (response.ok) await cache.put(url, response.clone());
+    if (!response.ok) return false;
+    const cache = await openReaderFontCache();
+    if (cache) await cache.put(url, response.clone()).catch(() => {});
+    return loadReaderFontFromResponse(fontId, response);
   } catch {
-    // The loaded font remains usable even if persistent browser storage is unavailable.
+    return false;
   }
 }
 
@@ -1500,10 +1492,16 @@ async function loadReaderFontFromResponse(fontId, response) {
     });
     await face.load();
     document.fonts.add(face);
-    return face.status === "loaded";
+    const loaded = face.status === "loaded";
+    if (loaded) loadedReaderFontIds.add(fontId);
+    return loaded;
   } catch {
     return false;
   }
+}
+
+function isReaderFontLoaded(fontId) {
+  return loadedReaderFontIds.has(fontId);
 }
 
 async function pruneStoredReaderFonts() {
@@ -1541,50 +1539,32 @@ function waitForFontStatusPaint() {
   });
 }
 
-async function loadFreshReaderFontFace(fontId) {
-  const webFamily = FONT_WEB_FAMILIES[fontId];
-  const url = FONT_ASSET_URLS[fontId];
-  if (typeof FontFace !== "function" || !document.fonts?.add || !url) {
-    const faces = await document.fonts.load(`400 18px "${webFamily}"`, FONT_LOAD_PROBE);
-    return faces.length > 0;
-  }
-  const face = new FontFace(webFamily, `url("${url}") format("woff2")`, {
-    style: "normal",
-    weight: "400",
-  });
-  document.fonts.add(face);
-  try {
-    await face.load();
-    return face.status === "loaded";
-  } catch {
-    document.fonts.delete?.(face);
-    return false;
-  }
-}
-
 async function ensureReaderFontLoaded(fontId, forceRetry = false) {
   const webFamily = FONT_WEB_FAMILIES[fontId];
   if (!webFamily) return true;
-  if (!document.fonts?.load) {
+  if (!document.fonts?.add || typeof FontFace !== "function") {
     setFontLoadState(fontId, "ready");
     return true;
   }
-  if (document.fonts.check(`400 18px "${webFamily}"`, FONT_LOAD_PROBE)) {
-    await persistReaderFontAsset(fontId);
+  if (isReaderFontLoaded(fontId)) {
+    setFontLoadState(fontId, "ready");
+    return true;
+  }
+  const activated = await activateCachedReaderFont(fontId);
+  if (activated) {
     setFontLoadState(fontId, "ready");
     return true;
   }
   if (!fontLoadPromises.has(fontId)) {
     setFontLoadState(fontId, "loading");
     const loadPromise = (forceRetry
-      ? waitForFontStatusPaint().then(() => loadFreshReaderFontFace(fontId))
-      : document.fonts.load(`400 18px "${webFamily}"`, FONT_LOAD_PROBE).then((faces) => faces.length > 0))
+      ? waitForFontStatusPaint().then(() => downloadAndStoreReaderFont(fontId, true))
+      : downloadAndStoreReaderFont(fontId))
       .catch(() => false)
       .finally(() => fontLoadPromises.delete(fontId));
     fontLoadPromises.set(fontId, loadPromise);
   }
   const loaded = await fontLoadPromises.get(fontId);
-  if (loaded) await persistReaderFontAsset(fontId);
   setFontLoadState(fontId, loaded ? "ready" : "failed");
   return loaded;
 }
@@ -1592,19 +1572,25 @@ async function ensureReaderFontLoaded(fontId, forceRetry = false) {
 async function activateCachedReaderFont(fontId) {
   const webFamily = FONT_WEB_FAMILIES[fontId];
   if (!webFamily) return true;
-  if (document.fonts?.check?.(`400 18px "${webFamily}"`, FONT_LOAD_PROBE)) {
+  if (isReaderFontLoaded(fontId)) {
     setFontLoadState(fontId, "ready");
     return true;
   }
-  if (fontLoadPromises.has(fontId)) return ensureReaderFontLoaded(fontId);
-  const cachedResponse = await locallyCachedFontResponse(fontId);
-  if (!cachedResponse) {
-    const status = document.querySelector(`.font-load-status[data-font="${fontId}"]`);
-    if (status?.dataset.state !== "loading") setFontLoadState(fontId, "idle");
-    return false;
+  if (fontLoadPromises.has(fontId)) {
+    return fontLoadPromises.get(fontId);
   }
-  setFontLoadState(fontId, "loading");
-  const loaded = await loadReaderFontFromResponse(fontId, cachedResponse);
+  if (!fontActivationPromises.has(fontId)) {
+    const activationPromise = (async () => {
+      const cachedResponse = await locallyCachedFontResponse(fontId);
+      if (!cachedResponse) return false;
+      setFontLoadState(fontId, "loading");
+      return loadReaderFontFromResponse(fontId, cachedResponse);
+    })()
+      .catch(() => false)
+      .finally(() => fontActivationPromises.delete(fontId));
+    fontActivationPromises.set(fontId, activationPromise);
+  }
+  const loaded = await fontActivationPromises.get(fontId);
   setFontLoadState(fontId, loaded ? "ready" : "idle");
   return loaded;
 }
@@ -1722,7 +1708,7 @@ function renderFontPicker() {
         }
       });
       tools.appendChild(loadButton);
-      const loaded = document.fonts?.check?.(`400 18px "${FONT_WEB_FAMILIES[font.id]}"`, FONT_LOAD_PROBE);
+      const loaded = isReaderFontLoaded(font.id);
       card.appendChild(tools);
       picker.appendChild(card);
       setFontLoadState(font.id, loaded ? "ready" : "idle");
@@ -1789,14 +1775,26 @@ function formatCacheTime(timestamp) {
 function formatBalanceTime(timestamp) {
   if (!timestamp) return "未更新";
   const date = new Date(Number(timestamp) * 1000);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
   const hours = String(date.getHours()).padStart(2, "0");
   const minutes = String(date.getMinutes()).padStart(2, "0");
-  return `${hours}:${minutes}`;
+  return `${year}-${month}-${day} ${hours}:${minutes}`;
 }
 
 function formatMimoBalance() {
   const balance = readerState.mimoBalance;
   if (!ttsReady()) return "";
+  if (!readerState.ttsConfig?.balance_cookie_configured) return "MiMo 余额：未配置 Cookie";
+  const hasBalance = !!balance?.total_balance && !!balance?.currency;
+  const symbol = hasBalance ? (balance.currency === "CNY" ? "¥" : `${balance.currency} `) : "";
+  const value = hasBalance ? `${symbol}${balance.total_balance}` : "";
+  if (balance?.auth_expired) {
+    return hasBalance
+      ? `MiMo 余额：${value} · 数据已过期（最后更新 ${formatBalanceTime(balance.updated_at)}）`
+      : "MiMo 余额：Cookie 已过期";
+  }
   if (!balance) {
     const reason = readerState.mimoBalanceError || "查询失败";
     const retryLeft = Math.max(0, Math.ceil((readerState.mimoBalanceRetryAt - Date.now()) / 1000));
@@ -1804,16 +1802,23 @@ function formatMimoBalance() {
       ? `MiMo 余额：${reason}，${retryLeft} 秒后重试`
       : `MiMo 余额：${reason}，正在重试`;
   }
-  if (!balance.total_balance || !balance.currency) return "MiMo 余额：未知";
-  const symbol = balance.currency === "CNY" ? "¥" : `${balance.currency} `;
-  return `MiMo 余额：${symbol}${balance.total_balance} · ${formatBalanceTime(balance.updated_at)}`;
+  if (readerState.mimoBalanceError) {
+    const retryLeft = Math.max(0, Math.ceil((readerState.mimoBalanceRetryAt - Date.now()) / 1000));
+    const retryText = retryLeft > 0 ? `${retryLeft} 秒后重试` : "正在重试";
+    return hasBalance
+      ? `MiMo 余额：${value} · 更新失败：${readerState.mimoBalanceError}，${retryText}`
+      : `MiMo 余额：${readerState.mimoBalanceError}，${retryText}`;
+  }
+  if (!hasBalance) return "MiMo 余额：未知";
+  return `MiMo 余额：${value} · 更新于 ${formatBalanceTime(balance.updated_at)}`;
 }
 
 function renderMimoBalance() {
   const node = $("mimoBalance");
+  const panel = $("mimoBalancePanel");
   if (!node) return;
   node.textContent = formatMimoBalance();
-  node.hidden = !ttsReady();
+  if (panel) panel.hidden = !ttsReady();
 }
 
 function stopMimoBalanceCountdown() {
@@ -1832,24 +1837,52 @@ function startMimoBalanceCountdown() {
   }, 1000);
 }
 
-async function loadMimoBalance() {
-  if (document.hidden || !ttsReady()) return;
+function scheduleMimoBalanceInterval() {
+  window.clearInterval(readerState.mimoBalanceTimer);
+  readerState.mimoBalanceTimer = null;
+  if (!ttsReady() || !readerState.ttsConfig?.balance_cookie_configured || readerState.mimoBalance?.auth_expired) return;
+  readerState.mimoBalanceTimer = window.setInterval(loadMimoBalance, 15 * 60 * 1000);
+}
+
+async function loadMimoBalance(options = {}) {
+  const force = !!options.force;
+  if ((!force && document.hidden) || !ttsReady() || !readerState.ttsConfig?.balance_cookie_configured) return false;
+  const requestId = ++readerState.mimoBalanceRequestId;
   window.clearTimeout(readerState.mimoBalanceRetryTimer);
   readerState.mimoBalanceRetryAt = 0;
   stopMimoBalanceCountdown();
+  renderMimoBalance();
   try {
-    const data = await api("/api/reader/mimo-balance");
+    const data = await api(`/api/reader/mimo-balance${force ? "?force=1" : ""}`);
+    if (requestId !== readerState.mimoBalanceRequestId) return false;
     readerState.mimoBalance = data.balance;
+    readerState.ttsConfig.balance_status = data.balance;
     readerState.mimoBalanceError = "";
     readerState.mimoBalanceLoadedAt = Date.now();
+    if (data.balance?.auth_expired) {
+      window.clearInterval(readerState.mimoBalanceTimer);
+      readerState.mimoBalanceTimer = null;
+    } else {
+      scheduleMimoBalanceInterval();
+    }
+    renderMimoBalance();
+    return !data.balance?.auth_expired;
   } catch (error) {
-    readerState.mimoBalance = null;
+    if (requestId !== readerState.mimoBalanceRequestId) return false;
+    if (error.data?.balance) readerState.mimoBalance = error.data.balance;
     readerState.mimoBalanceError = error.message || "查询失败";
-    readerState.mimoBalanceRetryAt = Date.now() + 15 * 1000;
-    readerState.mimoBalanceRetryTimer = window.setTimeout(loadMimoBalance, 15 * 1000);
-    startMimoBalanceCountdown();
+    const shouldRetry = error.code !== "missing_cookie" && !readerState.mimoBalance?.auth_expired;
+    if (shouldRetry) {
+      readerState.mimoBalanceRetryAt = Date.now() + 15 * 1000;
+      readerState.mimoBalanceRetryTimer = window.setTimeout(loadMimoBalance, 15 * 1000);
+      startMimoBalanceCountdown();
+    } else {
+      window.clearInterval(readerState.mimoBalanceTimer);
+      readerState.mimoBalanceTimer = null;
+    }
+    renderMimoBalance();
+    return false;
   }
-  renderMimoBalance();
 }
 
 function startMimoBalanceRefresh() {
@@ -1863,12 +1896,24 @@ function startMimoBalanceRefresh() {
     renderMimoBalance();
     return;
   }
+  if (!readerState.ttsConfig?.balance_cookie_configured) {
+    readerState.mimoBalanceError = "";
+    readerState.mimoBalanceRetryAt = 0;
+    renderMimoBalance();
+    return;
+  }
+  if (readerState.mimoBalance?.auth_expired) {
+    readerState.mimoBalanceError = "";
+    readerState.mimoBalanceRetryAt = 0;
+    renderMimoBalance();
+    return;
+  }
   loadMimoBalance();
-  readerState.mimoBalanceTimer = window.setInterval(loadMimoBalance, 15 * 60 * 1000);
 }
 
 function refreshMimoBalanceWhenVisible() {
   if (document.hidden || !ttsReady()) return;
+  if (!readerState.ttsConfig?.balance_cookie_configured || readerState.mimoBalance?.auth_expired) return;
   if (Date.now() - readerState.mimoBalanceLoadedAt >= 15 * 60 * 1000) {
     loadMimoBalance();
   }
@@ -1891,6 +1936,7 @@ async function loadTtsConfig() {
 
 function renderTtsConfig() {
   const config = readerState.ttsConfig || {};
+  readerState.mimoBalance = config.balance_status || readerState.mimoBalance;
   $("ttsEnabled").checked = !!config.enabled;
   $("ttsApiKey").value = "";
   $("ttsApiKey").placeholder = config.api_key_configured ? "已配置，留空不修改" : "未配置";
@@ -1907,8 +1953,6 @@ function renderTtsConfig() {
   renderTtsVoiceOptions(config);
   $("ttsChunkChars").value = config.chunk_chars ?? 260;
   $("ttsStylePrompt").value = config.style_prompt || "";
-  $("ttsBalanceCookie").value = "";
-  $("ttsBalanceCookie").placeholder = config.balance_cookie_configured ? "已配置，留空不修改" : "未配置，粘贴 platform.xiaomimimo.com 的 Cookie";
   $("ttsCacheEnabled").checked = config.cache_enabled !== false;
   renderTtsCacheStats(config.cache_stats || {});
   renderQuickVoiceOptions(config);
@@ -1983,7 +2027,6 @@ function ttsConfigPayload(overrides = {}) {
     model: $("ttsModel")?.value || config.model,
     voice_id: $("ttsVoiceId")?.value || config.voice_id,
     style_prompt: $("ttsStylePrompt")?.value ?? config.style_prompt ?? "",
-    balance_cookie: $("ttsBalanceCookie")?.value || "",
     chunk_chars: Number($("ttsChunkChars")?.value || config.chunk_chars || 260),
     cache_enabled: $("ttsCacheEnabled") ? $("ttsCacheEnabled").checked : config.cache_enabled !== false,
     ...overrides,
@@ -2009,22 +2052,80 @@ async function saveTtsConfig() {
   }
 }
 
-async function clearMimoBalanceCookie() {
-  if (!window.confirm("确定清空已保存的 MiMo 余额 Cookie？清空后余额可能无法查询。")) return;
-  const button = $("ttsClearBalanceCookieBtn");
+async function refreshMimoBalance() {
+  const button = $("refreshMimoBalanceBtn");
   if (button) button.disabled = true;
   try {
-    showTtsConfigMessage("正在清空余额 Cookie");
+    await loadMimoBalance({ force: true });
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function showMimoCookieMessage(text, type = "") {
+  const node = $("mimoCookieMessage");
+  if (!node) return;
+  node.textContent = text || "";
+  node.className = `reader-config-message ${type}`.trim();
+  node.hidden = !text;
+}
+
+function openMimoCookieDialog() {
+  const input = $("mimoBalanceCookieInput");
+  input.value = "";
+  input.placeholder = readerState.ttsConfig?.balance_cookie_configured
+    ? "已配置，粘贴新的 Cookie 后覆盖"
+    : "粘贴 platform.xiaomimimo.com 的完整 Cookie";
+  showMimoCookieMessage("");
+  openReaderDialog($("mimoCookieDialog"));
+  window.setTimeout(() => input.focus(), 0);
+}
+
+function persistedTtsConfigPayload(overrides = {}) {
+  const config = readerState.ttsConfig || {};
+  return {
+    enabled: !!config.enabled,
+    api_key: "",
+    base_url: config.base_url || "",
+    model: config.model || "mimo-v2.5-tts",
+    voice_id: config.voice_id || "mimo_default",
+    style_prompt: config.style_prompt || "",
+    chunk_chars: Number(config.chunk_chars || 260),
+    cache_enabled: config.cache_enabled !== false,
+    ...overrides,
+  };
+}
+
+async function saveMimoBalanceCookie() {
+  const input = $("mimoBalanceCookieInput");
+  const cookie = input.value.trim();
+  if (!cookie) {
+    showMimoCookieMessage("请先粘贴 Cookie", "error");
+    return;
+  }
+  const button = $("saveMimoCookieBtn");
+  if (button) button.disabled = true;
+  try {
+    showMimoCookieMessage("正在保存");
     const data = await api("/api/reader/tts-config", {
       method: "PUT",
-      body: JSON.stringify(ttsConfigPayload({ balance_cookie: "", clear_balance_cookie: true })),
+      body: JSON.stringify(persistedTtsConfigPayload({ balance_cookie: cookie })),
     });
     readerState.ttsConfig = data.config;
-    readerState.mimoBalance = null;
-    renderTtsConfig();
-    showTtsConfigMessage("余额 Cookie 已清空", "success");
+    readerState.mimoBalance = data.config.balance_status || readerState.mimoBalance;
+    input.value = "";
+    $("mimoCookieDialog").close();
+    showTtsConfigMessage("Cookie 已保存，正在更新余额", "success");
+    const updated = await loadMimoBalance({ force: true });
+    if (updated) {
+      showTtsConfigMessage("Cookie 已保存，余额已更新", "success");
+    } else if (readerState.mimoBalance?.auth_expired) {
+      showTtsConfigMessage("Cookie 已保存，但已失效，请重新获取", "error");
+    } else {
+      showTtsConfigMessage("Cookie 已保存，余额更新失败，正在重试", "error");
+    }
   } catch (error) {
-    showTtsConfigMessage(error.message, "error");
+    showMimoCookieMessage(error.message, "error");
   } finally {
     if (button) button.disabled = false;
   }
@@ -2103,7 +2204,10 @@ document.querySelectorAll("[data-sleep-minutes]").forEach((button) => {
 $("fontInput").addEventListener("input", updateReaderFont);
 $("darkModeBtn").addEventListener("click", updateReaderTheme);
 $("saveTtsConfigBtn").addEventListener("click", () => saveTtsConfig());
-$("ttsClearBalanceCookieBtn")?.addEventListener("click", () => clearMimoBalanceCookie());
+$("configureMimoCookieBtn")?.addEventListener("click", openMimoCookieDialog);
+$("saveMimoCookieBtn")?.addEventListener("click", () => saveMimoBalanceCookie());
+$("closeMimoCookieBtn")?.addEventListener("click", () => $("mimoCookieDialog").close());
+$("refreshMimoBalanceBtn")?.addEventListener("click", () => refreshMimoBalance());
 $("ttsModel").addEventListener("change", () => renderTtsVoiceOptions());
 $("shelfBtn").addEventListener("click", showShelfView);
 $("manageBtn").addEventListener("click", () => {
@@ -2164,5 +2268,10 @@ $("logoutBtn").addEventListener("click", async () => {
 });
 
 restoreReaderSettings();
+ensureReaderFontLoaded("yshi-written").then((loaded) => {
+  if (loaded && window.localStorage.getItem("readerFontFamily") === "yshi-written") {
+    updateReaderFontFamily("yshi-written", false, false);
+  }
+});
 pruneStoredReaderFonts();
 Promise.all([loadBooks(), loadImportJobs(), loadTtsConfig()]).catch((error) => setStatus(error.message));

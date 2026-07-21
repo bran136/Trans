@@ -3,6 +3,7 @@ __pycache__/
 .env
 config/app_config.json
 config/secret_key
+config/mimo_balance_state.json
 config/deepseek_cache.sqlite3
 config/deepseek_cache.sqlite3-*
 logs/*.log

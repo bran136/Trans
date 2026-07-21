@@ -37,6 +37,7 @@ from werkzeug.utils import secure_filename
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "app_config.json"
+MIMO_BALANCE_STATE_FILE = CONFIG_DIR / "mimo_balance_state.json"
 LOG_DIR = BASE_DIR / "logs"
 READER_DIR = BASE_DIR / "reader_data"
 READER_BOOK_DIR = READER_DIR / "books"
@@ -79,6 +80,7 @@ BOOK_EXTENSION_ALIASES = {
 }
 READER_IO_LOCK = threading.RLock()
 CONFIG_IO_LOCK = threading.RLock()
+MIMO_BALANCE_LOCK = threading.RLock()
 TRANSLATION_CACHE_LOCK = threading.RLock()
 CHAPTER_PARSE_LOCKS = {}
 CHAPTER_PARSE_LOCKS_LOCK = threading.Lock()
@@ -95,6 +97,13 @@ TTS_CACHE_LOCK = threading.RLock()
 UNSAFE_APP_PASSWORDS = {"", "changeme", "password", "admin", "123456", "replace-with-a-strong-password"}
 UNSAFE_SECRET_KEYS = {"", "replace-with-a-long-random-string", "changeme", "secret"}
 SECRET_KEY_FILE = CONFIG_DIR / "secret_key"
+MIMO_BALANCE_COOKIE_NAMES = (
+    "api-platform_serviceToken",
+    "userId",
+    "api-platform_ph",
+    "api-platform_slh",
+)
+MIMO_BALANCE_REQUIRED_COOKIE_NAMES = {"api-platform_serviceToken", "userId"}
 TTS_AUDIO_FORMATS = {
     "wav": "audio/wav",
 }
@@ -238,6 +247,35 @@ def quote_env_value(value):
 
 def clean_single_line_value(value):
     return str(value or "").replace("\r", " ").replace("\n", " ").strip()
+
+
+def parse_mimo_balance_cookie(value, strict=True):
+    raw = clean_single_line_value(value)
+    if raw.lower().startswith("cookie:"):
+        raw = raw.split(":", 1)[1].strip()
+    cookies = {}
+    for part in raw.split(";"):
+        name, separator, cookie_value = part.strip().partition("=")
+        if not separator or name not in MIMO_BALANCE_COOKIE_NAMES:
+            continue
+        cookie_value = cookie_value.strip()
+        if cookie_value and len(cookie_value) <= 8192:
+            cookies[name] = cookie_value
+    missing = MIMO_BALANCE_REQUIRED_COOKIE_NAMES.difference(cookies)
+    if missing:
+        if strict:
+            names = "、".join(sorted(missing))
+            raise ValueError(f"MiMo 余额 Cookie 缺少必要字段：{names}")
+        return {}
+    return cookies
+
+
+def format_mimo_balance_cookie(cookies):
+    return "; ".join(f"{name}={cookies[name]}" for name in MIMO_BALANCE_COOKIE_NAMES if name in cookies)
+
+
+def normalize_mimo_balance_cookie(value, strict=True):
+    return format_mimo_balance_cookie(parse_mimo_balance_cookie(value, strict=strict))
 
 
 def ensure_private_directory(path):
@@ -468,7 +506,7 @@ def apply_env(config):
         os.getenv("MIMO_BALANCE_URL", DEFAULT_CONFIG["reader_tts"]["balance_url"]),
         DEFAULT_CONFIG["reader_tts"]["balance_url"],
     )
-    reader_tts["balance_cookie"] = os.getenv("MIMO_BALANCE_COOKIE", reader_tts.get("balance_cookie", ""))
+    reader_tts["balance_cookie"] = stored_mimo_balance_cookie()
     reader_tts["model"] = os.getenv("MIMO_TTS_MODEL", reader_tts["model"])
     if reader_tts["model"] not in TTS_MODEL_OPTIONS:
         reader_tts["model"] = TTS_MODEL_OPTIONS[0]
@@ -2289,6 +2327,7 @@ def inject_asset_url():
             BASE_DIR / "templates" / "reader.html",
             BASE_DIR / "static" / "styles.css",
             BASE_DIR / "static" / "app.js",
+            BASE_DIR / "static" / "font-cache.js",
             BASE_DIR / "static" / "home.js",
             BASE_DIR / "static" / "reader.css",
             BASE_DIR / "static" / "reader.js",
@@ -2346,6 +2385,7 @@ def public_reader_tts_config(config):
     settings["model_options"] = TTS_MODEL_OPTIONS
     settings["voice_options"] = TTS_VOICE_OPTIONS
     settings["cache_stats"] = tts_cache_stats()
+    settings["balance_status"] = mimo_balance_snapshot()
     return settings
 
 
@@ -2364,6 +2404,7 @@ def parse_number(value, fallback, min_value=None, max_value=None):
 def update_reader_tts_config(config, payload):
     settings = config["reader_tts"]
     env_updates = {}
+    balance_cookie_update = None
     settings["enabled"] = bool(payload.get("enabled"))
     settings["provider"] = "mimo"
     if payload.get("api_key"):
@@ -2373,16 +2414,9 @@ def update_reader_tts_config(config, payload):
         settings["base_url"],
         DEFAULT_CONFIG["reader_tts"]["base_url"],
     )
-    if payload.get("clear_balance_cookie"):
-        settings["balance_cookie"] = ""
-        env_updates["MIMO_BALANCE_COOKIE"] = ""
-        MIMO_BALANCE_CACHE["data"] = None
-        MIMO_BALANCE_CACHE["time"] = 0.0
-    elif payload.get("balance_cookie"):
-        settings["balance_cookie"] = clean_single_line_value(payload["balance_cookie"])[:16_000]
-        env_updates["MIMO_BALANCE_COOKIE"] = settings["balance_cookie"]
-        MIMO_BALANCE_CACHE["data"] = None
-        MIMO_BALANCE_CACHE["time"] = 0.0
+    if payload.get("balance_cookie"):
+        settings["balance_cookie"] = normalize_mimo_balance_cookie(payload["balance_cookie"])
+        balance_cookie_update = settings["balance_cookie"]
     model = clean_single_line_value(payload.get("model", settings["model"]))
     settings["model"] = model if model in TTS_MODEL_OPTIONS else TTS_MODEL_OPTIONS[0]
     env_updates["MIMO_TTS_MODEL"] = settings["model"]
@@ -2397,6 +2431,8 @@ def update_reader_tts_config(config, payload):
     settings["cache_enabled"] = bool(payload.get("cache_enabled", True))
     if env_updates:
         save_dotenv_values(env_updates)
+    if balance_cookie_update is not None:
+        settings["balance_cookie"] = save_mimo_balance_cookie(balance_cookie_update)
     return config
 
 
@@ -3070,15 +3106,16 @@ def normalize_balance_payload(data, now, ttl):
     nested = data.get("data") if isinstance(data.get("data"), dict) else {}
     source = preferred if preferred else nested if nested else data
     currency = source.get("currency") or source.get("currency_code") or data.get("currency") or ""
-    total = (
-        source.get("total_balance")
-        or source.get("balance")
-        or source.get("available_balance")
-        or source.get("available")
-        or source.get("remaining")
-        or source.get("amount")
-        or ""
-    )
+    total = next((
+        value for value in (
+            source.get("total_balance"),
+            source.get("balance"),
+            source.get("available_balance"),
+            source.get("available"),
+            source.get("remaining"),
+            source.get("amount"),
+        ) if value not in (None, "") and not isinstance(value, bool)
+    ), "")
     return {
         "available": bool(data.get("is_available", True)),
         "currency": currency,
@@ -3088,9 +3125,130 @@ def normalize_balance_payload(data, now, ttl):
     }
 
 
+class MimoBalanceError(RuntimeError):
+    def __init__(self, message, code="temporary_failure"):
+        super().__init__(message)
+        self.code = code
+
+
+def empty_mimo_balance_state():
+    return {"version": 1, "cookies": {}, "balance": None, "auth_expired": False, "error": ""}
+
+
+def load_mimo_balance_state():
+    with MIMO_BALANCE_LOCK:
+        try:
+            state = json.loads(MIMO_BALANCE_STATE_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return empty_mimo_balance_state()
+        if not isinstance(state, dict):
+            return empty_mimo_balance_state()
+        balance = state.get("balance")
+        if not isinstance(balance, dict):
+            balance = None
+        elif not balance.get("total_balance") or not balance.get("currency"):
+            balance = None
+        else:
+            try:
+                updated_at = float(balance.get("updated_at") or 0)
+            except (TypeError, ValueError):
+                updated_at = 0
+            balance = {
+                "total_balance": str(balance.get("total_balance", "")),
+                "currency": clean_single_line_value(balance.get("currency", ""))[:20],
+                "updated_at": updated_at,
+            }
+        raw_cookies = state.get("cookies")
+        cookies = {}
+        if isinstance(raw_cookies, dict):
+            for name in MIMO_BALANCE_COOKIE_NAMES:
+                cookie_value = clean_single_line_value(raw_cookies.get(name, ""))
+                if cookie_value and len(cookie_value) <= 8192:
+                    cookies[name] = cookie_value
+        if MIMO_BALANCE_REQUIRED_COOKIE_NAMES.difference(cookies):
+            cookies = {}
+        return {
+            "version": 1,
+            "cookies": cookies,
+            "balance": balance,
+            "auth_expired": bool(state.get("auth_expired")),
+            "error": clean_display_text(state.get("error", ""), 300),
+        }
+
+
+def save_mimo_balance_state(state):
+    with MIMO_BALANCE_LOCK:
+        ensure_private_directory(CONFIG_DIR)
+        write_json_atomic(MIMO_BALANCE_STATE_FILE, state, indent=2)
+
+
+def stored_mimo_balance_cookie():
+    return format_mimo_balance_cookie(load_mimo_balance_state().get("cookies", {}))
+
+
+def save_mimo_balance_cookie(value):
+    cookies = parse_mimo_balance_cookie(value) if value else {}
+    with MIMO_BALANCE_LOCK:
+        state = load_mimo_balance_state()
+        state["cookies"] = cookies
+        state["auth_expired"] = False
+        state["error"] = ""
+        save_mimo_balance_state(state)
+        MIMO_BALANCE_CACHE["data"] = None
+        MIMO_BALANCE_CACHE["time"] = 0.0
+        MIMO_BALANCE_CACHE["attempt_time"] = 0.0
+    return format_mimo_balance_cookie(cookies)
+
+
+def mimo_balance_snapshot(state=None):
+    state = state or load_mimo_balance_state()
+    balance = dict(state.get("balance") or {})
+    balance.update({
+        "auth_expired": bool(state.get("auth_expired")),
+        "stale": bool(state.get("auth_expired")),
+        "error": clean_display_text(state.get("error", ""), 300),
+    })
+    return balance
+
+
+def mimo_balance_cookie_matches_state(state, cookie):
+    current = format_mimo_balance_cookie(state.get("cookies", {}))
+    return bool(current) and secrets.compare_digest(current, cookie)
+
+
+def mark_mimo_balance_auth_expired(message, expected_cookie=""):
+    with MIMO_BALANCE_LOCK:
+        state = load_mimo_balance_state()
+        if expected_cookie and not mimo_balance_cookie_matches_state(state, expected_cookie):
+            raise MimoBalanceError("MiMo 余额 Cookie 已更新，已忽略旧查询结果", "cookie_changed")
+        state["auth_expired"] = True
+        state["error"] = clean_display_text(message, 300)
+        save_mimo_balance_state(state)
+        MIMO_BALANCE_CACHE["data"] = None
+        MIMO_BALANCE_CACHE["time"] = 0.0
+    return mimo_balance_snapshot(state)
+
+
+def save_successful_mimo_balance(result, expected_cookie=""):
+    with MIMO_BALANCE_LOCK:
+        state = load_mimo_balance_state()
+        if expected_cookie and not mimo_balance_cookie_matches_state(state, expected_cookie):
+            raise MimoBalanceError("MiMo 余额 Cookie 已更新，已忽略旧查询结果", "cookie_changed")
+        state["balance"] = {
+            "total_balance": str(result.get("total_balance", "")),
+            "currency": clean_single_line_value(result.get("currency", ""))[:20],
+            "updated_at": float(result.get("updated_at") or time.time()),
+        }
+        state["auth_expired"] = False
+        state["error"] = ""
+        save_mimo_balance_state(state)
+        snapshot = mimo_balance_snapshot(state)
+        MIMO_BALANCE_CACHE["time"] = time.time()
+        MIMO_BALANCE_CACHE["data"] = snapshot
+    return snapshot
+
+
 def mimo_balance_error_message(response):
-    if response.status_code in {401, 403}:
-        return "MiMo 余额 Cookie 可能已过期，请在听书配置里更新 Cookie"
     if response.status_code == 404:
         return "MiMo 余额接口地址不可用，请检查余额接口配置"
     if response.status_code == 429:
@@ -3099,7 +3257,7 @@ def mimo_balance_error_message(response):
         payload = response.json()
     except ValueError:
         payload = {}
-    message = payload.get("message") or payload.get("msg") or response.reason or "未知错误"
+    message = clean_display_text(payload.get("message") or payload.get("msg") or response.reason or "未知错误", 300)
     return f"MiMo 余额查询失败：HTTP {response.status_code} {message}"
 
 
@@ -3112,15 +3270,22 @@ def fetch_mimo_balance(config, force=False):
         DEFAULT_CONFIG["reader_tts"]["balance_url"],
     )
     now = time.time()
-    cached = MIMO_BALANCE_CACHE["data"]
-    if not force and cached and now - MIMO_BALANCE_CACHE["time"] < MIMO_BALANCE_TTL:
-        return cached
-    if not force and now - MIMO_BALANCE_CACHE["attempt_time"] < MIMO_BALANCE_RETRY_INTERVAL:
-        raise RuntimeError("MiMo 余额查询过于频繁，请稍后再试")
-    MIMO_BALANCE_CACHE["attempt_time"] = now
-    balance_cookie = clean_single_line_value(settings.get("balance_cookie", ""))
+    state = load_mimo_balance_state()
+    if state.get("auth_expired") and not force:
+        return mimo_balance_snapshot(state)
+    with MIMO_BALANCE_LOCK:
+        cached = MIMO_BALANCE_CACHE["data"]
+        if not force and cached and now - MIMO_BALANCE_CACHE["time"] < MIMO_BALANCE_TTL:
+            return cached
+        if not force and now - MIMO_BALANCE_CACHE["attempt_time"] < MIMO_BALANCE_RETRY_INTERVAL:
+            raise MimoBalanceError("MiMo 余额查询过于频繁，请稍后再试")
+        MIMO_BALANCE_CACHE["attempt_time"] = now
+    balance_cookie = normalize_mimo_balance_cookie(settings.get("balance_cookie", ""), strict=False)
     if not balance_cookie:
-        raise RuntimeError("MiMo 余额 Cookie 未配置，请在听书配置里填写 platform.xiaomimimo.com 的 Cookie")
+        raise MimoBalanceError(
+            "MiMo 余额 Cookie 未配置，请在听书配置里填写 platform.xiaomimimo.com 的 Cookie",
+            "missing_cookie",
+        )
     headers = {
         "Accept": "application/json, text/plain, */*",
         "User-Agent": "Mozilla/5.0 TransTools/1.0",
@@ -3136,29 +3301,40 @@ def fetch_mimo_balance(config, force=False):
             allow_redirects=False,
         )
     except requests.Timeout as exc:
-        raise RuntimeError("MiMo 余额查询超时，请检查服务器到小米平台的网络") from exc
+        raise MimoBalanceError("MiMo 余额查询超时，请检查服务器到小米平台的网络") from exc
     except requests.RequestException as exc:
-        raise RuntimeError(f"MiMo 余额查询网络错误：{exc}") from exc
+        raise MimoBalanceError(f"MiMo 余额查询网络错误：{exc}") from exc
+    if response.status_code in {301, 302, 303, 307, 308, 401, 403}:
+        return mark_mimo_balance_auth_expired("MiMo 余额 Cookie 已过期，请更新 Cookie", balance_cookie)
     if not response.ok:
-        raise RuntimeError(mimo_balance_error_message(response))
+        message = mimo_balance_error_message(response)
+        auth_markers = ("login", "cookie", "auth", "登录", "登陆", "未认证", "凭证", "会话")
+        if response.status_code in {400, 419} and any(marker in message.lower() for marker in auth_markers):
+            return mark_mimo_balance_auth_expired("MiMo 余额 Cookie 已过期，请更新 Cookie", balance_cookie)
+        raise MimoBalanceError(message)
+    if "text/html" in response.headers.get("Content-Type", "").lower():
+        return mark_mimo_balance_auth_expired("MiMo 余额 Cookie 已过期，请更新 Cookie", balance_cookie)
     try:
         payload = response.json()
     except ValueError as exc:
-        raise RuntimeError("MiMo 余额接口返回内容不是 JSON") from exc
+        raise MimoBalanceError("MiMo 余额接口返回内容不是 JSON") from exc
     if payload.get("code") not in (None, 0, "0"):
         message = payload.get("message") or payload.get("msg") or "未知错误"
-        if "login" in message.lower() or "cookie" in message.lower() or "auth" in message.lower():
-            raise RuntimeError("MiMo 余额 Cookie 可能已过期，请在听书配置里更新 Cookie")
-        raise RuntimeError(f"MiMo 余额查询失败：{message}")
+        normalized_message = str(message).lower()
+        auth_markers = ("login", "cookie", "auth", "登录", "登陆", "未认证", "凭证", "会话")
+        if str(payload.get("code")) in {"401", "403"} or any(marker in normalized_message for marker in auth_markers):
+            return mark_mimo_balance_auth_expired("MiMo 余额 Cookie 已过期，请更新 Cookie", balance_cookie)
+        raise MimoBalanceError(f"MiMo 余额查询失败：{message}")
     result = normalize_balance_payload(payload, now, MIMO_BALANCE_TTL)
     if not result.get("total_balance") or not result.get("currency"):
-        raise RuntimeError("MiMo 余额接口返回数据不完整，请检查 Cookie 是否仍然有效")
-    MIMO_BALANCE_CACHE["time"] = now
-    MIMO_BALANCE_CACHE["data"] = result
+        raise MimoBalanceError("MiMo 余额接口返回数据不完整，请稍后重试")
+    result = save_successful_mimo_balance(result, balance_cookie)
     return result
 
 
 def mimo_balance_http_status(error):
+    if isinstance(error, MimoBalanceError) and error.code == "missing_cookie":
+        return 400
     message = str(error)
     if "过于频繁" in message:
         return 429
@@ -3444,11 +3620,13 @@ def api_reader_mimo_balance():
         return jsonify({"error": "unauthorized"}), 401
     config = load_config()
     try:
-        balance = fetch_mimo_balance(config)
+        force = request.args.get("force", "").lower() in {"1", "true", "yes"}
+        balance = fetch_mimo_balance(config, force=force)
         return jsonify({"ok": True, "balance": balance})
     except Exception as exc:
         app.logger.warning("mimo balance failed ip=%s error=%s", request.remote_addr, exc)
-        return jsonify({"error": str(exc)}), mimo_balance_http_status(exc)
+        code = exc.code if isinstance(exc, MimoBalanceError) else "temporary_failure"
+        return jsonify({"error": str(exc), "code": code, "balance": mimo_balance_snapshot()}), mimo_balance_http_status(exc)
 
 
 @app.route("/api/reader/tts", methods=["POST"])

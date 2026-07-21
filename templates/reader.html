@@ -152,14 +152,21 @@
         </div>
         <section class="tts-config-panel">
           <div id="ttsConfigMessage" class="reader-config-message" hidden></div>
-          <div id="mimoBalance" class="mimo-balance" hidden></div>
+          <div id="mimoBalancePanel" class="mimo-balance-panel" hidden>
+            <div id="mimoBalance" class="mimo-balance"></div>
+            <div class="mimo-balance-actions">
+              <button id="configureMimoCookieBtn" type="button">配置Cookie</button>
+              <a href="https://platform.xiaomimimo.com/console/balance" target="_blank" rel="noopener noreferrer">MiMo控制台</a>
+              <button id="refreshMimoBalanceBtn" type="button">重新查询</button>
+            </div>
+          </div>
           <label class="setting-check"><input id="ttsEnabled" type="checkbox"> 启用 Xiaomi MiMo 听书</label>
           <div class="tts-settings-grid">
             <label>API Key
               <input id="ttsApiKey" type="password" autocomplete="off">
             </label>
             <label>接口地址
-              <input id="ttsBaseUrl" type="url">
+              <input id="ttsBaseUrl" type="url" disabled aria-disabled="true">
             </label>
             <label>模型
               <select id="ttsModel"></select>
@@ -173,16 +180,29 @@
             <label class="tts-wide">风格 / 音色描述
               <textarea id="ttsStylePrompt" rows="3"></textarea>
             </label>
-            <label class="tts-wide">余额 Cookie
-              <textarea id="ttsBalanceCookie" rows="2" autocomplete="off"></textarea>
-            </label>
           </div>
-          <button id="ttsClearBalanceCookieBtn" class="tts-cookie-clear" type="button">清空余额 Cookie</button>
           <div class="tts-cache-row">
             <label class="setting-check"><input id="ttsCacheEnabled" type="checkbox"> 启用服务端音频缓存</label>
             <span id="ttsCacheStats" class="tts-cache-stats"></span>
           </div>
         </section>
+      </section>
+    </dialog>
+
+    <dialog id="mimoCookieDialog" class="reader-dialog mimo-cookie-dialog">
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2>配置 MiMo Cookie</h2>
+          <div class="dialog-actions">
+            <button id="saveMimoCookieBtn" type="button">保存</button>
+            <button id="closeMimoCookieBtn" type="button">关闭</button>
+          </div>
+        </div>
+        <div id="mimoCookieMessage" class="reader-config-message" hidden></div>
+        <label class="mimo-cookie-field">Cookie
+          <textarea id="mimoBalanceCookieInput" rows="5" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+        </label>
+        <p class="mimo-cookie-help">可以粘贴完整 Cookie；服务端只保存 MiMo 余额查询需要的白名单字段。</p>
       </section>
     </dialog>
 
