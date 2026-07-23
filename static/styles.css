@@ -47,22 +47,22 @@ button {
 
 .login-body {
   display: grid;
-  align-items: center;
-  align-items: safe center;
+  align-items: start;
   justify-items: center;
   height: 100svh;
   min-height: 100svh;
+  padding-top: clamp(56px, 12vh, 128px);
   overflow: hidden;
   overscroll-behavior: none;
 }
 
 .home-body {
   display: grid;
-  align-items: center;
-  align-items: safe center;
+  align-items: start;
   justify-items: center;
   height: 100svh;
   min-height: 100svh;
+  padding-top: clamp(56px, 12vh, 128px);
   overflow-x: clip;
   overflow-y: auto;
   overscroll-behavior-y: auto;
@@ -246,6 +246,10 @@ textarea:disabled {
 }
 
 @media (max-height: 520px) {
+  .login-body {
+    padding-top: clamp(12px, 4vh, 24px);
+  }
+
   .login-panel {
     padding: 20px 28px;
   }
