@@ -35,6 +35,7 @@ from werkzeug.utils import secure_filename
 
 
 BASE_DIR = Path(__file__).resolve().parent
+VERSION_FILE = BASE_DIR / "VERSION"
 CONFIG_DIR = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "app_config.json"
 MIMO_BALANCE_STATE_FILE = CONFIG_DIR / "mimo_balance_state.json"
@@ -43,6 +44,56 @@ READER_DIR = BASE_DIR / "reader_data"
 READER_BOOK_DIR = READER_DIR / "books"
 READER_INDEX_FILE = READER_DIR / "books.json"
 TTS_CACHE_DIR = READER_DIR / "tts_cache"
+
+
+def load_app_version():
+    try:
+        version = VERSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise RuntimeError(f"无法读取版本文件: {VERSION_FILE}") from error
+    if not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))?(?:-[0-9A-Za-z.-]+)?", version):
+        raise RuntimeError(f"VERSION 中的版本号格式无效: {version!r}")
+    return version
+
+
+def content_fingerprint(paths, length=12, seed=""):
+    digest = hashlib.sha256(seed.encode("utf-8"))
+    for path in paths:
+        try:
+            relative_name = path.relative_to(BASE_DIR).as_posix()
+        except ValueError:
+            relative_name = path.name
+        digest.update(relative_name.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(128 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            digest.update(b"missing")
+        digest.update(b"\0")
+    return digest.hexdigest()[:length]
+
+
+APP_VERSION = load_app_version()
+RUNTIME_BACKEND_FINGERPRINT = content_fingerprint((BASE_DIR / "app.py",), length=16)
+BUILD_VERSION_FILES = (
+    BASE_DIR / "templates" / "home.html",
+    BASE_DIR / "templates" / "index.html",
+    BASE_DIR / "templates" / "login.html",
+    BASE_DIR / "templates" / "reader.html",
+    BASE_DIR / "static" / "styles.css",
+    BASE_DIR / "static" / "app.js",
+    BASE_DIR / "static" / "font-cache.js",
+    BASE_DIR / "static" / "home.js",
+    BASE_DIR / "static" / "reader.css",
+    BASE_DIR / "static" / "reader-theme.js",
+    BASE_DIR / "static" / "reader.js",
+    BASE_DIR / "static" / "site-icon.svg",
+    BASE_DIR / "static" / "site.webmanifest",
+    BASE_DIR / "static" / "media-artwork.png",
+    BASE_DIR / "static" / "github-mark.svg",
+)
 TRANSLATION_CACHE_DB = CONFIG_DIR / "deepseek_cache.sqlite3"
 CACHE_LIMIT = 500
 CACHE_MAX_TEXT_CHARS = 12000
@@ -2183,6 +2234,7 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = load_or_create_secret_key()
 app.config.update(
+    TEMPLATES_AUTO_RELOAD=True,
     MAX_CONTENT_LENGTH=MAX_BOOK_UPLOAD_BYTES,
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
     SESSION_REFRESH_EACH_REQUEST=True,
@@ -2362,34 +2414,16 @@ def add_security_headers(response):
 def inject_asset_url():
     def asset_url(filename):
         asset_path = BASE_DIR / "static" / filename
-        try:
-            version = int(asset_path.stat().st_mtime)
-        except OSError:
-            version = int(time.time())
+        version = content_fingerprint((asset_path,))
         return url_for("static", filename=filename, v=version)
 
     def app_version():
-        version_files = [
-            BASE_DIR / "app.py",
-            BASE_DIR / "templates" / "home.html",
-            BASE_DIR / "templates" / "index.html",
-            BASE_DIR / "templates" / "login.html",
-            BASE_DIR / "templates" / "reader.html",
-            BASE_DIR / "static" / "styles.css",
-            BASE_DIR / "static" / "app.js",
-            BASE_DIR / "static" / "font-cache.js",
-            BASE_DIR / "static" / "home.js",
-            BASE_DIR / "static" / "reader.css",
-            BASE_DIR / "static" / "reader-theme.js",
-            BASE_DIR / "static" / "reader.js",
-        ]
-        version = 0
-        for path in version_files:
-            try:
-                version = max(version, int(path.stat().st_mtime))
-            except OSError:
-                continue
-        return time.strftime("%Y%m%d.%H%M", time.localtime(version or time.time()))
+        build_version = content_fingerprint(
+            BUILD_VERSION_FILES,
+            length=8,
+            seed=RUNTIME_BACKEND_FINGERPRINT,
+        )
+        return f"{APP_VERSION}+{build_version}"
 
     return {"asset_url": asset_url, "app_version": app_version, "csrf_token": csrf_token}
 

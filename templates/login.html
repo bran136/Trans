@@ -29,6 +29,11 @@
         {% endif %}
       </section>
     </main>
-    <div class="version-badge">v{{ app_version() }}</div>
+    <div class="version-badge">
+      <span>v{{ app_version() }}</span>
+      <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">
+        <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
+      </a>
+    </div>
   </body>
 </html>

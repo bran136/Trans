@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.venv/
 .env
 config/app_config.json
 config/secret_key
