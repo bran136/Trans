@@ -2,12 +2,16 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#dfe4fb">
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>在线读书</title>
+    <link rel="icon" type="image/svg+xml" sizes="any" href="{{ asset_url('site-icon.svg') }}">
+    <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
+    <script src="{{ asset_url('reader-theme.js') }}"></script>
     <link rel="stylesheet" href="{{ asset_url('reader.css') }}">
   </head>
-  <body class="reader-body">
+  <body class="reader-body" data-media-artwork-url="{{ asset_url('media-artwork.png') }}">
     <div class="reader-shell">
       <header class="reader-topbar">
         <div>
@@ -16,9 +20,9 @@
         </div>
         <nav class="reader-actions">
           <a href="/">主页</a>
-          <button id="shelfBtn" type="button">书架</button>
+          <button id="statisticsBtn" type="button">统计</button>
+          <button id="shelfBtn" type="button" hidden>书架</button>
           <button id="manageBtn" type="button">管理</button>
-          <button id="tocBtn" type="button">目录</button>
           <button id="ttsBtn" type="button">听书</button>
           <button id="settingsBtn" type="button">设置</button>
           <button id="logoutBtn" type="button">退出</button>
@@ -47,7 +51,7 @@
             <button id="listenStopBtn" type="button">停止</button>
             <select id="playbackRateSelect" aria-label="播放倍速">
               <option value="0.8">0.8x</option>
-              <option value="1">1.0x</option>
+              <option value="1" selected>1.0x</option>
               <option value="1.2">1.2x</option>
               <option value="1.5">1.5x</option>
               <option value="2">2.0x</option>
@@ -89,20 +93,40 @@
       </section>
     </dialog>
 
-    <dialog id="tocDialog" class="reader-dialog">
+    <dialog id="statisticsDialog" class="reader-dialog statistics-dialog">
       <section class="dialog-panel">
         <div class="dialog-head">
-          <h2>目录</h2>
-          <button id="closeTocBtn" type="button">关闭</button>
+          <h2>阅读统计</h2>
+          <button id="closeStatisticsBtn" type="button">关闭</button>
         </div>
-        <div id="tocList" class="toc-list"></div>
+        <div id="statisticsSummary" class="statistics-summary"></div>
+        <div id="statisticsList" class="statistics-list"></div>
       </section>
+    </dialog>
+
+    <dialog id="bookMetadataDialog" class="reader-dialog book-metadata-dialog">
+      <form id="bookMetadataForm" class="dialog-panel">
+        <div class="dialog-head">
+          <h2>编辑书籍</h2>
+          <div class="dialog-actions">
+            <button id="saveBookMetadataBtn" type="submit">保存</button>
+            <button id="closeBookMetadataBtn" type="button">关闭</button>
+          </div>
+        </div>
+        <div id="bookMetadataMessage" class="reader-config-message" hidden></div>
+        <label class="book-metadata-field">书名
+          <input id="bookTitleInput" type="text" maxlength="160" autocomplete="off" required>
+        </label>
+        <label class="book-metadata-field">作者
+          <input id="bookAuthorInput" type="text" maxlength="120" autocomplete="off" placeholder="作者未知">
+        </label>
+      </form>
     </dialog>
 
     <dialog id="tocEditDialog" class="reader-dialog toc-edit-dialog">
       <section class="dialog-panel">
         <div class="dialog-head">
-          <h2>TXT 目录编辑</h2>
+          <h2 id="tocEditTitle">目录</h2>
           <button id="closeTocEditBtn" type="button">关闭</button>
         </div>
         <div id="tocEditMessage" class="reader-config-message" hidden></div>
@@ -235,6 +259,7 @@
     </dialog>
 
     <div class="reader-version">v{{ app_version() }}</div>
+    <script src="{{ asset_url('font-cache.js') }}"></script>
     <script src="{{ asset_url('reader.js') }}"></script>
   </body>
 </html>

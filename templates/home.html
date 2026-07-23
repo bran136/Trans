@@ -2,17 +2,23 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#ffffff">
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Trans工具</title>
+    <link rel="icon" type="image/svg+xml" sizes="any" href="{{ asset_url('site-icon.svg') }}">
+    <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
     <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
   </head>
   <body class="home-body">
     <main class="home-shell">
       <header class="home-head">
-        <div>
-          <h1>Trans工具</h1>
-          <p>选择要使用的工具</p>
+        <div class="home-brand">
+          <img class="home-logo" src="{{ asset_url('site-icon.svg') }}" alt="" aria-hidden="true">
+          <div>
+            <h1>Trans工具</h1>
+            <p>选择要使用的工具</p>
+          </div>
         </div>
         <div class="home-actions">
           <button class="ghost" id="monitorBtn" type="button">监控</button>

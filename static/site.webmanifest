@@ -1,0 +1,20 @@
+{
+  "id": "/",
+  "name": "Trans工具",
+  "short_name": "Trans工具",
+  "description": "在线翻译与在线读书工具",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [
+    {
+      "src": "/static/site-icon.svg?v=1",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

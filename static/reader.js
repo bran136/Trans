@@ -15,9 +15,15 @@ const readerState = {
   ttsToken: 0,
   ttsScope: 0,
   ttsUrls: new Map(),
+  ttsBlobs: new Map(),
+  ttsWavInfo: new Map(),
   ttsUrlSizes: new Map(),
   ttsUrlOrder: [],
   ttsPending: new Map(),
+  activeTtsPlaybackUrl: "",
+  ttsPlaybackSegments: [],
+  nextChapterPrefetch: null,
+  mediaMetadataSignature: "",
   saveTimer: null,
   importJobs: [],
   localImportJobs: [],
@@ -33,6 +39,7 @@ const readerState = {
   sleepDeadline: 0,
   sleepPausePending: false,
   sleepFadeStarted: false,
+  sleepPauseTarget: null,
   wakeLock: null,
   wakeLockWanted: false,
   mimoBalance: null,
@@ -48,6 +55,7 @@ const readerState = {
   tocEditChapters: [],
   tocLineChapter: null,
   tocLineRows: [],
+  metadataEditBookId: "",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -56,6 +64,19 @@ const TTS_BROWSER_CACHE_LIMIT = 12;
 const TTS_BROWSER_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const TTS_PREFETCH_MIN_ITEMS = 2;
 const TTS_PREFETCH_MAX_ITEMS = 5;
+const TTS_SHORT_AUDIO_SECONDS = 5;
+const TTS_MERGED_AUDIO_TARGET_SECONDS = 6;
+const TTS_MERGED_AUDIO_MAX_ITEMS = 6;
+const TTS_NEXT_CHAPTER_PREFETCH_MULTIPLIER = 2;
+const TTS_SLEEP_FADE_SECONDS = 7;
+const BOOK_DATE_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
 const FONT_OPTIONS = [
   { id: "system", name: "系统字体", family: '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "微软雅黑", Arial, sans-serif', reliableOnIOS: true },
   { id: "kai", name: "楷体", family: 'KaiTi, "楷体", serif', reliableOnIOS: false },
@@ -94,7 +115,10 @@ const FONT_ASSET_URLS = {
 const FONT_CACHE_NAME = "reader-font-assets-v1";
 const fontLoadPromises = new Map();
 const fontActivationPromises = new Map();
-const loadedReaderFontIds = new Set();
+const loadedReaderFontIds = window.readerLoadedFontIds instanceof Set
+  ? window.readerLoadedFontIds
+  : new Set();
+window.readerLoadedFontIds = loadedReaderFontIds;
 let fontApplyGeneration = 0;
 
 function isIOSLike() {
@@ -167,6 +191,78 @@ function syncReaderWakeLock() {
   } else {
     releaseReaderWakeLock();
   }
+}
+
+function mediaSessionAvailable() {
+  return "mediaSession" in navigator && "MediaMetadata" in window;
+}
+
+function currentChapterTitle() {
+  const chapter = readerState.chapters.find((item) => Number(item.index) === Number(readerState.currentChapter));
+  return chapter?.title || "在线读书";
+}
+
+function updateMediaSessionMetadata() {
+  if (!mediaSessionAvailable() || !readerState.currentBook) return;
+  const artworkUrl = document.body.dataset.mediaArtworkUrl;
+  const title = readerState.currentBook.title || "在线读书";
+  const artist = currentChapterTitle();
+  const signature = [readerState.currentBookId, title, readerState.currentChapter, artist, artworkUrl || ""].join("|");
+  if (signature === readerState.mediaMetadataSignature) return;
+  const metadata = {
+    title,
+    artist,
+    album: "Trans工具 · 在线读书",
+  };
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      ...metadata,
+      artwork: artworkUrl ? [{ src: artworkUrl, sizes: "512x512", type: "image/png" }] : [],
+    });
+    readerState.mediaMetadataSignature = signature;
+  } catch {
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata(metadata);
+      readerState.mediaMetadataSignature = signature;
+    } catch {
+      // Incomplete Media Session support must not interrupt playback.
+    }
+  }
+}
+
+function setMediaSessionPlaybackState(state) {
+  if (!("mediaSession" in navigator)) return;
+  try {
+    navigator.mediaSession.playbackState = state;
+  } catch {
+    // Older browsers may expose Media Session without playbackState support.
+  }
+}
+
+function initializeMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  const setHandler = (action, handler) => {
+    try {
+      navigator.mediaSession.setActionHandler(action, handler);
+    } catch {
+      // Ignore actions not supported by this browser.
+    }
+  };
+  setHandler("play", () => {
+    if (!readerState.reading) {
+      startListeningFrom(readerState.currentSentence).catch((error) => setListenStatus(error.message));
+      return;
+    }
+    if (readerState.paused) {
+      toggleListeningPause().catch((error) => setListenStatus(error.message));
+    }
+  });
+  setHandler("pause", () => {
+    if (readerState.reading && !readerState.paused) {
+      toggleListeningPause().catch((error) => setListenStatus(error.message));
+    }
+  });
+  setHandler("stop", () => stopListening());
 }
 
 async function api(path, options = {}) {
@@ -366,6 +462,31 @@ function formatProgress(book) {
   return `第 ${Number(progress.chapter || 0) + 1} / ${book.chapter_count} 章`;
 }
 
+function formatBookAuthor(book) {
+  return book.author || "作者未知";
+}
+
+function bookProgressPercent(book) {
+  const chapterCount = Math.max(0, Number(book.chapter_count) || 0);
+  if (!chapterCount) return 0;
+  const chapterIndex = Math.max(0, Math.min(chapterCount - 1, Number(book.progress?.chapter) || 0));
+  return Math.round(((chapterIndex + 1) / chapterCount) * 100);
+}
+
+function formatBookLastOpened(book) {
+  const timestamp = Number(book.last_opened_at || book.updated_at || book.created_at || 0);
+  if (!timestamp) return "暂无记录";
+  const date = new Date(timestamp > 1e12 ? timestamp : timestamp * 1000);
+  if (Number.isNaN(date.getTime())) return "暂无记录";
+  return BOOK_DATE_FORMATTER.format(date);
+}
+
+function recentlyOpenedBooks() {
+  return [...readerState.books].sort((a, b) => (
+    Number(b.last_opened_at || b.updated_at || b.created_at || 0) - Number(a.last_opened_at || a.updated_at || a.created_at || 0)
+  ));
+}
+
 async function loadBooks() {
   const data = await api("/api/books");
   readerState.books = data.books || [];
@@ -376,6 +497,7 @@ function renderBooks() {
   $("bookCount").textContent = `${readerState.books.length} 本`;
   renderBookList($("bookList"));
   renderManageBooks();
+  renderStatistics();
 }
 
 function renderBookList(list) {
@@ -384,9 +506,7 @@ function renderBookList(list) {
     list.innerHTML = '<div class="book-item"><strong>暂无书籍</strong><span>导入 TXT、EPUB 或 PDF</span></div>';
     return;
   }
-  const shelfBooks = [...readerState.books].sort((a, b) => (
-    Number(b.last_opened_at || b.updated_at || b.created_at || 0) - Number(a.last_opened_at || a.updated_at || a.created_at || 0)
-  ));
+  const shelfBooks = recentlyOpenedBooks();
   shelfBooks.forEach((book) => {
     const button = document.createElement("button");
     button.className = `book-item ${book.id === readerState.currentBookId ? "active" : ""}`;
@@ -394,12 +514,40 @@ function renderBookList(list) {
     button.innerHTML = `
       ${book.cover_url ? `<span class="book-cover" style="background-image: url('${escapeAttribute(book.cover_url)}')"></span>` : ""}
       <strong>${escapeHtml(book.title)}</strong>
-      <span>${escapeHtml(book.author || book.format.toUpperCase())} · ${formatProgress(book)}</span>
+      <span>${escapeHtml(formatBookAuthor(book))} · ${formatProgress(book)}</span>
     `;
     button.addEventListener("click", async () => {
       await openBook(book.id, book.progress?.chapter || 0, book.progress?.sentence || 0);
     });
     list.appendChild(button);
+  });
+}
+
+function renderStatistics() {
+  const summary = $("statisticsSummary");
+  const list = $("statisticsList");
+  if (!summary || !list) return;
+  const books = recentlyOpenedBooks();
+  summary.textContent = books.length ? `共 ${books.length} 本 · 按最近打开排列 · 进度按章节估算` : "书架中还没有书籍";
+  list.innerHTML = "";
+  books.forEach((book) => {
+    const progressPercent = bookProgressPercent(book);
+    const item = document.createElement("article");
+    item.className = "statistics-book";
+    item.innerHTML = `
+      <div class="statistics-book-head">
+        <strong>${escapeHtml(book.title)}</strong>
+        <span>${progressPercent}%</span>
+      </div>
+      <div class="statistics-progress" role="progressbar" aria-label="${escapeAttribute(`${book.title} 章节进度`)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progressPercent}">
+        <i style="width: ${progressPercent}%"></i>
+      </div>
+      <div class="statistics-book-meta">
+        <span>${escapeHtml(formatProgress(book))}</span>
+        <span>最近打开 ${escapeHtml(formatBookLastOpened(book))}</span>
+      </div>
+    `;
+    list.appendChild(item);
   });
 }
 
@@ -415,22 +563,23 @@ function renderManageBooks() {
     Number(b.created_at || 0) - Number(a.created_at || 0)
   ));
   managedBooks.forEach((book) => {
+    const hasToc = book.format === "txt" || book.format === "epub";
     const row = document.createElement("div");
     row.className = "manage-book-row";
     row.innerHTML = `
       <div>
         <strong>${escapeHtml(book.title)}</strong>
-        <span>${escapeHtml(book.author || book.format.toUpperCase())} · ${formatProgress(book)}</span>
+        <span>${escapeHtml(formatBookAuthor(book))} · ${formatProgress(book)}</span>
       </div>
       <div class="manage-book-actions">
         ${book.format === "txt" ? '<button type="button" data-action="clear-toc">清除目录</button>' : '<span class="manage-action-spacer"></span>'}
-        ${book.format === "txt" ? '<button type="button" data-action="toc-edit">目录</button>' : '<span class="manage-action-spacer"></span>'}
-        <button type="button" data-action="rename">编辑</button>
+        ${hasToc ? '<button type="button" data-action="toc-edit">目录</button>' : '<span class="manage-action-spacer"></span>'}
+        <button type="button" data-action="edit">编辑</button>
         <button type="button" data-action="reparse">重新解析</button>
         <button type="button" data-action="delete">删除</button>
       </div>
     `;
-    row.querySelector('[data-action="rename"]').addEventListener("click", () => renameBook(book));
+    row.querySelector('[data-action="edit"]').addEventListener("click", () => openBookMetadataEditor(book));
     row.querySelector('[data-action="toc-edit"]')?.addEventListener("click", () => openTocEditor(book));
     row.querySelector('[data-action="reparse"]').addEventListener("click", () => reparseBook(book));
     row.querySelector('[data-action="clear-toc"]')?.addEventListener("click", () => clearBookToc(book));
@@ -447,10 +596,11 @@ function showTocEditMessage(text, type = "") {
 }
 
 async function openTocEditor(book) {
-  if (book.format !== "txt") return;
+  if (!["txt", "epub"].includes(book.format)) return;
   readerState.tocEditBookId = book.id;
   readerState.tocEditBook = book;
   readerState.tocEditChapters = [];
+  $("tocEditTitle").textContent = book.format === "epub" ? "EPUB 目录" : "TXT 目录编辑";
   showTocEditMessage("正在加载目录");
   openReaderDialog($("tocEditDialog"));
   await refreshTocEditor(book.id);
@@ -458,13 +608,15 @@ async function openTocEditor(book) {
 
 async function refreshTocEditor(bookId = readerState.tocEditBookId) {
   if (!bookId) return;
-  const data = await api(`/api/books/${bookId}`);
+  const data = await api(`/api/books/${bookId}?inspect=1`);
   readerState.tocEditBook = data.book;
   readerState.tocEditChapters = data.chapters || [];
   readerState.books = readerState.books.map((book) => (book.id === data.book.id ? data.book : book));
   renderBooks();
   renderTocEditor();
-  showTocEditMessage("");
+  showTocEditMessage(
+    data.book.format === "epub" ? "EPUB 目录由书籍文件定义，此处仅供查看" : ""
+  );
 }
 
 function renderTocEditor() {
@@ -475,6 +627,7 @@ function renderTocEditor() {
     return;
   }
   list.innerHTML = "";
+  const editable = readerState.tocEditBook?.format === "txt";
   chapters.forEach((chapter) => {
     const row = document.createElement("div");
     row.className = "toc-edit-row";
@@ -484,14 +637,14 @@ function renderTocEditor() {
         <span>第 ${Number(chapter.index) + 1} 章 · ${Number(chapter.char_count || 0)} 字</span>
       </div>
       <div class="toc-edit-actions">
-        <button type="button" data-action="rename">改名</button>
-        <button type="button" data-action="split">添加</button>
-        <button type="button" data-action="delete">删除</button>
+        ${editable ? '<button type="button" data-action="rename">改名</button>' : ""}
+        ${editable ? '<button type="button" data-action="split">添加</button>' : ""}
+        ${editable ? '<button type="button" data-action="delete">删除</button>' : ""}
       </div>
     `;
-    row.querySelector('[data-action="rename"]').addEventListener("click", () => renameTxtChapter(chapter));
-    row.querySelector('[data-action="split"]').addEventListener("click", () => openTocLineChooser(chapter));
-    row.querySelector('[data-action="delete"]').addEventListener("click", () => deleteTxtChapterTitle(chapter));
+    row.querySelector('[data-action="rename"]')?.addEventListener("click", () => renameTxtChapter(chapter));
+    row.querySelector('[data-action="split"]')?.addEventListener("click", () => openTocLineChooser(chapter));
+    row.querySelector('[data-action="delete"]')?.addEventListener("click", () => deleteTxtChapterTitle(chapter));
     list.appendChild(row);
   });
 }
@@ -589,28 +742,53 @@ async function splitTxtChapterAtLine(line) {
   }
 }
 
-async function renameBook(book) {
-  const title = window.prompt("请输入新的书名", book.title || "");
-  if (title === null) return;
-  const trimmed = title.trim();
-  if (!trimmed) {
-    setUploadMessage("书名不能为空", "error");
+function showBookMetadataMessage(text, type = "") {
+  const message = $("bookMetadataMessage");
+  message.textContent = text || "";
+  message.className = `reader-config-message ${type}`.trim();
+  message.hidden = !text;
+}
+
+function openBookMetadataEditor(book) {
+  readerState.metadataEditBookId = book.id;
+  $("bookTitleInput").value = book.title || "";
+  $("bookAuthorInput").value = book.author || "";
+  showBookMetadataMessage("");
+  openReaderDialog($("bookMetadataDialog"));
+  $("bookTitleInput").focus();
+}
+
+async function saveBookMetadata(event) {
+  event.preventDefault();
+  const bookId = readerState.metadataEditBookId;
+  if (!bookId) return;
+  const trimmedTitle = $("bookTitleInput").value.trim();
+  if (!trimmedTitle) {
+    showBookMetadataMessage("书名不能为空", "error");
     return;
   }
+  const trimmedAuthor = $("bookAuthorInput").value.trim();
+  $("saveBookMetadataBtn").disabled = true;
+  showBookMetadataMessage("正在保存");
   try {
-    const data = await api(`/api/books/${book.id}`, {
+    const data = await api(`/api/books/${bookId}`, {
       method: "PATCH",
-      body: JSON.stringify({ title: trimmed }),
+      body: JSON.stringify({ title: trimmedTitle, author: trimmedAuthor }),
     });
-    readerState.books = readerState.books.map((item) => (item.id === book.id ? data.book : item));
-    if (readerState.currentBookId === book.id && readerState.currentBook) {
+    readerState.books = readerState.books.map((item) => (item.id === bookId ? data.book : item));
+    if (readerState.currentBookId === bookId && readerState.currentBook) {
       readerState.currentBook.title = data.book.title;
+      readerState.currentBook.author = data.book.author;
       setStatus(data.book.title);
     }
     renderBooks();
-    setUploadMessage("书名已更新", "success");
+    $("bookTitleInput").value = data.book.title || "";
+    $("bookAuthorInput").value = data.book.author || "";
+    showBookMetadataMessage("书籍信息已保存", "success");
   } catch (error) {
-    setUploadMessage(error.message, "error");
+    showBookMetadataMessage(error.message, "error");
+  } finally {
+    $("saveBookMetadataBtn").disabled = false;
   }
 }
 
@@ -620,7 +798,15 @@ async function deleteBook(book) {
   try {
     await api(`/api/books/${book.id}`, { method: "DELETE" });
     if (readerState.currentBookId === book.id) {
-      showShelfView();
+      window.clearTimeout(readerState.saveTimer);
+      readerState.saveTimer = null;
+      readerState.currentBookId = "";
+      readerState.currentBook = null;
+      if (window.history.state?.readerView === "book") {
+        window.history.back();
+      } else {
+        showShelfView();
+      }
     }
     await loadBooks();
     setUploadMessage("已删除书籍", "success");
@@ -757,52 +943,76 @@ async function uploadBook(event) {
   }
 }
 
-async function openBook(bookId, chapter = 0, sentence = 0) {
+async function openBook(bookId, chapter = 0, sentence = 0, addHistory = true) {
+  const openedFromShelf = !$("shelfView").hidden;
   stopListening(false);
   readerState.currentBookId = bookId;
   const data = await api(`/api/books/${bookId}`);
   readerState.currentBook = data.book;
   readerState.chapters = data.chapters || [];
   renderBooks();
-  renderToc();
   renderChapterSelect();
-  showReadingView();
+  showReadingView(addHistory && openedFromShelf);
   await loadChapter(chapter, sentence);
 }
 
-function showReadingView() {
+function syncReaderNavigation(isReading) {
+  $("statisticsBtn").hidden = isReading;
+  $("shelfBtn").hidden = !isReading;
+}
+
+function showReadingView(addHistory = false) {
   $("shelfView").hidden = true;
   $("readingView").hidden = false;
+  syncReaderNavigation(true);
+  if (addHistory) {
+    window.history.pushState({ readerView: "book", bookId: readerState.currentBookId }, "", window.location.href);
+  }
+}
+
+function updateCurrentBookProgressLocally() {
+  const bookId = readerState.currentBookId;
+  if (!bookId) return null;
+  const now = Date.now() / 1000;
+  const snapshot = {
+    bookId,
+    chapter: readerState.currentChapter,
+    sentence: readerState.currentSentence,
+  };
+  readerState.books = readerState.books.map((book) => (
+    book.id === bookId
+      ? {
+          ...book,
+          progress: { chapter: snapshot.chapter, sentence: snapshot.sentence },
+          updated_at: now,
+          last_opened_at: now,
+        }
+      : book
+  ));
+  return snapshot;
 }
 
 function showShelfView() {
   stopListening(false);
+  window.clearTimeout(readerState.saveTimer);
+  readerState.saveTimer = null;
+  const progressSnapshot = updateCurrentBookProgressLocally();
+  if (progressSnapshot) saveProgress(progressSnapshot);
   $("readingView").hidden = true;
   $("shelfView").hidden = false;
   readerState.currentBookId = "";
   readerState.currentBook = null;
   renderBooks();
+  syncReaderNavigation(false);
   setStatus("本地书架");
 }
 
-function renderToc() {
-  const list = $("tocList");
-  list.innerHTML = "";
-  readerState.chapters.forEach((chapter) => {
-    const button = document.createElement("button");
-    const level = Math.max(1, Math.min(Number(chapter.level || 1), 4));
-    button.className = `toc-item level-${level} ${chapter.index === readerState.currentChapter ? "active" : ""}`;
-    button.type = "button";
-    button.textContent = chapter.title;
-    button.addEventListener("click", async () => {
-      const shouldResume = readerState.reading && !readerState.paused;
-      stopListening(false, false);
-      await loadChapter(chapter.index, 0);
-      if (shouldResume) await startListeningFrom(0);
-      if ($("tocDialog").open) $("tocDialog").close();
-    });
-    list.appendChild(button);
-  });
+function returnToShelf() {
+  if (window.history.state?.readerView === "book") {
+    window.history.back();
+    return;
+  }
+  showShelfView();
 }
 
 function renderChapterSelect() {
@@ -818,19 +1028,32 @@ function renderChapterSelect() {
 
 async function loadChapter(chapterIndex, sentenceIndex = 0) {
   if (!readerState.currentBookId) return;
-  const data = await api(`/api/books/${readerState.currentBookId}/chapters/${chapterIndex}`);
+  const bookId = readerState.currentBookId;
+  const normalizedChapterIndex = Number(chapterIndex);
+  const preparedEntry = readerState.nextChapterPrefetch;
+  const canUsePrepared = preparedEntry
+    && preparedEntry.bookId === bookId
+    && preparedEntry.chapterIndex === normalizedChapterIndex
+    && preparedEntry.scope === readerState.ttsScope;
+  if (canUsePrepared) preparedEntry.adopted = true;
+  const prepared = canUsePrepared
+    ? await (preparedEntry.readyPromise || preparedEntry.promise)
+    : null;
+  if (readerState.currentBookId !== bookId) return;
+  const data = prepared?.data || await api(`/api/books/${bookId}/chapters/${normalizedChapterIndex}`);
+  if (readerState.currentBookId !== bookId) return;
   readerState.currentBook = data.book;
   readerState.currentChapter = data.chapter.index;
   readerState.currentSentence = sentenceIndex;
   $("chapterSelect").value = String(readerState.currentChapter);
-  renderChapter(data.chapter);
-  renderToc();
+  renderChapter(data.chapter, prepared?.audios || []);
   highlightSentence(sentenceIndex, true);
   saveProgressSoon();
   setStatus(readerState.currentBook.title);
+  if (readerState.reading) updateMediaSessionMetadata();
 }
 
-function renderChapter(chapter) {
+function renderChapter(chapter, prefetchedAudios = []) {
   clearTtsBrowserCache();
   const content = $("bookContent");
   content.classList.remove("empty");
@@ -876,6 +1099,11 @@ function renderChapter(chapter) {
     content.classList.add("empty");
     content.textContent = "本章没有可阅读文本";
   }
+  prefetchedAudios.forEach((audio) => {
+    if (sentenceText(audio.index) !== audio.text || !(audio.blob instanceof Blob)) return;
+    rememberTtsUrl(audio.index, URL.createObjectURL(audio.blob), audio.blob);
+    if (audio.wavInfo) readerState.ttsWavInfo.set(Number(audio.index), Promise.resolve(audio.wavInfo));
+  });
 }
 
 function handleSentenceTap(event, index) {
@@ -937,19 +1165,32 @@ function highlightSentence(index, scroll = false) {
 
 function saveProgressSoon() {
   window.clearTimeout(readerState.saveTimer);
-  readerState.saveTimer = window.setTimeout(saveProgress, 350);
+  readerState.saveTimer = window.setTimeout(() => {
+    readerState.saveTimer = null;
+    saveProgress();
+  }, 350);
 }
 
-async function saveProgress() {
-  if (!readerState.currentBookId) return;
+async function saveProgress(snapshot = null) {
+  const bookId = snapshot?.bookId || readerState.currentBookId;
+  const chapter = snapshot?.chapter ?? readerState.currentChapter;
+  const sentence = snapshot?.sentence ?? readerState.currentSentence;
+  if (!bookId) return;
   try {
-    await api(`/api/books/${readerState.currentBookId}/progress`, {
+    const data = await api(`/api/books/${bookId}/progress`, {
       method: "PUT",
       body: JSON.stringify({
-        chapter: readerState.currentChapter,
-        sentence: readerState.currentSentence,
+        chapter,
+        sentence,
       }),
     });
+    if (data.book) {
+      readerState.books = readerState.books.map((book) => (book.id === data.book.id ? data.book : book));
+      if (readerState.currentBookId === data.book.id && readerState.currentBook) {
+        readerState.currentBook = { ...readerState.currentBook, ...data.book };
+      }
+      if (!$("shelfView").hidden) renderBooks();
+    }
   } catch (error) {
     setStatus(error.message);
   }
@@ -1002,10 +1243,26 @@ function updateListenButtons() {
   $("listenPauseBtn").textContent = readerState.paused ? "继续" : "暂停";
 }
 
+function applyAudioPlaybackRate(audio) {
+  if (!audio) return;
+  const rate = Math.max(0.5, Math.min(Number(readerState.playbackRate) || 1, 4));
+  audio.defaultPlaybackRate = rate;
+  audio.playbackRate = rate;
+}
+
 function updatePlaybackRate() {
   readerState.playbackRate = Number($("playbackRateSelect").value) || 1;
   window.localStorage.setItem("readerPlaybackRate", String(readerState.playbackRate));
-  if (readerState.ttsAudio) readerState.ttsAudio.playbackRate = readerState.playbackRate;
+  applyAudioPlaybackRate(readerState.ttsAudio);
+  if (readerState.reading) {
+    const segments = readerState.ttsPlaybackSegments;
+    const lastSegment = segments.length ? segments[segments.length - 1] : null;
+    const lastPreparedIndex = lastSegment
+      && Number(lastSegment.chapterIndex) === Number(readerState.currentChapter)
+      ? lastSegment.index
+      : readerState.currentSentence;
+    prefetchUpcomingTtsAudio(lastPreparedIndex, readerState.ttsToken, readerState.ttsScope);
+  }
 }
 
 function ttsReady(config = readerState.ttsConfig || {}) {
@@ -1052,6 +1309,7 @@ function clearSleepTimer(resetInput = false) {
   readerState.sleepDeadline = 0;
   readerState.sleepPausePending = false;
   readerState.sleepFadeStarted = false;
+  readerState.sleepPauseTarget = null;
   if (readerState.ttsAudio) readerState.ttsAudio.volume = 1;
   if (resetInput && $("sleepCustomMinutes")) $("sleepCustomMinutes").value = "";
   updateSleepTimerButton();
@@ -1065,6 +1323,7 @@ function armSleepPause() {
   readerState.sleepDeadline = 0;
   readerState.sleepPausePending = true;
   readerState.sleepFadeStarted = false;
+  setSleepPauseTargetForCurrentAudio();
   updateSleepTimerButton();
   setListenStatus("定时已到，本句读完后暂停");
 }
@@ -1094,41 +1353,50 @@ function applyCustomSleepTimer() {
   $("sleepTimerDialog").close();
 }
 
-function startSleepFadeIfNeeded(audio) {
-  if (!readerState.sleepPausePending || readerState.sleepFadeStarted || !audio || !Number.isFinite(audio.duration)) return;
-  const remaining = audio.duration - audio.currentTime;
-  if (remaining > 3.2) return;
+function startSleepFadeIfNeeded(audio, stopAt = audio?.duration) {
+  if (isIOSLike() || !readerState.sleepPausePending || !audio || !Number.isFinite(audio.duration)) return;
+  const normalizedStopAt = Number.isFinite(Number(stopAt)) ? Number(stopAt) : audio.duration;
+  const remaining = normalizedStopAt - audio.currentTime;
+  if (remaining > TTS_SLEEP_FADE_SECONDS + 0.2) return;
+  const applyVolume = () => {
+    const secondsLeft = Math.max(0, normalizedStopAt - audio.currentTime);
+    audio.volume = Math.max(0.05, Math.min(1, secondsLeft / TTS_SLEEP_FADE_SECONDS));
+  };
+  applyVolume();
+  if (readerState.sleepFadeStarted) return;
   readerState.sleepFadeStarted = true;
-  const fadeStart = Math.max(0.1, remaining);
-  const fadeStartTime = audio.currentTime;
   const tick = () => {
     if (!readerState.sleepPausePending || audio.paused || audio.ended) return;
-    const elapsed = Math.max(0, audio.currentTime - fadeStartTime);
-    audio.volume = Math.max(0.05, 1 - elapsed / fadeStart);
+    applyVolume();
     if (audio.volume > 0.05) window.requestAnimationFrame(tick);
   };
-  tick();
+  window.requestAnimationFrame(tick);
 }
 
 function finishSleepPause(index) {
   const nextIndex = nextReadableSentenceIndex(Number(index) + 1);
   if (nextIndex >= 0) highlightSentence(nextIndex, false);
   readerState.reading = false;
-  readerState.paused = false;
+  readerState.paused = true;
   readerState.sleepPausePending = false;
   readerState.sleepFadeStarted = false;
+  readerState.sleepPauseTarget = null;
   if (readerState.ttsAudio) readerState.ttsAudio.volume = 1;
   clearSleepTimer(false);
   updateListenButtons();
   syncReaderWakeLock();
+  setMediaSessionPlaybackState("paused");
   setListenStatus("定时已暂停");
 }
 
 function clearTtsBrowserCache() {
   readerState.ttsScope += 1;
+  readerState.nextChapterPrefetch = null;
   readerState.ttsPending.clear();
   readerState.ttsUrls.forEach((url) => URL.revokeObjectURL(url));
   readerState.ttsUrls.clear();
+  readerState.ttsBlobs.clear();
+  readerState.ttsWavInfo.clear();
   readerState.ttsUrlSizes.clear();
   readerState.ttsUrlOrder = [];
 }
@@ -1165,11 +1433,23 @@ function ttsTextLength(text) {
   return String(text || "").replace(/\s+/g, "").length;
 }
 
+function ttsPrefetchBudgetForText(text, requestedRate = readerState.playbackRate) {
+  const length = ttsTextLength(text);
+  let base;
+  if (length <= 35) base = { targetChars: 360, maxItems: 5 };
+  else if (length <= 90) base = { targetChars: 280, maxItems: 4 };
+  else base = { targetChars: 180, maxItems: 3 };
+  const rate = Math.max(1, Math.min(Number(requestedRate) || 1, 2));
+  const extraItems = Math.ceil(Math.max(0, rate - 1) * 2);
+  return {
+    targetChars: Math.round(base.targetChars * rate),
+    minItems: TTS_PREFETCH_MIN_ITEMS + extraItems,
+    maxItems: base.maxItems + extraItems,
+  };
+}
+
 function ttsPrefetchBudget(currentIndex) {
-  const length = ttsTextLength(sentenceText(currentIndex));
-  if (length <= 35) return { targetChars: 360, maxItems: 5 };
-  if (length <= 90) return { targetChars: 280, maxItems: 4 };
-  return { targetChars: 180, maxItems: 3 };
+  return ttsPrefetchBudgetForText(sentenceText(currentIndex));
 }
 
 function ttsPrefetchIndexes(currentIndex) {
@@ -1179,7 +1459,7 @@ function ttsPrefetchIndexes(currentIndex) {
   for (const index of upcomingReadableSentenceIndexes(Number(currentIndex) + 1, budget.maxItems)) {
     indexes.push(index);
     totalChars += ttsTextLength(sentenceText(index));
-    if (indexes.length >= TTS_PREFETCH_MIN_ITEMS && totalChars >= budget.targetChars) break;
+    if (indexes.length >= budget.minItems && totalChars >= budget.targetChars) break;
   }
   return indexes;
 }
@@ -1201,19 +1481,270 @@ function trimTtsBrowserCache(keepIndexes = []) {
     const staleUrl = readerState.ttsUrls.get(staleIndex);
     if (staleUrl) URL.revokeObjectURL(staleUrl);
     readerState.ttsUrls.delete(staleIndex);
+    readerState.ttsBlobs.delete(staleIndex);
+    readerState.ttsWavInfo.delete(staleIndex);
     readerState.ttsUrlSizes.delete(staleIndex);
   }
 }
 
-function rememberTtsUrl(index, url, size = 0) {
+function rememberTtsUrl(index, url, blob) {
   const normalizedIndex = Number(index);
   const existing = readerState.ttsUrls.get(normalizedIndex);
   if (existing && existing !== url) URL.revokeObjectURL(existing);
   readerState.ttsUrls.set(normalizedIndex, url);
-  readerState.ttsUrlSizes.set(normalizedIndex, Number(size) || 0);
+  readerState.ttsBlobs.set(normalizedIndex, blob);
+  readerState.ttsWavInfo.delete(normalizedIndex);
+  readerState.ttsUrlSizes.set(normalizedIndex, Number(blob?.size) || 0);
   readerState.ttsUrlOrder = readerState.ttsUrlOrder.filter((item) => Number(item) !== normalizedIndex);
   readerState.ttsUrlOrder.push(normalizedIndex);
   trimTtsBrowserCache([readerState.currentSentence, ...upcomingReadableSentenceIndexes(readerState.currentSentence + 1, TTS_BROWSER_CACHE_LIMIT - 1)]);
+}
+
+function wavChunkName(view, offset) {
+  return String.fromCharCode(
+    view.getUint8(offset),
+    view.getUint8(offset + 1),
+    view.getUint8(offset + 2),
+    view.getUint8(offset + 3),
+  );
+}
+
+async function parseWavBlob(blob) {
+  if (!blob || blob.size < 44) return null;
+  const header = await blob.slice(0, Math.min(blob.size, 64 * 1024)).arrayBuffer();
+  const view = new DataView(header);
+  if (wavChunkName(view, 0) !== "RIFF" || wavChunkName(view, 8) !== "WAVE") return null;
+  let format = null;
+  let data = null;
+  for (let offset = 12; offset + 8 <= view.byteLength;) {
+    const name = wavChunkName(view, offset);
+    const size = view.getUint32(offset + 4, true);
+    const valueOffset = offset + 8;
+    if (name === "fmt " && size >= 16 && valueOffset + 16 <= view.byteLength) {
+      format = {
+        audioFormat: view.getUint16(valueOffset, true),
+        channels: view.getUint16(valueOffset + 2, true),
+        sampleRate: view.getUint32(valueOffset + 4, true),
+        byteRate: view.getUint32(valueOffset + 8, true),
+        blockAlign: view.getUint16(valueOffset + 12, true),
+        bitsPerSample: view.getUint16(valueOffset + 14, true),
+      };
+    } else if (name === "data") {
+      data = {
+        offset: valueOffset,
+        size: Math.max(0, Math.min(size, blob.size - valueOffset)),
+      };
+      break;
+    }
+    offset = valueOffset + size + (size % 2);
+  }
+  if (!format || !data || format.audioFormat !== 1 || !format.byteRate || !data.size) return null;
+  return { ...format, ...data, duration: data.size / format.byteRate };
+}
+
+function wavInfoForIndex(index) {
+  const normalizedIndex = Number(index);
+  if (!readerState.ttsWavInfo.has(normalizedIndex)) {
+    const promise = parseWavBlob(readerState.ttsBlobs.get(normalizedIndex)).catch(() => null);
+    readerState.ttsWavInfo.set(normalizedIndex, promise);
+  }
+  return readerState.ttsWavInfo.get(normalizedIndex);
+}
+
+function sameWavFormat(left, right) {
+  return !!left && !!right
+    && left.audioFormat === right.audioFormat
+    && left.channels === right.channels
+    && left.sampleRate === right.sampleRate
+    && left.byteRate === right.byteRate
+    && left.blockAlign === right.blockAlign
+    && left.bitsPerSample === right.bitsPerSample;
+}
+
+function buildWavHeader(format, dataSize) {
+  const buffer = new ArrayBuffer(44);
+  const view = new DataView(buffer);
+  const writeName = (offset, value) => {
+    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+  };
+  writeName(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeName(8, "WAVE");
+  writeName(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, format.audioFormat, true);
+  view.setUint16(22, format.channels, true);
+  view.setUint32(24, format.sampleRate, true);
+  view.setUint32(28, format.byteRate, true);
+  view.setUint16(32, format.blockAlign, true);
+  view.setUint16(34, format.bitsPerSample, true);
+  writeName(36, "data");
+  view.setUint32(40, dataSize, true);
+  return buffer;
+}
+
+async function prefetchedTtsBlob(index, scope) {
+  const normalizedIndex = Number(index);
+  let blob = readerState.ttsBlobs.get(normalizedIndex);
+  if (blob) return blob;
+  const pending = readerState.ttsPending.get(`${scope}:${normalizedIndex}`);
+  if (!pending) return null;
+  await pending.catch(() => "");
+  blob = readerState.ttsBlobs.get(normalizedIndex);
+  return blob || null;
+}
+
+async function prepareTtsPlayback(index, originalUrl, scope) {
+  // Merge browser WAV blobs, including an in-flight prefetch. Server generation and cache entries remain per sentence.
+  const normalizedIndex = Number(index);
+  const chapterIndex = Number(readerState.currentChapter);
+  const firstBlob = readerState.ttsBlobs.get(normalizedIndex);
+  const firstInfo = await wavInfoForIndex(normalizedIndex);
+  if (!firstBlob || !firstInfo) {
+    return {
+      url: originalUrl,
+      owned: false,
+      lastIndex: normalizedIndex,
+      lastChapterIndex: chapterIndex,
+      segments: [],
+    };
+  }
+  const parts = [{ chapterIndex, index: normalizedIndex, blob: firstBlob, info: firstInfo }];
+  let duration = firstInfo.duration;
+  if (firstInfo.duration < TTS_SHORT_AUDIO_SECONDS) {
+    for (const nextIndex of upcomingReadableSentenceIndexes(normalizedIndex + 1, TTS_MERGED_AUDIO_MAX_ITEMS - 1)) {
+      const nextBlob = await prefetchedTtsBlob(nextIndex, scope);
+      if (!nextBlob) break;
+      const nextInfo = await wavInfoForIndex(nextIndex);
+      if (!nextInfo || !sameWavFormat(firstInfo, nextInfo)) break;
+      parts.push({ chapterIndex, index: nextIndex, blob: nextBlob, info: nextInfo });
+      duration += nextInfo.duration;
+      if (duration >= TTS_MERGED_AUDIO_TARGET_SECONDS) break;
+    }
+  }
+  const lastCurrentPart = parts[parts.length - 1];
+  if (nextReadableSentenceIndex(Number(lastCurrentPart.index) + 1) < 0) {
+    const entry = readerState.nextChapterPrefetch;
+    const prepared = entry?.prepared;
+    if (entry
+      && prepared
+      && entry.bookId === readerState.currentBookId
+      && entry.chapterIndex === chapterIndex + 1
+      && entry.scope === scope) {
+      let nextChapterDuration = 0;
+      for (const audio of prepared.audios.slice(0, Math.max(1, TTS_MERGED_AUDIO_MAX_ITEMS - parts.length))) {
+        const nextInfo = audio.wavInfo || await parseWavBlob(audio.blob).catch(() => null);
+        if (!nextInfo || !sameWavFormat(firstInfo, nextInfo)) break;
+        parts.push({
+          chapterIndex: entry.chapterIndex,
+          index: Number(audio.index),
+          blob: audio.blob,
+          info: nextInfo,
+        });
+        nextChapterDuration += nextInfo.duration;
+        if (nextChapterDuration >= TTS_MERGED_AUDIO_TARGET_SECONDS) break;
+      }
+    }
+  }
+  const segments = [];
+  let segmentStart = 0;
+  parts.forEach((part) => {
+    segments.push({
+      chapterIndex: part.chapterIndex,
+      index: part.index,
+      start: segmentStart,
+      end: segmentStart + part.info.duration,
+    });
+    segmentStart += part.info.duration;
+  });
+  if (parts.length < 2) {
+    return {
+      url: originalUrl,
+      owned: false,
+      lastIndex: normalizedIndex,
+      lastChapterIndex: chapterIndex,
+      segments,
+    };
+  }
+  const dataSize = parts.reduce((total, part) => total + part.info.size, 0);
+  const body = parts.map((part) => part.blob.slice(part.info.offset, part.info.offset + part.info.size));
+  const mergedBlob = new Blob([buildWavHeader(firstInfo, dataSize), ...body], { type: "audio/wav" });
+  return {
+    url: URL.createObjectURL(mergedBlob),
+    owned: true,
+    lastIndex: parts[parts.length - 1].index,
+    lastChapterIndex: parts[parts.length - 1].chapterIndex,
+    segments,
+  };
+}
+
+function playbackSegmentAtTime(segments, currentTime) {
+  if (!segments.length) return null;
+  let active = segments[0];
+  for (const segment of segments) {
+    if (currentTime + 0.02 < segment.start) break;
+    active = segment;
+  }
+  return active;
+}
+
+function setSleepPauseTargetForCurrentAudio() {
+  const audio = readerState.ttsAudio;
+  if (!audio) {
+    readerState.sleepPauseTarget = null;
+    return;
+  }
+  const segment = playbackSegmentAtTime(readerState.ttsPlaybackSegments, audio.currentTime);
+  readerState.sleepPauseTarget = segment
+    ? { chapterIndex: segment.chapterIndex, index: segment.index, time: segment.end }
+    : { chapterIndex: readerState.currentChapter, index: readerState.currentSentence, time: audio.duration };
+}
+
+function adoptPrefetchedChapterForPlayback(chapterIndex) {
+  const entry = readerState.nextChapterPrefetch;
+  const prepared = entry?.prepared;
+  if (!entry
+    || !prepared
+    || entry.bookId !== readerState.currentBookId
+    || entry.chapterIndex !== Number(chapterIndex)) return false;
+  entry.adopted = true;
+  const data = prepared.data;
+  readerState.currentBook = data.book;
+  readerState.currentChapter = data.chapter.index;
+  readerState.currentSentence = 0;
+  $("chapterSelect").value = String(readerState.currentChapter);
+  renderChapter(data.chapter, [...prepared.audios]);
+  saveProgressSoon();
+  setStatus(readerState.currentBook.title);
+  updateMediaSessionMetadata();
+  setMediaSessionPlaybackState("playing");
+  return true;
+}
+
+function syncTtsPlaybackSegment(audio, token) {
+  const segment = playbackSegmentAtTime(readerState.ttsPlaybackSegments, audio.currentTime);
+  if (!segment) return readerState.ttsScope;
+  const chapterChanged = Number(segment.chapterIndex) !== Number(readerState.currentChapter);
+  if (chapterChanged && !adoptPrefetchedChapterForPlayback(segment.chapterIndex)) {
+    return readerState.ttsScope;
+  }
+  if (!chapterChanged && Number(segment.index) === Number(readerState.currentSentence)) {
+    return readerState.ttsScope;
+  }
+  highlightSentence(segment.index, true);
+  updateMediaSessionMetadata();
+  saveProgressSoon();
+  setListenStatus(`正在朗读：第 ${Number(segment.index) + 1} 句`);
+  if (chapterChanged) {
+    prefetchUpcomingTtsAudio(segment.index, token, readerState.ttsScope);
+  }
+  return readerState.ttsScope;
+}
+
+function releaseActiveTtsPlaybackUrl() {
+  if (readerState.activeTtsPlaybackUrl) URL.revokeObjectURL(readerState.activeTtsPlaybackUrl);
+  readerState.activeTtsPlaybackUrl = "";
+  readerState.ttsPlaybackSegments = [];
 }
 
 async function fetchTtsAudio(index, token = readerState.ttsToken, scope = readerState.ttsScope) {
@@ -1280,7 +1811,7 @@ async function fetchTtsAudio(index, token = readerState.ttsToken, scope = reader
       URL.revokeObjectURL(url);
       return "";
     }
-    rememberTtsUrl(normalizedIndex, url, blob.size);
+    rememberTtsUrl(normalizedIndex, url, blob);
     return url;
   }).catch((error) => {
     readerState.ttsPending.delete(pendingKey);
@@ -1292,6 +1823,13 @@ async function fetchTtsAudio(index, token = readerState.ttsToken, scope = reader
 
 async function prefetchUpcomingTtsAudio(index, token = readerState.ttsToken, scope = readerState.ttsScope) {
   const prefetches = ttsPrefetchIndexes(index);
+  const budget = ttsPrefetchBudget(index);
+  const nextChapterWindow = budget.maxItems * TTS_NEXT_CHAPTER_PREFETCH_MULTIPLIER;
+  const remainingWindow = upcomingReadableSentenceIndexes(
+    Number(index) + 1,
+    nextChapterWindow + 1,
+  );
+  const shouldPrefetchNextChapter = remainingWindow.length <= nextChapterWindow;
   for (const nextIndex of prefetches) {
     if (token !== readerState.ttsToken || scope !== readerState.ttsScope || !readerState.reading) return;
     try {
@@ -1300,6 +1838,132 @@ async function prefetchUpcomingTtsAudio(index, token = readerState.ttsToken, sco
       // Prefetch failures are retried normally when the sentence becomes current.
     }
   }
+  if (token === readerState.ttsToken
+    && scope === readerState.ttsScope
+    && readerState.reading
+    && shouldPrefetchNextChapter) {
+    await prefetchNextChapterAudio(token, scope);
+  }
+}
+
+function readableChapterSentences(chapter, limit = TTS_MERGED_AUDIO_MAX_ITEMS) {
+  const sentences = [];
+  for (const paragraph of chapter?.paragraphs || []) {
+    if (paragraph?.type === "image") continue;
+    for (const sentence of paragraph?.sentences || []) {
+      if (!hasReadableText(sentence?.text)) continue;
+      sentences.push(sentence);
+      if (sentences.length >= limit) return sentences;
+    }
+  }
+  return sentences;
+}
+
+async function extendNextChapterAudio(entry, prepared, token, scope) {
+  if (!prepared
+    || entry.adopted
+    || token !== readerState.ttsToken
+    || scope !== readerState.ttsScope
+    || readerState.currentBookId !== entry.bookId
+    || !readerState.reading) {
+    return prepared;
+  }
+  const firstSentence = readableChapterSentences(prepared.data.chapter, 1)[0];
+  if (!firstSentence) return prepared;
+  const budget = ttsPrefetchBudgetForText(firstSentence.text, entry.playbackRate);
+  const candidates = readableChapterSentences(prepared.data.chapter, budget.maxItems);
+  let totalChars = prepared.audios.reduce((total, audio) => total + ttsTextLength(audio.text), 0);
+  for (const sentence of candidates.slice(prepared.audios.length)) {
+    if (token !== readerState.ttsToken
+      || scope !== readerState.ttsScope
+      || readerState.currentBookId !== entry.bookId
+      || !readerState.reading) break;
+    try {
+      const { blob } = await apiBlob("/api/reader/tts", {
+        method: "POST",
+        body: JSON.stringify({ text: sentence.text }),
+      });
+      if (entry.adopted
+        || token !== readerState.ttsToken
+        || scope !== readerState.ttsScope
+        || readerState.currentBookId !== entry.bookId
+        || !readerState.reading) break;
+      const wavInfo = await parseWavBlob(blob).catch(() => null);
+      prepared.audios.push({ index: Number(sentence.index), text: sentence.text, blob, wavInfo });
+      totalChars += ttsTextLength(sentence.text);
+      if (prepared.audios.length >= budget.minItems && totalChars >= budget.targetChars) break;
+    } catch {
+      // The normal current-sentence request retries if chapter-boundary prefetch fails.
+      break;
+    }
+  }
+  return prepared;
+}
+
+function prefetchNextChapterAudio(token = readerState.ttsToken, scope = readerState.ttsScope) {
+  const bookId = readerState.currentBookId;
+  const chapterIndex = Number(readerState.currentChapter) + 1;
+  const playbackRate = Math.max(1, Math.min(Number(readerState.playbackRate) || 1, 2));
+  if (!bookId || chapterIndex >= readerState.chapters.length) return Promise.resolve(null);
+  const existing = readerState.nextChapterPrefetch;
+  if (existing
+    && existing.bookId === bookId
+    && existing.chapterIndex === chapterIndex
+    && existing.scope === scope) {
+    if (playbackRate > existing.playbackRate) {
+      existing.playbackRate = playbackRate;
+      existing.promise = existing.promise
+        .then((prepared) => extendNextChapterAudio(existing, prepared, token, scope))
+        .catch(() => null);
+    }
+    return existing.promise;
+  }
+  const entry = {
+    bookId,
+    chapterIndex,
+    scope,
+    playbackRate,
+    adopted: false,
+    prepared: null,
+    readyPromise: null,
+    promise: null,
+  };
+  entry.readyPromise = (async () => {
+    const data = await api(`/api/books/${bookId}/chapters/${chapterIndex}`);
+    const prepared = { data, audios: [] };
+    entry.prepared = prepared;
+    const firstSentence = readableChapterSentences(data.chapter, 1)[0];
+    if (!firstSentence
+      || token !== readerState.ttsToken
+      || scope !== readerState.ttsScope
+      || readerState.currentBookId !== bookId
+      || !readerState.reading) return prepared;
+    try {
+      const { blob } = await apiBlob("/api/reader/tts", {
+        method: "POST",
+        body: JSON.stringify({ text: firstSentence.text }),
+      });
+      if (token !== readerState.ttsToken
+        || scope !== readerState.ttsScope
+        || readerState.currentBookId !== bookId
+        || !readerState.reading) return prepared;
+      const wavInfo = await parseWavBlob(blob).catch(() => null);
+      prepared.audios.push({
+        index: Number(firstSentence.index),
+        text: firstSentence.text,
+        blob,
+        wavInfo,
+      });
+    } catch {
+      // Normal playback retries the first sentence if this early request fails.
+    }
+    return prepared;
+  })().catch(() => null);
+  entry.promise = entry.readyPromise
+    .then((prepared) => extendNextChapterAudio(entry, prepared, token, scope))
+    .catch(() => null);
+  readerState.nextChapterPrefetch = entry;
+  return entry.promise;
 }
 
 function stopListening(resetStatus = true, clearTimer = true) {
@@ -1316,8 +1980,10 @@ function stopListening(resetStatus = true, clearTimer = true) {
     readerState.ttsAudio.removeAttribute("src");
     readerState.ttsAudio.load();
   }
+  releaseActiveTtsPlaybackUrl();
   updateListenButtons();
   syncReaderWakeLock();
+  setMediaSessionPlaybackState("none");
   if (resetStatus) setListenStatus("已停止");
 }
 
@@ -1344,8 +2010,16 @@ async function playSentence(index, token = readerState.ttsToken) {
   if (readableIndex < 0 || readableIndex >= readerState.sentences.length) {
     if (readerState.currentChapter + 1 < readerState.chapters.length) {
       setListenStatus("正在切换下一章");
-      await loadChapter(readerState.currentChapter + 1, 0);
-      await playSentence(nextReadableSentenceIndex(0), token);
+      setMediaSessionPlaybackState("playing");
+      try {
+        await loadChapter(readerState.currentChapter + 1, 0);
+        await playSentence(nextReadableSentenceIndex(0), token);
+      } catch (error) {
+        if (readerState.reading && token === readerState.ttsToken) {
+          setListenStatus(error.message || "切换下一章失败");
+          stopListening(false);
+        }
+      }
       return;
     }
     stopListening(false);
@@ -1354,7 +2028,9 @@ async function playSentence(index, token = readerState.ttsToken) {
   }
   index = readableIndex;
   highlightSentence(index, true);
-  const scope = readerState.ttsScope;
+  updateMediaSessionMetadata();
+  setMediaSessionPlaybackState("playing");
+  let scope = readerState.ttsScope;
   saveProgressSoon();
   setListenStatus(readerState.ttsUrls.has(Number(index)) ? "浏览器内存缓存命中，正在准备播放" : "正在准备检查服务器缓存");
   try {
@@ -1362,33 +2038,71 @@ async function playSentence(index, token = readerState.ttsToken) {
     if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
     if (!url) return;
     prefetchUpcomingTtsAudio(index, token, scope);
+    const playback = await prepareTtsPlayback(index, url, scope);
+    if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) {
+      if (playback.owned) URL.revokeObjectURL(playback.url);
+      return;
+    }
+    if (playback.lastChapterIndex === Number(readerState.currentChapter)
+      && playback.lastIndex !== Number(index)) {
+      prefetchUpcomingTtsAudio(playback.lastIndex, token, scope);
+    }
     const audio = readerState.ttsAudio || new Audio();
     audio.pause();
     audio.onplaying = null;
     audio.onended = null;
     audio.onerror = null;
     audio.ontimeupdate = null;
+    releaseActiveTtsPlaybackUrl();
+    readerState.activeTtsPlaybackUrl = playback.owned ? playback.url : "";
+    readerState.ttsPlaybackSegments = playback.segments;
+    if (readerState.sleepPausePending) readerState.sleepPauseTarget = null;
     audio.volume = 1;
-    audio.src = url;
+    applyAudioPlaybackRate(audio);
+    audio.src = playback.url;
     audio.preload = "auto";
-    audio.playbackRate = readerState.playbackRate;
     readerState.ttsAudio = audio;
     audio.onplaying = () => {
       if (token === readerState.ttsToken && scope === readerState.ttsScope) {
+        applyAudioPlaybackRate(audio);
+        setMediaSessionPlaybackState("playing");
         setListenStatus(`正在朗读：第 ${Number(index) + 1} 句`);
       }
     };
     audio.ontimeupdate = () => {
-      if (token === readerState.ttsToken && scope === readerState.ttsScope) startSleepFadeIfNeeded(audio);
-    };
-    audio.onended = () => {
       if (token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
-      audio.volume = 1;
-      if (readerState.sleepPausePending) {
-        finishSleepPause(index);
+      let sleepTarget = readerState.sleepPauseTarget;
+      if (readerState.sleepPausePending && sleepTarget && Number.isFinite(sleepTarget.time)
+        && audio.currentTime >= sleepTarget.time - 0.01) {
+        if (Number(sleepTarget.chapterIndex) !== Number(readerState.currentChapter)
+          && adoptPrefetchedChapterForPlayback(sleepTarget.chapterIndex)) {
+          scope = readerState.ttsScope;
+        }
+        audio.pause();
+        audio.volume = 1;
+        finishSleepPause(sleepTarget.index);
         return;
       }
-      playSentence(nextReadableSentenceIndex(Number(index) + 1), token);
+      scope = syncTtsPlaybackSegment(audio, token);
+      if (readerState.sleepPausePending && !readerState.sleepPauseTarget) {
+        setSleepPauseTargetForCurrentAudio();
+        sleepTarget = readerState.sleepPauseTarget;
+      }
+      startSleepFadeIfNeeded(audio, sleepTarget?.time);
+    };
+    audio.onended = () => {
+      if (token !== readerState.ttsToken) return;
+      if (Number(playback.lastChapterIndex) !== Number(readerState.currentChapter)
+        && adoptPrefetchedChapterForPlayback(playback.lastChapterIndex)) {
+        scope = readerState.ttsScope;
+      }
+      if (scope !== readerState.ttsScope) return;
+      audio.volume = 1;
+      if (readerState.sleepPausePending) {
+        finishSleepPause(readerState.sleepPauseTarget?.index ?? playback.lastIndex);
+        return;
+      }
+      playSentence(nextReadableSentenceIndex(Number(playback.lastIndex) + 1), token);
     };
     audio.onerror = () => {
       if (token === readerState.ttsToken && scope === readerState.ttsScope) {
@@ -1398,6 +2112,8 @@ async function playSentence(index, token = readerState.ttsToken) {
     };
     await waitForAudioReady(audio);
     if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
+    if (readerState.sleepPausePending && !readerState.sleepPauseTarget) setSleepPauseTargetForCurrentAudio();
+    applyAudioPlaybackRate(audio);
     await audio.play();
   } catch (error) {
     if (token === readerState.ttsToken && scope === readerState.ttsScope) {
@@ -1417,11 +2133,14 @@ async function toggleListeningPause() {
   if (!readerState.ttsAudio) return;
   if (readerState.paused) {
     readerState.paused = false;
+    applyAudioPlaybackRate(readerState.ttsAudio);
     await readerState.ttsAudio.play();
+    setMediaSessionPlaybackState("playing");
     setListenStatus("继续朗读");
   } else {
     readerState.paused = true;
     readerState.ttsAudio.pause();
+    setMediaSessionPlaybackState("paused");
     setListenStatus("已暂停");
   }
   updateListenButtons();
@@ -1455,12 +2174,18 @@ async function openReaderFontCache() {
   }
 }
 
+function readerFontRequest(url) {
+  return new Request(new URL(url, window.location.href).href, {
+    credentials: "same-origin",
+  });
+}
+
 async function locallyCachedFontResponse(fontId) {
   const url = FONT_ASSET_URLS[fontId];
   if (!url) return null;
   const cache = await openReaderFontCache();
   if (!cache) return null;
-  const stored = await cache.match(url).catch(() => null);
+  const stored = await cache.match(readerFontRequest(url), { ignoreVary: true }).catch(() => null);
   return stored?.ok ? stored : null;
 }
 
@@ -1475,7 +2200,7 @@ async function downloadAndStoreReaderFont(fontId, forceRetry = false) {
     });
     if (!response.ok) return false;
     const cache = await openReaderFontCache();
-    if (cache) await cache.put(url, response.clone()).catch(() => {});
+    if (cache) await cache.put(readerFontRequest(url), response.clone()).catch(() => {});
     return loadReaderFontFromResponse(fontId, response);
   } catch {
     return false;
@@ -1572,6 +2297,9 @@ async function ensureReaderFontLoaded(fontId, forceRetry = false) {
 async function activateCachedReaderFont(fontId) {
   const webFamily = FONT_WEB_FAMILIES[fontId];
   if (!webFamily) return true;
+  if (fontId === "yshi-written" && window.readerRequiredFontPromise) {
+    await window.readerRequiredFontPromise.catch(() => false);
+  }
   if (isReaderFontLoaded(fontId)) {
     setFontLoadState(fontId, "ready");
     return true;
@@ -1652,7 +2380,13 @@ function refreshSelectedReaderFont() {
 function applyReaderTheme(value) {
   const dark = value === "dark";
   document.body.classList.toggle("reader-dark", dark);
-  document.documentElement.classList.toggle("reader-dark-root", dark);
+  if (typeof window.applyReaderDocumentTheme === "function") {
+    window.applyReaderDocumentTheme(dark);
+  } else {
+    document.documentElement.classList.toggle("reader-dark-root", dark);
+    const themeColor = document.querySelector('meta[name="theme-color"]');
+    if (themeColor) themeColor.content = dark ? "#0e1320" : "#dfe4fb";
+  }
   const button = $("darkModeBtn");
   if (button) {
     button.classList.toggle("active", dark);
@@ -2209,13 +2943,14 @@ $("saveMimoCookieBtn")?.addEventListener("click", () => saveMimoBalanceCookie())
 $("closeMimoCookieBtn")?.addEventListener("click", () => $("mimoCookieDialog").close());
 $("refreshMimoBalanceBtn")?.addEventListener("click", () => refreshMimoBalance());
 $("ttsModel").addEventListener("change", () => renderTtsVoiceOptions());
-$("shelfBtn").addEventListener("click", showShelfView);
+$("shelfBtn").addEventListener("click", returnToShelf);
+$("statisticsBtn").addEventListener("click", () => {
+  renderStatistics();
+  openReaderDialog($("statisticsDialog"));
+});
 $("manageBtn").addEventListener("click", () => {
   renderManageBooks();
   openReaderDialog($("manageDialog"));
-});
-$("tocBtn").addEventListener("click", () => {
-  if (readerState.currentBook) openReaderDialog($("tocDialog"));
 });
 $("ttsBtn").addEventListener("click", () => {
   loadTtsConfig().catch((error) => showTtsConfigMessage(error.message, "error"));
@@ -2226,7 +2961,9 @@ $("settingsBtn").addEventListener("click", () => {
   activateCachedReaderFonts();
 });
 $("closeManageBtn").addEventListener("click", () => $("manageDialog").close());
-$("closeTocBtn").addEventListener("click", () => $("tocDialog").close());
+$("closeStatisticsBtn").addEventListener("click", () => $("statisticsDialog").close());
+$("bookMetadataForm").addEventListener("submit", saveBookMetadata);
+$("closeBookMetadataBtn").addEventListener("click", () => $("bookMetadataDialog").close());
 $("closeTocEditBtn").addEventListener("click", () => $("tocEditDialog").close());
 $("closeTocLineBtn").addEventListener("click", () => $("tocLineDialog").close());
 $("tocLineSearch").addEventListener("input", renderTocLineRows);
@@ -2251,6 +2988,21 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 window.addEventListener("pageshow", refreshSelectedReaderFont);
+window.addEventListener("popstate", (event) => {
+  const state = event.state || {};
+  if (state.readerView === "book" && state.bookId) {
+    const book = readerState.books.find((item) => item.id === state.bookId);
+    if (book) {
+      openBook(state.bookId, book.progress?.chapter || 0, book.progress?.sentence || 0, false)
+        .catch((error) => {
+          setStatus(error.message);
+          showShelfView();
+        });
+      return;
+    }
+  }
+  showShelfView();
+});
 window.addEventListener("pagehide", () => {
   readerState.wakeLockWanted = false;
   releaseReaderWakeLock();
@@ -2268,6 +3020,8 @@ $("logoutBtn").addEventListener("click", async () => {
 });
 
 restoreReaderSettings();
+initializeMediaSession();
+window.history.replaceState({ readerView: "shelf" }, "", window.location.href);
 ensureReaderFontLoaded("yshi-written").then((loaded) => {
   if (loaded && window.localStorage.getItem("readerFontFamily") === "yshi-written") {
     updateReaderFontFamily("yshi-written", false, false);

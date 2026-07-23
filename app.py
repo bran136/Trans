@@ -875,6 +875,40 @@ def rebuild_book_index():
         return summaries
 
 
+def load_book_index_or_rebuild():
+    books = load_book_index()
+    if not all(isinstance(book, dict) and book.get("id") for book in books):
+        return rebuild_book_index()
+    record_ids = {path.parent.name for path in READER_BOOK_DIR.glob("*/book.json")}
+    index_ids = {str(book["id"]) for book in books}
+    if record_ids != index_ids or len(books) != len(index_ids):
+        return rebuild_book_index()
+    books.sort(key=lambda item: (item.get("last_opened_at", 0), item.get("created_at", 0)), reverse=True)
+    return books
+
+
+def upsert_book_index(book):
+    summary = book_summary(book)
+    with READER_IO_LOCK:
+        books = [
+            item for item in load_book_index()
+            if isinstance(item, dict) and item.get("id") != summary["id"]
+        ]
+        books.append(summary)
+        books.sort(key=lambda item: (item.get("last_opened_at", 0), item.get("created_at", 0)), reverse=True)
+        save_book_index(books)
+    return summary
+
+
+def remove_from_book_index(book_id):
+    with READER_IO_LOCK:
+        books = [
+            item for item in load_book_index()
+            if isinstance(item, dict) and item.get("id") != book_id
+        ]
+        save_book_index(books)
+
+
 def decode_text_bytes(raw):
     for encoding in ("utf-8-sig", "utf-8", "gb18030", "big5"):
         try:
@@ -882,6 +916,21 @@ def decode_text_bytes(raw):
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace")
+
+
+def infer_txt_author(text, filename_title=""):
+    sources = [str(text or "")[:20_000], str(filename_title or "")]
+    pattern = re.compile(r"(?:作者|著者|作\s*者)\s*[:：]\s*([^\r\n|｜]{1,80})", re.IGNORECASE)
+    for source in sources:
+        match = pattern.search(source)
+        if not match:
+            continue
+        author = re.split(r"\s{2,}|[【\[]", match.group(1), maxsplit=1)[0]
+        author = re.sub(r"\.(?:txt|text)$", "", author, flags=re.IGNORECASE)
+        author = clean_display_text(author.strip(" \t　·•-_—=《》〈〉【】[]（）()"), 120)
+        if author:
+            return author
+    return ""
 
 
 def normalize_book_text(text, max_chars=MAX_BOOK_TEXT_CHARS):
@@ -1084,7 +1133,7 @@ def split_plain_chapters(text):
 def parse_txt_book(path, title):
     text = decode_text_bytes(path.read_bytes())
     chapters = split_plain_chapters(text)
-    return {"title": title, "author": "", "chapters": chapters}
+    return {"title": title, "author": infer_txt_author(text, title), "chapters": chapters}
 
 
 def zip_path_join(base, href):
@@ -1717,7 +1766,7 @@ def reparse_book_record(book_id):
     updated = {
         **book,
         "title": book.get("title") or parsed["title"],
-        "author": parsed.get("author", ""),
+        "author": book.get("author", "") if book.get("author_manually_set") else parsed.get("author", ""),
         "cover_name": cover_name,
         "lazy": bool(parsed.get("lazy")),
         "metadata_version": CHAPTER_CACHE_VERSION,
@@ -1726,7 +1775,7 @@ def reparse_book_record(book_id):
         "chapters": parsed["chapters"],
     }
     write_book_record(updated)
-    rebuild_book_index()
+    upsert_book_index(updated)
     return updated
 
 
@@ -1766,7 +1815,7 @@ def clear_txt_book_toc(book_id):
         }],
     }
     write_book_record(updated)
-    rebuild_book_index()
+    upsert_book_index(updated)
     return updated
 
 
@@ -1800,7 +1849,7 @@ def update_txt_chapter_title(book_id, chapter_index, title):
     book["chapters"] = reindex_chapters(chapters)
     book["updated_at"] = int(time.time())
     write_book_record(book)
-    rebuild_book_index()
+    upsert_book_index(book)
     return book
 
 
@@ -1829,7 +1878,7 @@ def delete_txt_chapter_title(book_id, chapter_index):
     book["chapters"] = reindex_chapters(chapters)
     book["updated_at"] = int(time.time())
     write_book_record(book)
-    rebuild_book_index()
+    upsert_book_index(book)
     return book
 
 
@@ -1886,7 +1935,7 @@ def split_txt_chapter_at_line(book_id, chapter_index, line_index, title=""):
     book["chapters"] = reindex_chapters(chapters)
     book["updated_at"] = int(time.time())
     write_book_record(book)
-    rebuild_book_index()
+    upsert_book_index(book)
     return book
 
 
@@ -1907,14 +1956,15 @@ def refresh_epub_chapter_metadata(book):
     progress = book.get("progress") or {"chapter": 0, "sentence": 0}
     progress["chapter"] = max(0, min(int(progress.get("chapter") or 0), max(len(parsed["chapters"]) - 1, 0)))
     progress["sentence"] = max(0, int(progress.get("sentence") or 0))
-    book["author"] = parsed.get("author", book.get("author", ""))
+    if not book.get("author_manually_set"):
+        book["author"] = parsed.get("author", book.get("author", ""))
     book["lazy"] = bool(parsed.get("lazy"))
     book["chapters"] = parsed["chapters"]
     book["progress"] = progress
     book["metadata_version"] = CHAPTER_CACHE_VERSION
     book["updated_at"] = int(time.time())
     write_book_record(book)
-    rebuild_book_index()
+    upsert_book_index(book)
     return book
 
 
@@ -2062,7 +2112,7 @@ def ensure_chapter_text(book, chapter_index):
                 latest_book["chapters"] = latest_chapters
                 latest_book["updated_at"] = int(time.time())
                 write_book_record(latest_book)
-                rebuild_book_index()
+                upsert_book_index(latest_book)
         except FileNotFoundError:
             pass
         return chapter
@@ -2330,6 +2380,7 @@ def inject_asset_url():
             BASE_DIR / "static" / "font-cache.js",
             BASE_DIR / "static" / "home.js",
             BASE_DIR / "static" / "reader.css",
+            BASE_DIR / "static" / "reader-theme.js",
             BASE_DIR / "static" / "reader.js",
         ]
         version = 0
@@ -3579,7 +3630,7 @@ def logout():
 def api_books():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    return jsonify({"books": rebuild_book_index(), "supported": sorted(SUPPORTED_BOOK_EXTENSIONS)})
+    return jsonify({"books": load_book_index_or_rebuild(), "supported": sorted(SUPPORTED_BOOK_EXTENSIONS)})
 
 
 @app.route("/api/book-imports")
@@ -3706,6 +3757,7 @@ def process_book_import_job(job_id, book_id, original_path, original_name, safe_
             "id": book_id,
             "title": parsed["title"],
             "author": parsed["author"],
+            "author_manually_set": False,
             "format": suffix.lstrip("."),
             "original_name": original_name,
             "stored_name": safe_name,
@@ -3724,7 +3776,7 @@ def process_book_import_job(job_id, book_id, original_path, original_name, safe_
         summary = book_summary(book)
         update_import_job(job_id, status="parsing", message="正在更新书架", progress=92)
         index_started = time.perf_counter()
-        rebuild_book_index()
+        upsert_book_index(book)
         index_seconds = time.perf_counter() - index_started
         update_import_job(job_id, status="done", message="导入完成", progress=100, book=summary)
         app.logger.info(
@@ -3830,11 +3882,12 @@ def api_book_detail(book_id):
         return jsonify({"error": "unauthorized"}), 401
     try:
         book = refresh_epub_chapter_metadata(read_book_record(book_id))
-        now = int(time.time())
-        book["last_opened_at"] = now
-        book["updated_at"] = max(int(book.get("updated_at") or 0), now)
-        write_book_record(book)
-        rebuild_book_index()
+        if request.args.get("inspect") != "1":
+            now = int(time.time())
+            book["last_opened_at"] = now
+            book["updated_at"] = max(int(book.get("updated_at") or 0), now)
+            write_book_record(book)
+            upsert_book_index(book)
         chapters = [
             {
                 "index": chapter.get("index", index),
@@ -3856,16 +3909,31 @@ def api_book_update(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     payload = request_json_object()
-    title = clean_display_text(payload.get("title"), 160)
-    if not title:
+    has_title = "title" in payload
+    has_author = "author" in payload
+    if not has_title and not has_author:
+        return jsonify({"error": "没有可更新的书籍信息"}), 400
+    title = clean_display_text(payload.get("title"), 160) if has_title else ""
+    author = clean_display_text(payload.get("author"), 120) if has_author else ""
+    if has_title and not title:
         return jsonify({"error": "书名不能为空"}), 400
     try:
-        book = read_book_record(book_id)
-        book["title"] = title
-        book["updated_at"] = int(time.time())
-        write_book_record(book)
-        rebuild_book_index()
-        app.logger.info("book renamed ip=%s id=%s title=%s", request.remote_addr, book_id, title)
+        with READER_IO_LOCK:
+            book = read_book_record(book_id)
+            if has_title:
+                book["title"] = title
+            if has_author:
+                book["author"] = author
+                book["author_manually_set"] = True
+            book["updated_at"] = int(time.time())
+            write_book_record(book)
+            upsert_book_index(book)
+        app.logger.info(
+            "book metadata updated ip=%s id=%s fields=%s",
+            request.remote_addr,
+            book_id,
+            ",".join(key for key, present in (("title", has_title), ("author", has_author)) if present),
+        )
         return jsonify({"ok": True, "book": book_summary(book)})
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 404
@@ -4027,17 +4095,18 @@ def api_book_progress(book_id):
         return jsonify({"error": "unauthorized"}), 401
     payload = request_json_object()
     try:
-        book = read_book_record(book_id)
-        chapter = int(payload.get("chapter", 0))
-        sentence = int(payload.get("sentence", 0))
-        chapter = max(0, min(chapter, max(len(book.get("chapters", [])) - 1, 0)))
-        sentence = max(0, sentence)
-        now = int(time.time())
-        book["progress"] = {"chapter": chapter, "sentence": sentence}
-        book["updated_at"] = now
-        book["last_opened_at"] = now
-        write_book_record(book)
-        rebuild_book_index()
+        with READER_IO_LOCK:
+            book = read_book_record(book_id)
+            chapter = int(payload.get("chapter", 0))
+            sentence = int(payload.get("sentence", 0))
+            chapter = max(0, min(chapter, max(len(book.get("chapters", [])) - 1, 0)))
+            sentence = max(0, sentence)
+            now = int(time.time())
+            book["progress"] = {"chapter": chapter, "sentence": sentence}
+            book["updated_at"] = now
+            book["last_opened_at"] = now
+            write_book_record(book)
+            upsert_book_index(book)
         return jsonify({"ok": True, "book": book_summary(book)})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
@@ -4051,10 +4120,11 @@ def api_book_delete(book_id):
         target_dir = book_dir(book_id)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    if not target_dir.exists():
-        return jsonify({"error": "书籍不存在"}), 404
-    shutil.rmtree(target_dir)
-    rebuild_book_index()
+    with READER_IO_LOCK:
+        if not target_dir.exists():
+            return jsonify({"error": "书籍不存在"}), 404
+        shutil.rmtree(target_dir)
+        remove_from_book_index(book_id)
     app.logger.info("book deleted ip=%s id=%s", request.remote_addr, book_id)
     return jsonify({"ok": True})
 

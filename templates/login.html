@@ -2,22 +2,18 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#ffffff">
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Trans工具</title>
+    <link rel="icon" type="image/svg+xml" sizes="any" href="{{ asset_url('site-icon.svg') }}">
+    <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
     <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
   </head>
   <body class="login-body">
     <main class="login-shell">
       <section class="login-panel">
-        <div class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 64 64" role="img">
-            <rect x="8" y="10" width="34" height="34" rx="10"></rect>
-            <path d="M18 21h16M26 17v22M20 28c3 5 8 9 16 11M34 25c-3 7-8 12-16 15"></path>
-            <rect x="26" y="24" width="30" height="30" rx="10"></rect>
-            <path d="M36 44l5-12 5 12M38 40h6"></path>
-          </svg>
-        </div>
+        <img class="brand-mark" src="{{ asset_url('site-icon.svg') }}" alt="" aria-hidden="true">
         <h1>Trans工具</h1>
         <p>输入访问密码并选择功能</p>
         <form method="post" class="login-form">
