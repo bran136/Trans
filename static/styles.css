@@ -1074,11 +1074,7 @@ dialog::backdrop {
   line-height: 1.6;
   overflow-wrap: anywhere;
   cursor: pointer;
-}
-
-.info-help.flip-left div {
-  right: 0;
-  left: auto;
+  transform: translateX(var(--help-shift-x, 0px));
 }
 
 .config-message.success {

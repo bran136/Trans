@@ -843,13 +843,18 @@ $("settingsDialog").addEventListener("toggle", (event) => {
 }, true);
 
 function placeHelpBox(help) {
-  help.classList.remove("flip-left");
   const body = help.querySelector("div");
   if (!body) return;
+  body.style.removeProperty("--help-shift-x");
   const rect = body.getBoundingClientRect();
+  let shift = 0;
   if (rect.right > window.innerWidth - 16) {
-    help.classList.add("flip-left");
+    shift -= rect.right - (window.innerWidth - 16);
   }
+  if (rect.left + shift < 16) {
+    shift += 16 - (rect.left + shift);
+  }
+  body.style.setProperty("--help-shift-x", Math.round(shift) + "px");
 }
 $("saveConfigBtn").addEventListener("click", saveConfig);
 $("clearCacheBtn").addEventListener("click", clearDeepSeekCache);

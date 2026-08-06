@@ -51,7 +51,6 @@ body.reader-body.dialog-scroll-locked {
   right: 0;
   width: 100%;
   overflow: hidden;
-  touch-action: none;
 }
 
 .reader-body.reader-dark {
@@ -778,7 +777,7 @@ button {
 }
 
 .manage-dialog {
-  width: min(760px, calc(100vw - 24px));
+  width: min(920px, calc(100vw - 24px));
 }
 
 .statistics-dialog {
@@ -810,6 +809,7 @@ button {
   display: grid;
   gap: 12px;
   max-height: min(86vh, 720px);
+  max-height: min(86dvh, 720px);
   padding: 14px;
   overflow: auto;
   overscroll-behavior: contain;
@@ -823,6 +823,10 @@ button {
 .reader-dark .dialog-panel {
   border-color: rgba(120, 137, 184, 0.2);
   background: rgba(18, 23, 33, 0.96);
+}
+
+.dialog-panel:focus {
+  outline: none;
 }
 
 .reader-dark .reader-figure img {
@@ -886,7 +890,7 @@ button {
 
 .manage-book-actions {
   display: grid;
-  grid-template-columns: 92px 74px 74px 118px 74px;
+  grid-template-columns: 92px 74px 74px 118px 88px 74px;
   justify-content: end;
   gap: 7px;
   align-items: center;
@@ -1239,6 +1243,201 @@ button {
   box-shadow: 0 0 0 1000px rgb(25, 32, 45) inset;
 }
 
+.offline-cache-dialog {
+  width: min(760px, calc(100vw - 24px));
+  max-height: none;
+  overflow: visible;
+}
+
+.offline-cache-dialog .dialog-panel {
+  grid-template-rows: auto auto auto auto minmax(120px, 1fr) auto auto;
+  gap: 7px;
+  max-height: min(90vh, 720px);
+  max-height: min(90dvh, 720px);
+  padding: 12px;
+  overflow: hidden;
+}
+
+.offline-cache-summary,
+.offline-cache-help {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.offline-cache-summary {
+  display: -webkit-box;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.offline-cache-help {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.offline-cache-presets,
+.offline-cache-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+}
+
+.offline-cache-presets button,
+.offline-cache-actions button {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgba(107, 125, 227, 0.22);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.offline-cache-presets button:hover:not(:disabled),
+.offline-cache-actions button:hover:not(:disabled) {
+  border-color: rgba(107, 125, 227, 0.45);
+  background: rgba(107, 125, 227, 0.07);
+}
+
+.offline-cache-presets button:disabled,
+.offline-cache-actions button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.reader-dark .offline-cache-presets button,
+.reader-dark .offline-cache-actions button {
+  border-color: rgba(107, 125, 227, 0.28);
+  background: rgba(25, 32, 45, 0.86);
+  color: var(--ink);
+}
+
+.offline-cache-actions {
+  flex-wrap: nowrap;
+}
+
+.offline-cache-actions .danger {
+  border-color: rgba(180, 35, 24, 0.18);
+  color: var(--danger);
+}
+
+.reader-dark .offline-cache-actions .danger {
+  color: #ff9b92;
+}
+
+.offline-cache-actions .danger:hover:not(:disabled) {
+  border-color: rgba(180, 35, 24, 0.42);
+  background: rgba(180, 35, 24, 0.06);
+}
+
+.offline-cache-progress {
+  box-sizing: border-box;
+  display: flex;
+  visibility: hidden;
+  align-items: center;
+  height: 44px;
+  gap: 8px;
+  margin: 0;
+  padding: 4px 6px 4px 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(107, 125, 227, 0.08);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.offline-cache-progress.visible {
+  visibility: visible;
+}
+
+.offline-cache-progress-text {
+  display: -webkit-box;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.offline-cache-progress-text.compact {
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.offline-cache-cancel {
+  min-height: 25px;
+  flex: 0 0 auto;
+  padding: 0 9px;
+  border: 1px solid rgba(180, 35, 24, 0.28);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.offline-cache-cancel:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.offline-cache-progress.error {
+  border-color: rgba(180, 35, 24, 0.24);
+  background: rgba(180, 35, 24, 0.08);
+  color: var(--danger);
+}
+
+.offline-chapter-list {
+  display: grid;
+  min-height: 0;
+  gap: 5px;
+  overflow: auto;
+  padding: 2px;
+}
+
+.offline-chapter-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.offline-chapter-item input {
+  width: 17px;
+  height: 17px;
+}
+
+.offline-chapter-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+}
+
+.offline-chapter-state {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+
 @media (min-width: 761px) {
   .tts-dialog .dialog-panel {
     padding: 16px 18px;
@@ -1584,7 +1783,7 @@ button {
     grid-template-rows: 56px 38px;
     gap: 8px;
     position: sticky;
-    top: -64px;
+    top: calc(-64px + env(safe-area-inset-top));
     z-index: 20;
     margin-bottom: 8px;
   }
@@ -1653,7 +1852,7 @@ button {
 
   .reader-toolbar {
     position: sticky;
-    top: 38px;
+    top: calc(38px + env(safe-area-inset-top));
     z-index: 12;
     grid-template-columns: auto minmax(0, 1fr) auto;
     gap: 6px;
@@ -1664,7 +1863,7 @@ button {
 
   .listen-toolbar {
     position: sticky;
-    top: 89px;
+    top: calc(89px + env(safe-area-inset-top));
     z-index: 11;
     grid-template-columns: auto auto auto minmax(76px, 1fr) auto;
     gap: 6px;
@@ -1758,13 +1957,70 @@ button {
 
   .reader-version {
     position: absolute;
-    top: 10px;
-    right: 8px;
+    top: max(10px, env(safe-area-inset-top));
+    right: max(8px, env(safe-area-inset-right));
     bottom: auto;
     z-index: 8;
     width: max-content;
     padding: 4px 8px;
     font-size: 10px;
     opacity: 0.82;
+  }
+
+  .mimo-balance-actions a,
+  .mimo-balance-actions button,
+  .font-load-button,
+  .toc-edit-actions button {
+    min-height: 34px;
+  }
+}
+
+@media (max-width: 640px) {
+  .offline-cache-dialog {
+    width: calc(100vw - 16px);
+  }
+
+  .offline-cache-dialog .dialog-panel {
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - max(12px, env(safe-area-inset-top)) - max(12px, env(safe-area-inset-bottom)));
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
+
+  .offline-cache-presets button,
+  .offline-cache-actions button {
+    min-height: 38px;
+  }
+
+  .offline-cache-cancel {
+    min-height: 30px;
+  }
+
+  .offline-chapter-item {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .offline-chapter-state {
+    grid-column: 2;
+    text-align: left;
+  }
+
+  .offline-cache-actions {
+    flex-wrap: wrap;
+  }
+
+  .offline-cache-actions button {
+    flex: 1 1 calc(50% - 8px);
+  }
+}
+
+@supports (-webkit-touch-callout: none) {
+  @media (max-width: 760px) {
+    .reader-dialog input,
+    .reader-dialog select,
+    .reader-dialog textarea,
+    .reader-toolbar select,
+    .listen-toolbar select {
+      font-size: 16px;
+    }
   }
 }

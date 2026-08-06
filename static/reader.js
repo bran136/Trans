@@ -55,11 +55,22 @@ const readerState = {
   tocEditChapters: [],
   tocLineChapter: null,
   tocLineRows: [],
+  offlineBookId: "",
+  offlineBook: null,
+  offlineStatus: null,
+  offlineLocalStats: new Map(),
+  offlineBusy: false,
+  offlineActiveJobId: "",
+  offlineDownloadController: null,
+  offlineCancelRequested: false,
   metadataEditBookId: "",
 };
 
 const $ = (id) => document.getElementById(id);
 const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || "";
+const TTS_OFFLINE_DB_NAME = "trans-reader-offline-v1";
+const TTS_OFFLINE_STORE = "audio";
+let ttsOfflineDbPromise = null;
 const TTS_BROWSER_CACHE_LIMIT = 12;
 const TTS_BROWSER_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const TTS_PREFETCH_MIN_ITEMS = 2;
@@ -154,9 +165,18 @@ function unlockReaderScroll() {
 function openReaderDialog(dialog) {
   if (!dialog) return;
   lockReaderScroll();
-  if (!dialog.open) dialog.showModal();
+  if (dialog.open) return;
+  dialog.showModal();
+  const panel = dialog.querySelector(".dialog-panel");
+  if (panel) {
+    panel.tabIndex = -1;
+    try {
+      panel.focus({ preventScroll: true });
+    } catch {
+      panel.focus();
+    }
+  }
 }
-
 function markUserScrollIntent() {
   readerState.lastUserScrollAt = Date.now();
 }
@@ -312,6 +332,232 @@ async function apiBlob(path, options = {}, onResponse = null) {
     cacheState,
     ...serverTiming,
   };
+}
+
+function openTtsOfflineDb() {
+  if (!("indexedDB" in window)) return Promise.reject(new Error("当前浏览器不支持本机离线缓存"));
+  if (ttsOfflineDbPromise) return ttsOfflineDbPromise;
+  let openPromise;
+  openPromise = new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(TTS_OFFLINE_DB_NAME, 2);
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      if (ttsOfflineDbPromise === openPromise) ttsOfflineDbPromise = null;
+      reject(error);
+    };
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      const store = database.objectStoreNames.contains(TTS_OFFLINE_STORE)
+        ? request.transaction.objectStore(TTS_OFFLINE_STORE)
+        : database.createObjectStore(TTS_OFFLINE_STORE, { keyPath: "id" });
+      if (!store.indexNames.contains("book")) {
+        store.createIndex("book", "bookId", { unique: false });
+      }
+      if (!store.indexNames.contains("bookProfile")) {
+        store.createIndex("bookProfile", ["bookId", "profileKey"], { unique: false });
+      }
+      if (store.indexNames.contains("bookChapter")) {
+        store.deleteIndex("bookChapter");
+      }
+    };
+    request.onsuccess = () => {
+      const database = request.result;
+      if (settled) {
+        database.close();
+        return;
+      }
+      settled = true;
+      database.onversionchange = () => {
+        database.close();
+        if (ttsOfflineDbPromise === openPromise) ttsOfflineDbPromise = null;
+      };
+      resolve(database);
+    };
+    request.onerror = () => fail(request.error || new Error("无法打开本机离线缓存"));
+    request.onblocked = () => fail(new Error("离线缓存数据库正在被其他页面占用，请关闭其他读书页面后重试"));
+  });
+  ttsOfflineDbPromise = openPromise;
+  return openPromise;
+}
+
+function offlineAudioRecordId(bookId, profileKey, chapterIndex, sentenceIndex) {
+  return `${bookId}:${profileKey}:${Number(chapterIndex)}:${Number(sentenceIndex)}`;
+}
+
+function normalizedOfflineTtsText(value) {
+  const maxChars = Math.max(80, Math.min(Number(readerState.ttsConfig?.chunk_chars) || 260, 800));
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, maxChars);
+}
+
+async function localOfflineAudio(index, text) {
+  const bookId = readerState.currentBookId;
+  const profileKey = readerState.ttsConfig?.offline_profile_key;
+  if (!bookId || !profileKey) return null;
+  const chapterIndex = readerState.currentChapter;
+  try {
+    const database = await openTtsOfflineDb();
+    const id = offlineAudioRecordId(bookId, profileKey, chapterIndex, index);
+    const record = await new Promise((resolve, reject) => {
+      const request = database.transaction(TTS_OFFLINE_STORE, "readonly").objectStore(TTS_OFFLINE_STORE).get(id);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+    if (!record || record.text !== normalizedOfflineTtsText(text) || !(record.blob instanceof Blob) || record.blob.size <= 0) return null;
+    return record.blob;
+  } catch {
+    return null;
+  }
+}
+
+async function saveLocalOfflineAudio(manifest, entry, blob) {
+  const database = await openTtsOfflineDb();
+  const record = {
+    id: offlineAudioRecordId(manifest.book_id, manifest.profile_key, manifest.chapter_index, entry.sentence_index),
+    bookId: manifest.book_id,
+    profileKey: manifest.profile_key,
+    chapterIndex: Number(manifest.chapter_index),
+    chapterHash: manifest.chapter_hash,
+    sentenceIndex: Number(entry.sentence_index),
+    cacheKey: entry.cache_key,
+    text: entry.text,
+    format: entry.format,
+    size: Number(blob.size) || Number(entry.size_bytes) || 0,
+    savedAt: Date.now(),
+    blob,
+  };
+  await new Promise((resolve, reject) => {
+    const transaction = database.transaction(TTS_OFFLINE_STORE, "readwrite");
+    transaction.objectStore(TTS_OFFLINE_STORE).put(record);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error("写入本机缓存失败"));
+    transaction.onabort = () => reject(transaction.error || new Error("本机缓存空间不足"));
+  });
+}
+
+async function localOfflineStats(bookId, profileKey, chapters = []) {
+  const stats = new Map();
+  if (!bookId || !profileKey) return stats;
+  const chapterHashes = new Map(chapters.map((chapter) => [Number(chapter.index), chapter.chapter_hash]));
+  try {
+    const database = await openTtsOfflineDb();
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(TTS_OFFLINE_STORE, "readonly");
+      const index = transaction.objectStore(TTS_OFFLINE_STORE).index("bookProfile");
+      const request = index.openCursor(IDBKeyRange.only([bookId, profileKey]));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          resolve();
+          return;
+        }
+        const record = cursor.value;
+        const chapterIndex = Number(record.chapterIndex);
+        if (chapterHashes.get(chapterIndex) === record.chapterHash && record.blob instanceof Blob && record.blob.size > 0) {
+          const current = stats.get(chapterIndex) || { entries: 0, sizeBytes: 0 };
+          current.entries += 1;
+          current.sizeBytes += Number(record.size) || Number(record.blob?.size) || 0;
+          stats.set(chapterIndex, current);
+        }
+        cursor.continue();
+      };
+      request.onerror = () => reject(request.error);
+    });
+  } catch {
+    return stats;
+  }
+  return stats;
+}
+
+async function deleteLocalOfflineChapters(bookId, profileKey, chapterIndexes) {
+  if (!bookId || !profileKey || !chapterIndexes.length) return { entries: 0, sizeBytes: 0 };
+  const database = await openTtsOfflineDb();
+  const selected = new Set(chapterIndexes.map(Number));
+  let entries = 0;
+  let sizeBytes = 0;
+  await new Promise((resolve, reject) => {
+    const transaction = database.transaction(TTS_OFFLINE_STORE, "readwrite");
+    const store = transaction.objectStore(TTS_OFFLINE_STORE);
+    const index = store.index("bookProfile");
+    const request = index.openCursor(IDBKeyRange.only([bookId, profileKey]));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      if (selected.has(Number(cursor.value.chapterIndex))) {
+        entries += 1;
+        sizeBytes += Number(cursor.value.size) || Number(cursor.value.blob?.size) || 0;
+        cursor.delete();
+      }
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error || new Error("读取本机缓存失败"));
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error("删除本机缓存失败"));
+    transaction.onabort = () => reject(transaction.error || new Error("删除本机缓存失败"));
+  });
+  return { entries, sizeBytes };
+}
+
+async function deleteLocalOfflineBook(bookId) {
+  if (!bookId) return { entries: 0, sizeBytes: 0 };
+  const database = await openTtsOfflineDb();
+  let entries = 0;
+  let sizeBytes = 0;
+  await new Promise((resolve, reject) => {
+    const transaction = database.transaction(TTS_OFFLINE_STORE, "readwrite");
+    const index = transaction.objectStore(TTS_OFFLINE_STORE).index("book");
+    const request = index.openCursor(IDBKeyRange.only(bookId));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      entries += 1;
+      sizeBytes += Number(cursor.value.size) || Number(cursor.value.blob?.size) || 0;
+      cursor.delete();
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error || new Error("读取本机缓存失败"));
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error("删除本机缓存失败"));
+    transaction.onabort = () => reject(transaction.error || new Error("删除本机缓存失败"));
+  });
+  return { entries, sizeBytes };
+}
+
+async function discardLocalOfflineBook(bookId) {
+  try {
+    return await deleteLocalOfflineBook(bookId);
+  } catch {
+    return { entries: 0, sizeBytes: 0 };
+  }
+}
+
+async function browserStorageSummary() {
+  if (!navigator.storage?.estimate) {
+    return window.isSecureContext ? "本机容量不可查询" : "HTTP 下无法查询本机容量";
+  }
+  try {
+    const estimate = await navigator.storage.estimate();
+    const persisted = window.isSecureContext && navigator.storage.persisted
+      ? await navigator.storage.persisted()
+      : false;
+    const persistence = !window.isSecureContext
+      ? " · HTTP 下不能持久化"
+      : persisted ? " · 已持久化" : " · 可能被回收";
+    return "本机存储 " + formatBytes(estimate.usage || 0) + " / " + formatBytes(estimate.quota || 0)
+      + persistence;
+  } catch {
+    return "本机容量不可查询";
+  }
+}
+
+async function requestPersistentBrowserStorage() {
+  if (!window.isSecureContext || !navigator.storage?.persist) return false;
+  try {
+    return await navigator.storage.persist();
+  } catch {
+    return false;
+  }
 }
 
 function uploadWithProgress(path, form, onProgress) {
@@ -576,6 +822,7 @@ function renderManageBooks() {
         ${hasToc ? '<button type="button" data-action="toc-edit">目录</button>' : '<span class="manage-action-spacer"></span>'}
         <button type="button" data-action="edit">编辑</button>
         <button type="button" data-action="reparse">重新解析</button>
+        <button type="button" data-action="offline-cache">离线缓存</button>
         <button type="button" data-action="delete">删除</button>
       </div>
     `;
@@ -583,6 +830,7 @@ function renderManageBooks() {
     row.querySelector('[data-action="toc-edit"]')?.addEventListener("click", () => openTocEditor(book));
     row.querySelector('[data-action="reparse"]').addEventListener("click", () => reparseBook(book));
     row.querySelector('[data-action="clear-toc"]')?.addEventListener("click", () => clearBookToc(book));
+    row.querySelector('[data-action="offline-cache"]').addEventListener("click", () => openOfflineCacheManager(book));
     row.querySelector('[data-action="delete"]').addEventListener("click", () => deleteBook(book));
     list.appendChild(row);
   });
@@ -674,6 +922,7 @@ async function deleteTxtChapterTitle(chapter) {
   if (!window.confirm(`确定删除标题“${chapter.title}”吗？正文会合并到相邻章节。`)) return;
   try {
     await api(`/api/books/${readerState.tocEditBookId}/chapters/${chapter.index}/title`, { method: "DELETE" });
+    await discardLocalOfflineBook(readerState.tocEditBookId);
     await refreshTocEditor();
     if (readerState.currentBookId === readerState.tocEditBookId) await openBook(readerState.currentBookId, Math.max(0, Math.min(readerState.currentChapter, readerState.tocEditChapters.length - 1)), 0);
     showTocEditMessage("标题已删除", "success");
@@ -733,6 +982,7 @@ async function splitTxtChapterAtLine(line) {
       method: "POST",
       body: JSON.stringify({ line_index: line.index, title: line.text }),
     });
+    await discardLocalOfflineBook(readerState.tocEditBookId);
     $("tocLineDialog").close();
     await refreshTocEditor();
     if (readerState.currentBookId === readerState.tocEditBookId) await openBook(readerState.currentBookId, chapter.index, 0);
@@ -797,6 +1047,7 @@ async function deleteBook(book) {
   if (!confirmed) return;
   try {
     await api(`/api/books/${book.id}`, { method: "DELETE" });
+    await discardLocalOfflineBook(book.id);
     if (readerState.currentBookId === book.id) {
       window.clearTimeout(readerState.saveTimer);
       readerState.saveTimer = null;
@@ -821,6 +1072,7 @@ async function reparseBook(book) {
   try {
     setUploadMessage("正在重新解析书籍");
     const data = await api(`/api/books/${book.id}/reparse`, { method: "POST", body: "{}" });
+    await discardLocalOfflineBook(book.id);
     readerState.books = readerState.books.map((item) => (item.id === book.id ? data.book : item));
     if (readerState.currentBookId === book.id) {
       await openBook(book.id, data.book.progress?.chapter || 0, data.book.progress?.sentence || 0);
@@ -839,6 +1091,7 @@ async function clearBookToc(book) {
   try {
     setUploadMessage("正在清除目录信息");
     const data = await api(`/api/books/${book.id}/clear-toc`, { method: "POST", body: "{}" });
+    await discardLocalOfflineBook(book.id);
     readerState.books = readerState.books.map((item) => (item.id === book.id ? data.book : item));
     if (readerState.currentBookId === book.id) {
       await openBook(book.id, 0, 0);
@@ -1118,11 +1371,16 @@ function handleSentenceTap(event, index) {
     focusSentence(normalizedIndex, true);
     return;
   }
+  if (readerState.reading) {
+    window.clearTimeout(readerState.deferredAutoScrollTimer);
+    readerState.lastUserScrollAt = now;
+    return;
+  }
   focusSentence(normalizedIndex, false);
 }
 
 function focusSentence(index, read = false) {
-  highlightSentence(index, true);
+  highlightSentence(index, !read);
   saveProgressSoon();
   if (read) startListeningFrom(index).catch((error) => setListenStatus(error.message));
 }
@@ -1773,6 +2031,11 @@ async function fetchTtsAudio(index, token = readerState.ttsToken, scope = reader
     && Number(readerState.currentSentence) === normalizedIndex
   );
   const pending = (async () => {
+    const offlineBlob = await localOfflineAudio(normalizedIndex, text);
+    if (offlineBlob) {
+      if (isActiveCurrentSentence()) setListenStatus("本机离线缓存命中｜正在准备播放");
+      return { blob: offlineBlob, cacheState: "local" };
+    }
     if (isActiveCurrentSentence()) {
       setListenStatus("正在检查服务器音频缓存");
       try {
@@ -2491,6 +2754,7 @@ function showTtsConfigMessage(text, type = "") {
 
 function formatBytes(bytes) {
   const value = Number(bytes) || 0;
+  if (value >= 1024 * 1024 * 1024) return `${(value / 1024 / 1024 / 1024).toFixed(value >= 10 * 1024 * 1024 * 1024 ? 0 : 1)} GB`;
   if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(value >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
   if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${value} B`;
@@ -2653,13 +2917,408 @@ function refreshMimoBalanceWhenVisible() {
   }
 }
 
+function selectedOfflineChapterIndexes() {
+  return [...document.querySelectorAll("#offlineChapterList input[type=checkbox]:checked")]
+    .map((input) => Number(input.value))
+    .filter(Number.isFinite);
+}
+
+function setOfflineCacheBusy(busy) {
+  readerState.offlineBusy = !!busy;
+  const selected = selectedOfflineChapterIndexes();
+  [
+    "cacheAndDownloadOfflineBtn",
+    "cacheServerOfflineBtn",
+    "deleteLocalOfflineBtn",
+    "unpinServerOfflineBtn",
+  ].forEach((id) => {
+    const button = $(id);
+    if (button) button.disabled = busy || !selected.length;
+  });
+  document.querySelectorAll("#offlineChapterList input[type=checkbox]").forEach((input) => {
+    input.disabled = busy;
+  });
+}
+function updateOfflineProgressDensity() {
+  const text = $("offlineCacheProgressText");
+  text.classList.remove("compact");
+  if (!text.textContent) return;
+  window.requestAnimationFrame(() => {
+    const lineHeight = Number.parseFloat(window.getComputedStyle(text).lineHeight) || 15;
+    if (text.scrollHeight > lineHeight * 2 + 1) text.classList.add("compact");
+  });
+}
+
+function showOfflineCacheProgress(message, type = "", bookId = "") {
+  if (bookId && bookId !== readerState.offlineBookId) return;
+  const node = $("offlineCacheProgress");
+  const text = $("offlineCacheProgressText");
+  text.textContent = message || "";
+  text.title = message || "";
+  node.classList.toggle("visible", !!message);
+  node.classList.toggle("error", type === "error");
+  node.setAttribute("aria-hidden", message ? "false" : "true");
+  updateOfflineProgressDensity();
+}
+
+function setOfflineActiveJob(job = null) {
+  const active = job
+    && job.book_id === readerState.offlineBookId
+    && ["queued", "running"].includes(job.status);
+  readerState.offlineActiveJobId = active ? job.id : "";
+  const downloading = readerState.offlineDownloadController?.bookId === readerState.offlineBookId;
+  const button = $("cancelOfflineJobBtn");
+  button.hidden = !active && !downloading;
+  button.disabled = readerState.offlineCancelRequested || (active ? !!job.cancel_requested : false);
+  updateOfflineProgressDensity();
+}
+
+async function renderOfflineCacheStatus() {
+  const bookId = readerState.offlineBookId;
+  const status = readerState.offlineStatus;
+  const list = $("offlineChapterList");
+  const checked = new Set(selectedOfflineChapterIndexes());
+  list.innerHTML = "";
+  if (!status?.chapters?.length) {
+    list.innerHTML = '<div class="offline-cache-summary">当前书籍没有可缓存章节。</div>';
+    setOfflineCacheBusy(readerState.offlineBusy);
+    return;
+  }
+  status.chapters.forEach((chapter) => {
+    const local = readerState.offlineLocalStats.get(Number(chapter.index)) || { entries: 0, sizeBytes: 0 };
+    const label = document.createElement("label");
+    label.className = "offline-chapter-item";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = chapter.index;
+    input.checked = checked.has(Number(chapter.index));
+    input.addEventListener("change", () => setOfflineCacheBusy(readerState.offlineBusy));
+    const name = document.createElement("span");
+    name.className = "offline-chapter-name";
+    name.textContent = (Number(chapter.index) + 1) + ". " + chapter.title;
+    const state = document.createElement("span");
+    state.className = "offline-chapter-state";
+    const total = Number(chapter.total_sentences || 0);
+    state.textContent = "服务器固定 " + Number(chapter.server_sentences || 0) + "/" + total + " 句 · "
+      + formatBytes(chapter.server_size_bytes || 0) + "｜本机 " + Number(local.entries || 0)
+      + "/" + total + " 句 · " + formatBytes(local.sizeBytes || 0);
+    label.append(input, name, state);
+    list.appendChild(label);
+  });
+  const storage = await browserStorageSummary();
+  if (bookId !== readerState.offlineBookId) return;
+  const profileLabel = status.profile_label || "默认音色";
+  $("offlineCacheSummary").textContent = "《" + (readerState.offlineBook?.title || "当前书籍")
+    + "》 · 音色：" + profileLabel + " · " + storage;
+  setOfflineCacheBusy(readerState.offlineBusy);
+}
+
+async function loadOfflineCacheStatus(bookId = readerState.offlineBookId) {
+  if (!bookId) throw new Error("请先选择一本书，再管理离线缓存");
+  const status = await api("/api/books/" + bookId + "/tts-offline");
+  if (bookId !== readerState.offlineBookId) return null;
+  readerState.offlineStatus = status;
+  readerState.offlineLocalStats = await localOfflineStats(bookId, status.profile_key, status.chapters);
+  if (bookId !== readerState.offlineBookId) return null;
+  await renderOfflineCacheStatus();
+  return status;
+}
+
+async function openOfflineCacheManager(book) {
+  if (!book?.id) return;
+  readerState.offlineBookId = book.id;
+  readerState.offlineBook = book;
+  readerState.offlineStatus = null;
+  $("offlineChapterList").innerHTML = "";
+  $("offlineCacheSummary").textContent = "《" + book.title + "》 · 正在读取缓存状态";
+  readerState.offlineLocalStats = new Map();
+  if ($("manageDialog").open) $("manageDialog").close();
+  openReaderDialog($("offlineCacheDialog"));
+  setOfflineActiveJob(null);
+  showOfflineCacheProgress("正在读取服务器和本机缓存状态");
+  try {
+    const status = await loadOfflineCacheStatus(book.id);
+    if (!status) return;
+    if (status.active_job) {
+      setOfflineActiveJob(status.active_job);
+      showOfflineCacheProgress(
+        status.active_job.message + " · " + (status.active_job.progress || 0) + "%",
+        "",
+        book.id,
+      );
+    } else {
+      setOfflineActiveJob(null);
+      showOfflineCacheProgress("", "", book.id);
+    }
+  } catch (error) {
+    showOfflineCacheProgress(error.message, "error", book.id);
+  }
+}
+
+function closeOfflineCacheManager() {
+  $("offlineCacheDialog").close();
+  window.setTimeout(() => {
+    renderManageBooks();
+    openReaderDialog($("manageDialog"));
+  }, 0);
+}
+
+function selectOfflineChapterRange(mode) {
+  document.querySelectorAll("#offlineChapterList input[type=checkbox]").forEach((input) => {
+    input.checked = mode === "all";
+  });
+  setOfflineCacheBusy(readerState.offlineBusy);
+}
+
+async function cancelOfflineJob() {
+  if (readerState.offlineCancelRequested) return;
+  const jobId = readerState.offlineActiveJobId;
+  const bookId = readerState.offlineBookId;
+  const downloadTask = readerState.offlineDownloadController;
+  const downloadController = downloadTask?.bookId === bookId ? downloadTask.controller : null;
+  if ((!jobId && !downloadController) || !bookId) return;
+
+  const button = $("cancelOfflineJobBtn");
+  button.disabled = true;
+  readerState.offlineCancelRequested = true;
+
+  if (downloadController) {
+    showOfflineCacheProgress("正在取消本机下载", "", bookId);
+    downloadController.abort();
+    return;
+  }
+
+  showOfflineCacheProgress("正在取消，当前正在处理的句子完成后停止", "", bookId);
+  const ownsWait = !readerState.offlineBusy;
+  if (ownsWait) setOfflineCacheBusy(true);
+
+  try {
+    const data = await api("/api/reader/tts-offline/jobs/" + jobId + "/cancel", {
+      method: "POST",
+      body: "{}",
+    });
+    setOfflineActiveJob(data.job);
+
+    if (ownsWait) {
+      const completedJob = await waitForOfflineJob(data.job, bookId);
+      showOfflineCacheProgress(completedJob.message || "任务已取消", "", bookId);
+      await loadOfflineCacheStatus(bookId);
+    }
+  } catch (error) {
+    readerState.offlineCancelRequested = false;
+    button.disabled = false;
+    showOfflineCacheProgress(error.message, "error", bookId);
+  } finally {
+    if (ownsWait) {
+      readerState.offlineCancelRequested = false;
+      setOfflineCacheBusy(false);
+    }
+  }
+}
+
+async function waitForOfflineJob(job, bookId) {
+  let current = job;
+  setOfflineActiveJob(current);
+
+  while (["queued", "running"].includes(current.status)) {
+    const reuse = Number(current.cached_sentences || 0);
+    const generated = Number(current.generated_sentences || 0);
+    showOfflineCacheProgress(
+      current.message + " · " + (current.completed_sentences || 0) + " / "
+        + (current.total_sentences || "…") + " 句 · 复用 " + reuse + " · 生成 " + generated,
+      "",
+      bookId,
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    const data = await api("/api/reader/tts-offline/jobs/" + current.id);
+    current = data.job;
+    setOfflineActiveJob(current);
+  }
+
+  setOfflineActiveJob(null);
+
+  if (current.status === "error") {
+    throw new Error(current.error || current.message || "服务器缓存任务失败");
+  }
+  return current;
+}
+
+async function downloadOfflineChapters(bookId, chapterIndexes) {
+  const controller = new AbortController();
+  readerState.offlineDownloadController = { controller, bookId };
+  setOfflineActiveJob(null);
+  try {
+    const manifests = [];
+    for (const chapterIndex of chapterIndexes) {
+      const manifest = await api(
+        "/api/books/" + bookId + "/tts-offline/chapters/" + chapterIndex,
+        { signal: controller.signal },
+      );
+      manifests.push(manifest);
+    }
+    const total = manifests.reduce((count, manifest) => count + manifest.entries.length, 0);
+    let completed = 0;
+    let downloadedBytes = 0;
+    for (const manifest of manifests) {
+      for (const entry of manifest.entries) {
+        showOfflineCacheProgress(
+          "正在下载到本机 · " + completed + " / " + total + " 句 · " + formatBytes(downloadedBytes),
+          "",
+          bookId,
+        );
+        const response = await fetch(entry.url, {
+          credentials: "same-origin",
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(data.error || "音频下载失败：" + response.status);
+        }
+        const blob = await response.blob();
+        await saveLocalOfflineAudio(manifest, entry, blob);
+        completed += 1;
+        downloadedBytes += blob.size;
+      }
+    }
+    return { completed, total, downloadedBytes };
+  } finally {
+    if (readerState.offlineDownloadController?.controller === controller) {
+      readerState.offlineDownloadController = null;
+      setOfflineActiveJob(null);
+    }
+  }
+}
+
+
+function sameOfflineChapterSelection(left, right) {
+  const selected = new Set((left || []).map(Number).filter(Number.isFinite));
+  const active = new Set((right || []).map(Number).filter(Number.isFinite));
+  return selected.size === active.size && [...selected].every((index) => active.has(index));
+}
+
+async function createOfflineCache(downloadToDevice) {
+  const bookId = readerState.offlineBookId;
+  const chapterIndexes = selectedOfflineChapterIndexes();
+  if (!bookId || !chapterIndexes.length || readerState.offlineBusy) return;
+  readerState.offlineCancelRequested = false;
+  setOfflineCacheBusy(true);
+  try {
+    let data;
+    if (downloadToDevice) await requestPersistentBrowserStorage();
+    try {
+      data = await api("/api/books/" + bookId + "/tts-offline", {
+        method: "POST",
+        body: JSON.stringify({
+          chapters: chapterIndexes,
+        }),
+      });
+    } catch (error) {
+      if (
+        error.status !== 429
+        || !error.data?.job
+        || error.data.job.book_id !== bookId
+        || !sameOfflineChapterSelection(chapterIndexes, error.data.job.chapter_indexes)
+      ) throw error;
+      data = { job: error.data.job };
+    }
+    const completedJob = await waitForOfflineJob(data.job, bookId);
+    if (completedJob.status === "cancelled" || readerState.offlineCancelRequested) {
+      const message = completedJob.status === "cancelled"
+        ? completedJob.message || "任务已取消"
+        : downloadToDevice ? "已停止后续本机下载" : completedJob.message;
+      showOfflineCacheProgress(message, "", bookId);
+      await loadOfflineCacheStatus(bookId);
+      return;
+    }
+    const failed = Math.max(0, Number(completedJob.failed_sentences || 0));
+    const failedText = failed ? " · " + failed + " 句生成失败，可稍后重试" : "";
+    if (!downloadToDevice) {
+      showOfflineCacheProgress(
+        "服务器固定完成 · 复用 " + Number(completedJob.cached_sentences || 0)
+          + " 句 · 生成 " + Number(completedJob.generated_sentences || 0) + " 句" + failedText,
+        failed ? "error" : "",
+        bookId,
+      );
+      await loadOfflineCacheStatus(bookId);
+      return;
+    }
+    const downloaded = await downloadOfflineChapters(bookId, chapterIndexes);
+    showOfflineCacheProgress(
+      "本地下载完成 · " + downloaded.completed + " 句 · "
+        + formatBytes(downloaded.downloadedBytes) + failedText,
+      failed ? "error" : "",
+      bookId,
+    );
+    await loadOfflineCacheStatus(bookId);
+  } catch (error) {
+    if (error.name === "AbortError") {
+      showOfflineCacheProgress("本机下载已取消，已下载部分已保留", "", bookId);
+      await loadOfflineCacheStatus(bookId);
+    } else {
+      showOfflineCacheProgress(error.message, "error", bookId);
+    }
+  } finally {
+    readerState.offlineCancelRequested = false;
+    setOfflineCacheBusy(false);
+  }
+}
+
+
+async function deleteSelectedLocalOffline() {
+  const bookId = readerState.offlineBookId;
+  const chapterIndexes = selectedOfflineChapterIndexes();
+  const profileKey = readerState.offlineStatus?.profile_key;
+  if (!bookId || !profileKey || !chapterIndexes.length || readerState.offlineBusy) return;
+  if (!window.confirm(`确定删除当前浏览器中选定的 ${chapterIndexes.length} 章音频吗？`)) return;
+  setOfflineCacheBusy(true);
+  try {
+    const removed = await deleteLocalOfflineChapters(bookId, profileKey, chapterIndexes);
+    showOfflineCacheProgress(
+      `已删除本机缓存 ${removed.entries} 句 · ${formatBytes(removed.sizeBytes)}`,
+      "",
+      bookId,
+    );
+    await loadOfflineCacheStatus(bookId);
+  } catch (error) {
+    showOfflineCacheProgress(error.message, "error", bookId);
+  } finally {
+    setOfflineCacheBusy(false);
+  }
+}
+
+async function unpinSelectedServerOffline() {
+  const bookId = readerState.offlineBookId;
+  const chapterIndexes = selectedOfflineChapterIndexes();
+  if (!bookId || !chapterIndexes.length || readerState.offlineBusy) return;
+  if (!window.confirm(`确定取消选定的 ${chapterIndexes.length} 章服务器固定吗？各设备的本机缓存不会删除。`)) return;
+  setOfflineCacheBusy(true);
+  try {
+    const removed = await api(`/api/books/${bookId}/tts-offline`, {
+      method: "DELETE",
+      body: JSON.stringify({ chapters: chapterIndexes }),
+    });
+    showOfflineCacheProgress(
+      `已取消服务器固定 ${removed.entries} 条 · ${formatBytes(removed.size_bytes)}`,
+      "",
+      bookId,
+    );
+    await loadOfflineCacheStatus(bookId);
+  } catch (error) {
+    showOfflineCacheProgress(error.message, "error", bookId);
+  } finally {
+    setOfflineCacheBusy(false);
+  }
+}
+
 function renderTtsCacheStats(stats = {}) {
   const node = $("ttsCacheStats");
   if (!node) return;
   const entries = Number(stats.entries || 0);
   const expired = Number(stats.expired_entries || 0);
+  const pinned = Number(stats.pinned_entries || 0);
+  const pinnedText = pinned > 0 ? ` · 固定 ${pinned} 条 / ${formatBytes(stats.pinned_size_bytes || 0)}` : "";
   const expiredText = expired > 0 ? `，待清理 ${expired} 条` : "";
-  node.textContent = `${entries} 条 · ${formatBytes(stats.size_bytes)} / ${formatBytes(stats.limit_bytes)} · 有效期 ${stats.ttl_days || 7} 天 · 最近 ${formatCacheTime(stats.newest_accessed_at)}${expiredText}`;
+  node.textContent = `${entries} 条 · ${formatBytes(stats.size_bytes)} / ${formatBytes(stats.limit_bytes)} · 有效期 ${stats.ttl_days || 7} 天${pinnedText} · 最近 ${formatCacheTime(stats.newest_accessed_at)}${expiredText}`;
 }
 
 async function loadTtsConfig() {
@@ -2968,9 +3627,21 @@ $("closeTocEditBtn").addEventListener("click", () => $("tocEditDialog").close())
 $("closeTocLineBtn").addEventListener("click", () => $("tocLineDialog").close());
 $("tocLineSearch").addEventListener("input", renderTocLineRows);
 $("closeSettingsBtn").addEventListener("click", () => $("settingsDialog").close());
+
+$("closeOfflineCacheBtn")?.addEventListener("click", closeOfflineCacheManager);
+$("selectAllOfflineBtn")?.addEventListener("click", () => selectOfflineChapterRange("all"));
+$("clearOfflineSelectionBtn")?.addEventListener("click", () => selectOfflineChapterRange("clear"));
+$("cancelOfflineJobBtn")?.addEventListener("click", cancelOfflineJob);
+$("cacheAndDownloadOfflineBtn")?.addEventListener("click", () => createOfflineCache(true));
+$("cacheServerOfflineBtn")?.addEventListener("click", () => createOfflineCache(false));
+$("deleteLocalOfflineBtn")?.addEventListener("click", () => deleteSelectedLocalOffline());
+$("unpinServerOfflineBtn")?.addEventListener("click", () => unpinSelectedServerOffline());
 $("closeTtsBtn").addEventListener("click", () => $("ttsDialog").close());
 $("closeSleepTimerBtn")?.addEventListener("click", () => $("sleepTimerDialog").close());
-window.addEventListener("resize", resizeQuickVoiceSelect);
+window.addEventListener("resize", () => {
+  resizeQuickVoiceSelect();
+  updateOfflineProgressDensity();
+});
 window.addEventListener("wheel", markUserScrollIntent, { passive: true });
 window.addEventListener("touchmove", markUserScrollIntent, { passive: true });
 window.addEventListener("keydown", (event) => {

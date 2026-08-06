@@ -213,6 +213,34 @@
       </section>
     </dialog>
 
+    <dialog id="offlineCacheDialog" class="reader-dialog offline-cache-dialog">
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2>离线听书缓存</h2>
+          <div class="dialog-actions">
+            <button id="closeOfflineCacheBtn" type="button">返回管理</button>
+          </div>
+        </div>
+        <p id="offlineCacheSummary" class="offline-cache-summary">请选择一本书后管理离线音频。</p>
+        <div class="offline-cache-presets">
+          <button id="selectAllOfflineBtn" type="button">全选</button>
+          <button id="clearOfflineSelectionBtn" type="button">清除选择</button>
+        </div>
+        <div id="offlineCacheProgress" class="offline-cache-progress" role="status" aria-live="polite" aria-hidden="true">
+          <span id="offlineCacheProgressText" class="offline-cache-progress-text"></span>
+          <button id="cancelOfflineJobBtn" class="offline-cache-cancel" type="button" hidden>取消</button>
+        </div>
+        <div id="offlineChapterList" class="offline-chapter-list"></div>
+        <div class="offline-cache-actions">
+          <button id="cacheServerOfflineBtn" type="button">服务器固定</button>
+          <button id="cacheAndDownloadOfflineBtn" type="button">固定并下载到本地</button>
+          <button id="deleteLocalOfflineBtn" type="button">删除本地缓存</button>
+          <button id="unpinServerOfflineBtn" class="danger" type="button">取消服务器固定</button>
+        </div>
+        <p class="offline-cache-help">优先播放本机缓存；服务器缓存固定后不会自动清理。</p>
+      </section>
+    </dialog>
+
     <dialog id="mimoCookieDialog" class="reader-dialog mimo-cookie-dialog">
       <section class="dialog-panel">
         <div class="dialog-head">

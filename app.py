@@ -18,6 +18,7 @@ import time
 import uuid
 import zipfile
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from html.parser import HTMLParser
 from logging.handlers import RotatingFileHandler
@@ -44,6 +45,7 @@ READER_DIR = BASE_DIR / "reader_data"
 READER_BOOK_DIR = READER_DIR / "books"
 READER_INDEX_FILE = READER_DIR / "books.json"
 TTS_CACHE_DIR = READER_DIR / "tts_cache"
+TTS_OFFLINE_DB = READER_DIR / "tts_offline.sqlite3"
 
 
 def load_app_version():
@@ -145,6 +147,12 @@ LOGIN_FAILURES = {}
 LOGIN_FAILURE_LOCK = threading.Lock()
 LOGIN_FAILURE_MAX_IPS = 10_000
 TTS_CACHE_LOCK = threading.RLock()
+TTS_CACHE_KEY_LOCKS = tuple(threading.Lock() for _ in range(64))
+TTS_OFFLINE_LOCK = threading.RLock()
+TTS_OFFLINE_JOB_LOCK = threading.RLock()
+TTS_OFFLINE_JOBS = OrderedDict()
+TTS_OFFLINE_JOB_RETENTION_SECONDS = 3600
+TTS_OFFLINE_CHAPTER_WORKERS = 2
 UNSAFE_APP_PASSWORDS = {"", "changeme", "password", "admin", "123456", "replace-with-a-strong-password"}
 UNSAFE_SECRET_KEYS = {"", "replace-with-a-long-random-string", "changeme", "secret"}
 SECRET_KEY_FILE = CONFIG_DIR / "secret_key"
@@ -2016,6 +2024,7 @@ def refresh_epub_chapter_metadata(book):
     book["updated_at"] = int(time.time())
     write_book_record(book)
     upsert_book_index(book)
+    delete_tts_offline_refs(book["id"])
     return book
 
 
@@ -2469,6 +2478,7 @@ def public_reader_tts_config(config):
     settings["allow_custom_base_url"] = False
     settings["model_options"] = TTS_MODEL_OPTIONS
     settings["voice_options"] = TTS_VOICE_OPTIONS
+    settings["offline_profile_key"] = tts_offline_profile_key(settings)
     settings["cache_stats"] = tts_cache_stats()
     settings["balance_status"] = mimo_balance_snapshot()
     return settings
@@ -2740,6 +2750,9 @@ def tts_cache_stats():
     oldest_accessed_at = None
     newest_accessed_at = None
     expired_entries = 0
+    pinned_keys = pinned_tts_cache_keys()
+    pinned_entries = 0
+    pinned_size = 0
     if TTS_CACHE_DIR.exists():
         for path in TTS_CACHE_DIR.glob("*"):
             if not path.is_file():
@@ -2748,11 +2761,14 @@ def tts_cache_stats():
                 stat = path.stat()
             except OSError:
                 continue
+            if path.stem in pinned_keys:
+                pinned_entries += 1
+                pinned_size += stat.st_size
             entries += 1
             total_size += stat.st_size
             oldest_accessed_at = stat.st_mtime if oldest_accessed_at is None else min(oldest_accessed_at, stat.st_mtime)
             newest_accessed_at = stat.st_mtime if newest_accessed_at is None else max(newest_accessed_at, stat.st_mtime)
-            if now - stat.st_mtime > ttl:
+            if now - stat.st_mtime > ttl and path.stem not in pinned_keys:
                 expired_entries += 1
     return {
         "entries": entries,
@@ -2762,6 +2778,8 @@ def tts_cache_stats():
         "oldest_accessed_at": int(oldest_accessed_at or 0),
         "newest_accessed_at": int(newest_accessed_at or 0),
         "expired_entries": expired_entries,
+        "pinned_entries": pinned_entries,
+        "pinned_size_bytes": pinned_size,
     }
 
 
@@ -2792,6 +2810,482 @@ def tts_cache_path(cache_key, audio_format):
     return TTS_CACHE_DIR / f"{cache_key}.{suffix}"
 
 
+
+def tts_cache_key_lock(cache_key):
+    return TTS_CACHE_KEY_LOCKS[int(cache_key[:8], 16) % len(TTS_CACHE_KEY_LOCKS)]
+
+def open_tts_offline_db():
+    ensure_private_directory(READER_DIR)
+    connection = sqlite3.connect(TTS_OFFLINE_DB, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=30000")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    os.chmod(TTS_OFFLINE_DB, 0o600)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS offline_tts_refs (
+            book_id TEXT NOT NULL,
+            chapter_index INTEGER NOT NULL,
+            chapter_hash TEXT NOT NULL,
+            sentence_index INTEGER NOT NULL,
+            sentence_text TEXT NOT NULL,
+            profile_key TEXT NOT NULL,
+            cache_key TEXT NOT NULL,
+            audio_format TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (book_id, chapter_index, sentence_index, profile_key)
+        )
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS offline_tts_cache_key ON offline_tts_refs(cache_key)")
+    connection.execute("CREATE INDEX IF NOT EXISTS offline_tts_book_profile ON offline_tts_refs(book_id, profile_key)")
+    connection.commit()
+    return connection
+
+
+def tts_offline_profile_key(settings):
+    payload = tts_cache_payload("", settings)
+    payload.pop("text", None)
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def tts_offline_chapter_data(book, chapter_index, settings):
+    payload = chapter_payload(book, chapter_index)
+    chapter = payload["chapter"]
+    max_chars = int(settings.get("chunk_chars", 260))
+    sentences = []
+    for paragraph in chapter.get("paragraphs", []):
+        if paragraph.get("type") == "image":
+            continue
+        for sentence in paragraph.get("sentences", []):
+            text = clean_tts_text(sentence.get("text", ""), max_chars)
+            if not text or not re.search(r"[A-Za-z0-9\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", text):
+                continue
+            sentences.append({
+                "index": int(sentence.get("index", len(sentences))),
+                "text": text,
+                "cache_key": tts_cache_key(text, settings),
+            })
+    chapter_raw = json.dumps(
+        [item["text"] for item in sentences],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return {
+        "index": int(chapter.get("index", chapter_index)),
+        "title": chapter.get("title", f"第 {chapter_index + 1} 章"),
+        "hash": hashlib.sha256(chapter_raw.encode("utf-8")).hexdigest(),
+        "sentences": sentences,
+    }
+
+
+def pinned_tts_cache_keys():
+    pending_cutoff = time.time() - TTS_OFFLINE_JOB_RETENTION_SECONDS
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            return {
+                row["cache_key"]
+                for row in connection.execute(
+                    "SELECT DISTINCT cache_key FROM offline_tts_refs WHERE size_bytes > 0 OR created_at >= ?",
+                    (pending_cutoff,),
+                )
+            }
+        finally:
+            connection.close()
+
+
+def is_tts_cache_pinned(cache_key):
+    pending_cutoff = time.time() - TTS_OFFLINE_JOB_RETENTION_SECONDS
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM offline_tts_refs WHERE cache_key = ? AND (size_bytes > 0 OR created_at >= ?) LIMIT 1",
+                (cache_key, pending_cutoff),
+            ).fetchone()
+            return row is not None
+        finally:
+            connection.close()
+
+
+def save_tts_offline_ref(book_id, chapter, sentence, profile_key, audio_format, size_bytes=0):
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO offline_tts_refs (
+                        book_id, chapter_index, chapter_hash, sentence_index, sentence_text,
+                        profile_key, cache_key, audio_format, size_bytes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(book_id, chapter_index, sentence_index, profile_key) DO UPDATE SET
+                        chapter_hash = excluded.chapter_hash,
+                        sentence_text = excluded.sentence_text,
+                        cache_key = excluded.cache_key,
+                        audio_format = excluded.audio_format,
+                        size_bytes = CASE WHEN offline_tts_refs.cache_key = excluded.cache_key AND excluded.size_bytes = 0 THEN offline_tts_refs.size_bytes ELSE excluded.size_bytes END,
+                        created_at = excluded.created_at
+                    """,
+                    (
+                        book_id,
+                        chapter["index"],
+                        chapter["hash"],
+                        sentence["index"],
+                        sentence["text"],
+                        profile_key,
+                        sentence["cache_key"],
+                        audio_format,
+                        max(0, int(size_bytes)),
+                        time.time(),
+                    ),
+                )
+        finally:
+            connection.close()
+
+
+def remove_tts_offline_ref(book_id, chapter_index, sentence_index, profile_key):
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            with connection:
+                connection.execute(
+                    "DELETE FROM offline_tts_refs WHERE book_id = ? AND chapter_index = ? AND sentence_index = ? AND profile_key = ?",
+                    (book_id, chapter_index, sentence_index, profile_key),
+                )
+        finally:
+            connection.close()
+
+
+def tts_offline_book_status(book, settings):
+    profile_key = tts_offline_profile_key(settings)
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            rows = connection.execute(
+                """
+                SELECT chapter_index, chapter_hash, sentence_index, sentence_text, cache_key, audio_format
+                FROM offline_tts_refs
+                WHERE book_id = ? AND profile_key = ? AND size_bytes > 0
+                """,
+                (book["id"], profile_key),
+            ).fetchall()
+        finally:
+            connection.close()
+    rows_by_chapter = {}
+    for row in rows:
+        rows_by_chapter.setdefault(int(row["chapter_index"]), []).append(row)
+    chapters = []
+    for index, chapter_record in enumerate(book.get("chapters", [])):
+        chapter_index = int(chapter_record.get("index", index))
+        chapter = tts_offline_chapter_data(book, chapter_index, settings)
+        sentences = {int(item["index"]): item for item in chapter["sentences"]}
+        sentence_count = 0
+        size_bytes = 0
+        cache_keys = set()
+        for row in rows_by_chapter.get(chapter_index, []):
+            sentence = sentences.get(int(row["sentence_index"]))
+            if (
+                row["chapter_hash"] != chapter["hash"]
+                or not sentence
+                or row["sentence_text"] != sentence["text"]
+                or row["cache_key"] != sentence["cache_key"]
+            ):
+                continue
+            path = tts_cache_path(row["cache_key"], row["audio_format"])
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if not path.is_file() or stat.st_size <= 0:
+                continue
+            sentence_count += 1
+            if row["cache_key"] not in cache_keys:
+                cache_keys.add(row["cache_key"])
+                size_bytes += stat.st_size
+        chapters.append({
+            "index": chapter_index,
+            "title": display_chapter_title(chapter_record, index),
+            "chapter_hash": chapter["hash"],
+            "server_sentences": sentence_count,
+            "total_sentences": len(chapter["sentences"]),
+            "server_size_bytes": size_bytes,
+        })
+    voice_id = settings.get("voice_id") or "mimo_default"
+    voice = next((item for item in TTS_VOICE_OPTIONS if item.get("id") == voice_id), None)
+    return {
+        "profile_key": profile_key,
+        "profile_label": (voice or {}).get("name") or voice_id,
+        "chapters": chapters,
+    }
+
+
+def tts_offline_chapter_manifest(book, chapter_index, config):
+    settings = config["reader_tts"]
+    profile_key = tts_offline_profile_key(settings)
+    chapter = tts_offline_chapter_data(book, chapter_index, settings)
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            rows = connection.execute(
+                """
+                SELECT sentence_index, sentence_text, cache_key, audio_format, size_bytes
+                FROM offline_tts_refs
+                WHERE book_id = ? AND chapter_index = ? AND chapter_hash = ? AND profile_key = ? AND size_bytes > 0
+                """,
+                (book["id"], chapter["index"], chapter["hash"], profile_key),
+            ).fetchall()
+        finally:
+            connection.close()
+    cached = {int(row["sentence_index"]): row for row in rows}
+    entries = []
+    for sentence in chapter["sentences"]:
+        row = cached.get(sentence["index"])
+        if not row or row["sentence_text"] != sentence["text"] or row["cache_key"] != sentence["cache_key"]:
+            continue
+        path = tts_cache_path(row["cache_key"], row["audio_format"])
+        if not path.is_file() or path.stat().st_size <= 0:
+            continue
+        entries.append({
+            "sentence_index": sentence["index"],
+            "text": sentence["text"],
+            "cache_key": row["cache_key"],
+            "format": row["audio_format"],
+            "size_bytes": path.stat().st_size,
+            "url": f"/api/books/{book['id']}/tts-offline/audio/{row['cache_key']}",
+        })
+    return {
+        "book_id": book["id"],
+        "chapter_index": chapter["index"],
+        "chapter_title": chapter["title"],
+        "chapter_hash": chapter["hash"],
+        "profile_key": profile_key,
+        "sentence_count": len(chapter["sentences"]),
+        "entries": entries,
+    }
+
+
+def cleanup_tts_offline_jobs_locked():
+    cutoff = time.time() - TTS_OFFLINE_JOB_RETENTION_SECONDS
+    stale = [
+        job_id for job_id, job in TTS_OFFLINE_JOBS.items()
+        if job.get("status") in {"done", "error", "cancelled"} and job.get("updated_at", 0) < cutoff
+    ]
+    for job_id in stale:
+        TTS_OFFLINE_JOBS.pop(job_id, None)
+
+
+def active_tts_offline_job_for_book(book_id):
+    with TTS_OFFLINE_JOB_LOCK:
+        cleanup_tts_offline_jobs_locked()
+        job = next((
+            item for item in TTS_OFFLINE_JOBS.values()
+            if item.get("book_id") == book_id and item.get("status") in {"queued", "running"}
+        ), None)
+        return public_tts_offline_job(job) if job else None
+
+def public_tts_offline_job(job):
+    return {
+        key: job.get(key)
+        for key in (
+            "id", "book_id", "chapter_indexes", "status", "message", "progress", "total_sentences",
+            "completed_sentences", "failed_sentences", "cached_sentences", "generated_sentences",
+            "size_bytes", "error", "cancel_requested", "created_at", "updated_at",
+        )
+    }
+
+
+def update_tts_offline_job(job_id, **updates):
+    with TTS_OFFLINE_JOB_LOCK:
+        job = TTS_OFFLINE_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = time.time()
+        total = max(1, int(job.get("total_sentences") or 0))
+        completed = int(job.get("completed_sentences") or 0) + int(job.get("failed_sentences") or 0)
+        if job.get("status") == "done":
+            job["progress"] = 100
+        elif total:
+            job["progress"] = min(99, round(completed / total * 100))
+
+
+def tts_offline_job_cancel_requested(job_id):
+    with TTS_OFFLINE_JOB_LOCK:
+        job = TTS_OFFLINE_JOBS.get(job_id)
+        return bool(job and job.get("cancel_requested"))
+
+
+def process_tts_offline_job(job_id, book_id, chapter_indexes):
+    try:
+        config = load_config()
+        config = json.loads(json.dumps(config))
+        config["reader_tts"]["cache_enabled"] = True
+        settings = config["reader_tts"]
+        book = read_book_record(book_id)
+        chapters = [tts_offline_chapter_data(book, index, settings) for index in chapter_indexes]
+        total = sum(len(chapter["sentences"]) for chapter in chapters)
+        if tts_offline_job_cancel_requested(job_id):
+            update_tts_offline_job(job_id, status="cancelled", message="任务已取消", total_sentences=total)
+            return
+        worker_count = min(TTS_OFFLINE_CHAPTER_WORKERS, len(chapters))
+        message = "正在生成并固定服务器缓存"
+        if worker_count > 1:
+            message += f"（{worker_count} 章并行）"
+        update_tts_offline_job(
+            job_id,
+            status="running",
+            message=message,
+            total_sentences=total,
+        )
+        profile_key = tts_offline_profile_key(settings)
+        audio_format = settings.get("format", "wav")
+        stats = {
+            "completed_sentences": 0,
+            "failed_sentences": 0,
+            "cached_sentences": 0,
+            "generated_sentences": 0,
+            "size_bytes": 0,
+            "error": "",
+        }
+        stats_lock = threading.Lock()
+
+        def process_chapter(chapter):
+            for sentence in chapter["sentences"]:
+                if tts_offline_job_cancel_requested(job_id):
+                    return
+                save_tts_offline_ref(book_id, chapter, sentence, profile_key, audio_format)
+                succeeded = False
+                cached_result = False
+                size = 0
+                error = ""
+                try:
+                    result = synthesize_reader_tts(sentence["text"], config)
+                    path = result.get("path") or tts_cache_path(sentence["cache_key"], audio_format)
+                    if not path.is_file() and result.get("data"):
+                        with TTS_CACHE_LOCK:
+                            ensure_private_directory(TTS_CACHE_DIR)
+                            write_private_bytes_atomic(path, result["data"])
+                    size = path.stat().st_size
+                    save_tts_offline_ref(book_id, chapter, sentence, profile_key, audio_format, size)
+                    succeeded = True
+                    cached_result = bool(result.get("cached"))
+                except Exception as exc:
+                    error = str(exc)
+                    remove_tts_offline_ref(book_id, chapter["index"], sentence["index"], profile_key)
+
+                with stats_lock:
+                    if succeeded:
+                        stats["completed_sentences"] += 1
+                        stats["size_bytes"] += size
+                        if cached_result:
+                            stats["cached_sentences"] += 1
+                        else:
+                            stats["generated_sentences"] += 1
+                    else:
+                        stats["failed_sentences"] += 1
+                        stats["error"] = error
+                    update_tts_offline_job(job_id, **stats)
+
+        if worker_count == 1:
+            process_chapter(chapters[0])
+        else:
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="tts-offline-chapter",
+            ) as executor:
+                list(executor.map(process_chapter, chapters))
+
+        with stats_lock:
+            final_stats = dict(stats)
+        cached = final_stats["cached_sentences"]
+        generated = final_stats["generated_sentences"]
+        failed = final_stats["failed_sentences"]
+        total_size = final_stats["size_bytes"]
+        if tts_offline_job_cancel_requested(job_id):
+            message = f"已取消：复用 {cached} 句，生成 {generated} 句"
+            if failed:
+                message += f"，失败 {failed} 句"
+            update_tts_offline_job(job_id, status="cancelled", message=message)
+            app.logger.info(
+                "tts offline job cancelled book=%s chapters=%s cached=%s generated=%s failed=%s bytes=%s",
+                book_id,
+                len(chapter_indexes),
+                cached,
+                generated,
+                failed,
+                total_size,
+            )
+            return
+        message = f"完成：复用 {cached} 句，生成 {generated} 句"
+        if failed:
+            message += f"，失败 {failed} 句"
+        update_tts_offline_job(job_id, status="done", message=message)
+        app.logger.info(
+            "tts offline job done book=%s chapters=%s cached=%s generated=%s failed=%s bytes=%s",
+            book_id,
+            len(chapter_indexes),
+            cached,
+            generated,
+            failed,
+            total_size,
+        )
+    except Exception as exc:
+        app.logger.warning("tts offline job failed book=%s error=%s", book_id, exc)
+        update_tts_offline_job(job_id, status="error", message="服务器固定缓存失败", error=str(exc))
+
+
+def delete_tts_offline_refs(book_id, chapter_indexes=None, profile_key=None, delete_files=False):
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            params = [book_id]
+            where = "book_id = ?"
+            if chapter_indexes is not None:
+                placeholders = ",".join("?" for _ in chapter_indexes)
+                if not placeholders:
+                    return {"entries": 0, "size_bytes": 0}
+                where += f" AND chapter_index IN ({placeholders})"
+                params.extend(chapter_indexes)
+            if profile_key:
+                where += " AND profile_key = ?"
+                params.append(profile_key)
+            rows = connection.execute(
+                f"SELECT DISTINCT cache_key, audio_format, size_bytes FROM offline_tts_refs WHERE {where}",
+                params,
+            ).fetchall()
+            with connection:
+                connection.execute(f"DELETE FROM offline_tts_refs WHERE {where}", params)
+            remaining = {
+                row["cache_key"]
+                for row in connection.execute(
+                    "SELECT DISTINCT cache_key FROM offline_tts_refs WHERE cache_key IN ({})".format(
+                        ",".join("?" for _ in rows)
+                    ),
+                    [row["cache_key"] for row in rows],
+                )
+            } if rows else set()
+        finally:
+            connection.close()
+    affected_size = sum(max(0, int(row["size_bytes"] or 0)) for row in rows)
+    removed_size = 0
+    if not delete_files:
+        return {"entries": len(rows), "size_bytes": affected_size, "removed_size_bytes": 0}
+    for row in rows:
+        if row["cache_key"] in remaining:
+            continue
+        path = tts_cache_path(row["cache_key"], row["audio_format"])
+        try:
+            removed_size += path.stat().st_size
+            path.unlink()
+        except OSError:
+            pass
+    return {"entries": len(rows), "size_bytes": affected_size, "removed_size_bytes": removed_size}
+
 def find_cached_tts(cache_path):
     if not cache_path.exists():
         return None
@@ -2800,7 +3294,7 @@ def find_cached_tts(cache_path):
         if not cache_path.is_file() or stat.st_size <= 0:
             cache_path.unlink(missing_ok=True)
             return None
-        if time.time() - stat.st_mtime > tts_cache_ttl_seconds():
+        if time.time() - stat.st_mtime > tts_cache_ttl_seconds() and not is_tts_cache_pinned(cache_path.stem):
             cache_path.unlink()
             return None
         os.chmod(cache_path, 0o600)
@@ -2816,12 +3310,15 @@ def prune_tts_cache():
     total = 0
     now = time.time()
     ttl = tts_cache_ttl_seconds()
+    pinned_keys = pinned_tts_cache_keys()
     for path in TTS_CACHE_DIR.glob("*"):
         if not path.is_file():
             continue
         try:
             stat = path.stat()
         except OSError:
+            continue
+        if path.stem in pinned_keys:
             continue
         if now - stat.st_mtime > ttl:
             try:
@@ -2959,59 +3456,60 @@ def reader_tts_cache_status(text, config):
 def synthesize_reader_tts(text, config):
     total_started = time.perf_counter()
     settings, text, audio_format, cache_key, cache_path = prepare_reader_tts_request(text, config)
-    cache_started = time.perf_counter()
-    if settings.get("cache_enabled", True):
-        with TTS_CACHE_LOCK:
-            cached_path = find_cached_tts(cache_path)
-            if cached_path is not None:
-                cache_ms = (time.perf_counter() - cache_started) * 1000
-                return {
-                    "path": cached_path,
-                    "format": audio_format,
-                    "cached": True,
-                    "cache_key": cache_key,
-                    "cache_ms": round(cache_ms, 2),
-                    "generate_ms": 0.0,
-                    "write_ms": 0.0,
-                    "total_ms": round((time.perf_counter() - total_started) * 1000, 2),
-                }
-    cache_ms = (time.perf_counter() - cache_started) * 1000
-    generate_started = time.perf_counter()
-    data = request_mimo_tts(text, settings)
-    generate_ms = (time.perf_counter() - generate_started) * 1000
-    write_ms = 0.0
-    if settings.get("cache_enabled", True) and data:
-        with TTS_CACHE_LOCK:
-            ensure_private_directory(TTS_CACHE_DIR)
-            write_started = time.perf_counter()
-            try:
-                write_private_bytes_atomic(cache_path, data)
-                os.utime(cache_path, None)
-                prune_tts_cache()
-                write_ms = (time.perf_counter() - write_started) * 1000
-                if cache_path.exists():
+    with tts_cache_key_lock(cache_key):
+        cache_started = time.perf_counter()
+        if settings.get("cache_enabled", True):
+            with TTS_CACHE_LOCK:
+                cached_path = find_cached_tts(cache_path)
+                if cached_path is not None:
+                    cache_ms = (time.perf_counter() - cache_started) * 1000
                     return {
-                        "path": cache_path,
+                        "path": cached_path,
                         "format": audio_format,
-                        "cached": False,
+                        "cached": True,
                         "cache_key": cache_key,
                         "cache_ms": round(cache_ms, 2),
-                        "generate_ms": round(generate_ms, 2),
-                        "write_ms": round(write_ms, 2),
+                        "generate_ms": 0.0,
+                        "write_ms": 0.0,
                         "total_ms": round((time.perf_counter() - total_started) * 1000, 2),
                     }
-            except OSError:
-                write_ms = (time.perf_counter() - write_started) * 1000
-    return {
-        "data": data,
-        "format": audio_format,
-        "cached": False,
-        "cache_key": cache_key,
-        "cache_ms": round(cache_ms, 2),
-        "generate_ms": round(generate_ms, 2),
-        "write_ms": round(write_ms, 2),
-        "total_ms": round((time.perf_counter() - total_started) * 1000, 2),
-    }
+        cache_ms = (time.perf_counter() - cache_started) * 1000
+        generate_started = time.perf_counter()
+        data = request_mimo_tts(text, settings)
+        generate_ms = (time.perf_counter() - generate_started) * 1000
+        write_ms = 0.0
+        if settings.get("cache_enabled", True) and data:
+            with TTS_CACHE_LOCK:
+                ensure_private_directory(TTS_CACHE_DIR)
+                write_started = time.perf_counter()
+                try:
+                    write_private_bytes_atomic(cache_path, data)
+                    os.utime(cache_path, None)
+                    prune_tts_cache()
+                    write_ms = (time.perf_counter() - write_started) * 1000
+                    if cache_path.exists():
+                        return {
+                            "path": cache_path,
+                            "format": audio_format,
+                            "cached": False,
+                            "cache_key": cache_key,
+                            "cache_ms": round(cache_ms, 2),
+                            "generate_ms": round(generate_ms, 2),
+                            "write_ms": round(write_ms, 2),
+                            "total_ms": round((time.perf_counter() - total_started) * 1000, 2),
+                        }
+                except OSError:
+                    write_ms = (time.perf_counter() - write_started) * 1000
+        return {
+            "data": data,
+            "format": audio_format,
+            "cached": False,
+            "cache_key": cache_key,
+            "cache_ms": round(cache_ms, 2),
+            "generate_ms": round(generate_ms, 2),
+            "write_ms": round(write_ms, 2),
+            "total_ms": round((time.perf_counter() - total_started) * 1000, 2),
+        }
 
 
 def read_meminfo():
@@ -3774,6 +4272,195 @@ def api_reader_tts_cache_status():
         return jsonify({"error": str(exc)}), 400
 
 
+@app.route("/api/books/<book_id>/tts-offline")
+def api_book_tts_offline_status(book_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        book = read_book_record(book_id)
+        result = tts_offline_book_status(book, load_config()["reader_tts"])
+        result["active_job"] = active_tts_offline_job_for_book(book_id)
+        return jsonify(result)
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/books/<book_id>/tts-offline", methods=["POST"])
+def api_book_tts_offline_create(book_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        settings = load_config()["reader_tts"]
+        if not settings.get("enabled"):
+            raise ValueError("请先启用听书服务")
+        if not settings.get("api_key"):
+            raise ValueError("请先配置 MiMo API Key")
+        payload = request_json_object()
+        requested = payload.get("chapters")
+        if not isinstance(requested, list) or not requested:
+            raise ValueError("请选择需要缓存的章节")
+        with TTS_OFFLINE_JOB_LOCK:
+            active = next(
+                (job for job in TTS_OFFLINE_JOBS.values() if job.get("status") in {"queued", "running"}),
+                None,
+            )
+            if active:
+                return jsonify({"error": "已有离线缓存任务正在运行", "job": public_tts_offline_job(active)}), 429
+            book = read_book_record(book_id)
+            valid_indexes = {int(chapter.get("index", index)) for index, chapter in enumerate(book.get("chapters", []))}
+            chapter_indexes = sorted({int(index) for index in requested if int(index) in valid_indexes})
+            if not chapter_indexes:
+                raise ValueError("没有有效的章节")
+            if len(chapter_indexes) > 100:
+                raise ValueError("单次最多缓存 100 章")
+            job_id = uuid.uuid4().hex
+            now = time.time()
+            TTS_OFFLINE_JOBS[job_id] = {
+                "id": job_id,
+                "book_id": book_id,
+                "chapter_indexes": chapter_indexes,
+                "status": "queued",
+                "message": "等待生成并固定服务器缓存",
+                "progress": 0,
+                "total_sentences": 0,
+                "completed_sentences": 0,
+                "failed_sentences": 0,
+                "cached_sentences": 0,
+                "generated_sentences": 0,
+                "size_bytes": 0,
+                "error": "",
+                "cancel_requested": False,
+                "created_at": now,
+                "updated_at": now,
+            }
+            job = public_tts_offline_job(TTS_OFFLINE_JOBS[job_id])
+        worker = threading.Thread(
+            target=process_tts_offline_job,
+            args=(job_id, book_id, chapter_indexes),
+            daemon=True,
+        )
+        worker.start()
+        app.logger.info("tts offline job created ip=%s book=%s chapters=%s", request.remote_addr, book_id, len(chapter_indexes))
+        return jsonify({"ok": True, "job": job}), 202
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/reader/tts-offline/jobs/<job_id>")
+def api_reader_tts_offline_job(job_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    with TTS_OFFLINE_JOB_LOCK:
+        cleanup_tts_offline_jobs_locked()
+        job = TTS_OFFLINE_JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "离线缓存任务不存在或已过期"}), 404
+        return jsonify({"job": public_tts_offline_job(job)})
+
+
+@app.route("/api/reader/tts-offline/jobs/<job_id>/cancel", methods=["POST"])
+def api_reader_tts_offline_job_cancel(job_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    with TTS_OFFLINE_JOB_LOCK:
+        cleanup_tts_offline_jobs_locked()
+        job = TTS_OFFLINE_JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "离线缓存任务不存在或已过期"}), 404
+        if job.get("status") in {"queued", "running"}:
+            job["cancel_requested"] = True
+            job["message"] = "正在取消，当前正在处理的句子完成后停止"
+            job["updated_at"] = time.time()
+        return jsonify({"ok": True, "job": public_tts_offline_job(job)})
+
+@app.route("/api/books/<book_id>/tts-offline/chapters/<int:chapter_index>")
+def api_book_tts_offline_manifest(book_id, chapter_index):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        return jsonify(tts_offline_chapter_manifest(read_book_record(book_id), chapter_index, load_config()))
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/books/<book_id>/tts-offline/audio/<cache_key>")
+def api_book_tts_offline_audio(book_id, cache_key):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    if not re.fullmatch(r"[0-9a-f]{64}", cache_key):
+        return jsonify({"error": "音频缓存键无效"}), 400
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            row = connection.execute(
+                "SELECT audio_format FROM offline_tts_refs WHERE book_id = ? AND cache_key = ? AND size_bytes > 0 LIMIT 1",
+                (book_id, cache_key),
+            ).fetchone()
+        finally:
+            connection.close()
+    if not row:
+        return jsonify({"error": "离线音频不存在"}), 404
+    audio_format = row["audio_format"]
+    path = tts_cache_path(cache_key, audio_format)
+    if not path.is_file():
+        return jsonify({"error": "离线音频文件不存在，请重新生成"}), 404
+    response = send_file(
+        path,
+        mimetype=TTS_AUDIO_FORMATS.get(audio_format, "audio/mpeg"),
+        download_name=f"{cache_key}.{audio_format}",
+        conditional=True,
+        max_age=0,
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+@app.route("/api/books/<book_id>/tts-offline", methods=["DELETE"])
+def api_book_tts_offline_delete(book_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        with TTS_OFFLINE_JOB_LOCK:
+            active = active_tts_offline_job_for_book(book_id)
+            if active:
+                return jsonify({
+                    "error": "该书正在生成离线缓存，请等待任务完成",
+                    "job": active,
+                }), 409
+            book = read_book_record(book_id)
+            payload = request_json_object()
+            requested = payload.get("chapters")
+            if not isinstance(requested, list) or not requested:
+                raise ValueError("请选择需要取消固定的章节")
+            valid_indexes = {int(chapter.get("index", index)) for index, chapter in enumerate(book.get("chapters", []))}
+            chapter_indexes = sorted({int(index) for index in requested if int(index) in valid_indexes})
+            if not chapter_indexes:
+                raise ValueError("没有有效的章节")
+            removed = delete_tts_offline_refs(
+                book_id,
+                chapter_indexes,
+                tts_offline_profile_key(load_config()["reader_tts"]),
+            )
+        app.logger.info(
+            "tts offline unpinned ip=%s book=%s entries=%s bytes=%s",
+            request.remote_addr,
+            book_id,
+            removed["entries"],
+            removed["size_bytes"],
+        )
+        return jsonify({"ok": True, **removed})
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
 def process_book_import_job(job_id, book_id, original_path, original_name, safe_name, suffix, remote_addr):
     job_started = time.perf_counter()
     update_import_job(job_id, status="parsing", message="正在解析书本", progress=35)
@@ -3915,7 +4602,20 @@ def api_book_detail(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     try:
-        book = refresh_epub_chapter_metadata(read_book_record(book_id))
+        book = read_book_record(book_id)
+        needs_metadata_refresh = (
+            book.get("format") == "epub"
+            and book.get("metadata_version") != CHAPTER_CACHE_VERSION
+        )
+        if needs_metadata_refresh:
+            with TTS_OFFLINE_JOB_LOCK:
+                active = active_tts_offline_job_for_book(book_id)
+                if active:
+                    return jsonify({
+                        "error": "该书正在生成离线缓存，请等待任务完成后重新打开",
+                        "job": active,
+                    }), 409
+                book = refresh_epub_chapter_metadata(book)
         if request.args.get("inspect") != "1":
             now = int(time.time())
             book["last_opened_at"] = now
@@ -3980,7 +4680,15 @@ def api_book_reparse(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     try:
-        book = reparse_book_record(book_id)
+        with TTS_OFFLINE_JOB_LOCK:
+            active = active_tts_offline_job_for_book(book_id)
+            if active:
+                return jsonify({
+                    "error": "该书正在生成离线缓存，请等待任务完成",
+                    "job": active,
+                }), 409
+            book = reparse_book_record(book_id)
+            delete_tts_offline_refs(book_id)
         app.logger.info("book reparsed ip=%s id=%s", request.remote_addr, book_id)
         return jsonify({"ok": True, "book": book_summary(book)})
     except FileNotFoundError as exc:
@@ -3995,7 +4703,15 @@ def api_book_clear_toc(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     try:
-        book = clear_txt_book_toc(book_id)
+        with TTS_OFFLINE_JOB_LOCK:
+            active = active_tts_offline_job_for_book(book_id)
+            if active:
+                return jsonify({
+                    "error": "该书正在生成离线缓存，请等待任务完成",
+                    "job": active,
+                }), 409
+            book = clear_txt_book_toc(book_id)
+            delete_tts_offline_refs(book_id)
         app.logger.info("book toc cleared ip=%s id=%s", request.remote_addr, book_id)
         return jsonify({"ok": True, "book": book_summary(book)})
     except FileNotFoundError as exc:
@@ -4087,7 +4803,15 @@ def api_txt_chapter_title_delete(book_id, chapter_index):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     try:
-        book = delete_txt_chapter_title(book_id, chapter_index)
+        with TTS_OFFLINE_JOB_LOCK:
+            active = active_tts_offline_job_for_book(book_id)
+            if active:
+                return jsonify({
+                    "error": "该书正在生成离线缓存，请等待任务完成",
+                    "job": active,
+                }), 409
+            book = delete_txt_chapter_title(book_id, chapter_index)
+            delete_tts_offline_refs(book_id)
         return jsonify({"ok": True, "book": book_summary(book)})
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 404
@@ -4115,7 +4839,15 @@ def api_txt_chapter_split(book_id, chapter_index):
     payload = request_json_object()
     try:
         line_index = int(payload.get("line_index", -1))
-        book = split_txt_chapter_at_line(book_id, chapter_index, line_index, payload.get("title", ""))
+        with TTS_OFFLINE_JOB_LOCK:
+            active = active_tts_offline_job_for_book(book_id)
+            if active:
+                return jsonify({
+                    "error": "该书正在生成离线缓存，请等待任务完成",
+                    "job": active,
+                }), 409
+            book = split_txt_chapter_at_line(book_id, chapter_index, line_index, payload.get("title", ""))
+            delete_tts_offline_refs(book_id)
         return jsonify({"ok": True, "book": book_summary(book)})
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 404
@@ -4154,11 +4886,19 @@ def api_book_delete(book_id):
         target_dir = book_dir(book_id)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    with READER_IO_LOCK:
-        if not target_dir.exists():
-            return jsonify({"error": "书籍不存在"}), 404
-        shutil.rmtree(target_dir)
-        remove_from_book_index(book_id)
+    with TTS_OFFLINE_JOB_LOCK:
+        active = active_tts_offline_job_for_book(book_id)
+        if active:
+            return jsonify({
+                "error": "该书正在生成离线缓存，请等待任务完成",
+                "job": active,
+            }), 409
+        with READER_IO_LOCK:
+            delete_tts_offline_refs(book_id, delete_files=True)
+            if not target_dir.exists():
+                return jsonify({"error": "书籍不存在"}), 404
+            shutil.rmtree(target_dir)
+            remove_from_book_index(book_id)
     app.logger.info("book deleted ip=%s id=%s", request.remote_addr, book_id)
     return jsonify({"ok": True})
 
