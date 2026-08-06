@@ -2973,6 +2973,41 @@ function setOfflineActiveJob(job = null) {
   updateOfflineProgressDensity();
 }
 
+function offlineJobProgressMessage(job) {
+  const completed = Number(job?.completed_sentences || 0);
+  const failed = Number(job?.failed_sentences || 0);
+  const total = Number(job?.total_sentences || 0);
+  const processed = completed + failed;
+  let message = (job?.message || "正在生成并固定服务器缓存") + " · "
+    + processed + " / " + (total || "…") + " 句 · 复用 "
+    + Number(job?.cached_sentences || 0) + " · 生成 "
+    + Number(job?.generated_sentences || 0);
+  if (failed) message += " · 失败 " + failed;
+  return message;
+}
+
+async function resumeOfflineJob(job, bookId) {
+  if (!job?.id || readerState.offlineBusy) return;
+  readerState.offlineCancelRequested = false;
+  setOfflineCacheBusy(true);
+  try {
+    const completedJob = await waitForOfflineJob(job, bookId);
+    const failed = Number(completedJob.failed_sentences || 0);
+    const hasFailures = completedJob.status === "done" && failed > 0;
+    showOfflineCacheProgress(
+      completedJob.message || (completedJob.status === "cancelled" ? "任务已取消" : "服务器固定完成"),
+      hasFailures ? "error" : "",
+      bookId,
+    );
+    await loadOfflineCacheStatus(bookId);
+  } catch (error) {
+    showOfflineCacheProgress(error.message, "error", bookId);
+  } finally {
+    readerState.offlineCancelRequested = false;
+    setOfflineCacheBusy(false);
+  }
+}
+
 async function renderOfflineCacheStatus() {
   const bookId = readerState.offlineBookId;
   const status = readerState.offlineStatus;
@@ -3041,11 +3076,8 @@ async function openOfflineCacheManager(book) {
     if (!status) return;
     if (status.active_job) {
       setOfflineActiveJob(status.active_job);
-      showOfflineCacheProgress(
-        status.active_job.message + " · " + (status.active_job.progress || 0) + "%",
-        "",
-        book.id,
-      );
+      showOfflineCacheProgress(offlineJobProgressMessage(status.active_job), "", book.id);
+      resumeOfflineJob(status.active_job, book.id);
     } else {
       setOfflineActiveJob(null);
       showOfflineCacheProgress("", "", book.id);
@@ -3121,14 +3153,7 @@ async function waitForOfflineJob(job, bookId) {
   setOfflineActiveJob(current);
 
   while (["queued", "running"].includes(current.status)) {
-    const reuse = Number(current.cached_sentences || 0);
-    const generated = Number(current.generated_sentences || 0);
-    showOfflineCacheProgress(
-      current.message + " · " + (current.completed_sentences || 0) + " / "
-        + (current.total_sentences || "…") + " 句 · 复用 " + reuse + " · 生成 " + generated,
-      "",
-      bookId,
-    );
+    showOfflineCacheProgress(offlineJobProgressMessage(current), "", bookId);
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
     const data = await api("/api/reader/tts-offline/jobs/" + current.id);
     current = data.job;

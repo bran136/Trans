@@ -3871,7 +3871,7 @@ def fetch_mimo_balance(config, force=False):
         )
     headers = {
         "Accept": "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0 TransTools/1.0",
+        "User-Agent": f"Mozilla/5.0 TransTools/{APP_VERSION}",
         "Cookie": balance_cookie,
         "Origin": "https://platform.xiaomimimo.com",
         "Referer": "https://platform.xiaomimimo.com/",
