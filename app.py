@@ -181,6 +181,7 @@ TTS_OFFLINE_JOB_LOCK = threading.RLock()
 TTS_OFFLINE_JOBS = OrderedDict()
 TTS_OFFLINE_JOB_RETENTION_SECONDS = 3600
 TTS_OFFLINE_CHAPTER_WORKERS = 2
+TTS_OFFLINE_MAX_CHAPTERS = 300
 TTS_OFFLINE_PACK_WORKERS = 2
 UNSAFE_APP_PASSWORDS = {"", "changeme", "password", "admin", "123456", "replace-with-a-strong-password"}
 UNSAFE_SECRET_KEYS = {"", "replace-with-a-long-random-string", "changeme", "secret"}
@@ -5586,8 +5587,8 @@ def api_book_tts_offline_create(book_id):
         requested_indexes = sorted({int(index) for index in requested if int(index) in valid_indexes})
         if not requested_indexes:
             raise ValueError("没有有效的章节")
-        if len(requested_indexes) > 100:
-            raise ValueError("单次最多缓存 100 章")
+        if len(requested_indexes) > TTS_OFFLINE_MAX_CHAPTERS:
+            raise ValueError(f"单次最多缓存 {TTS_OFFLINE_MAX_CHAPTERS} 章")
 
         profile_key = tts_offline_profile_key(settings)
         refs_by_chapter = load_tts_offline_refs_by_chapter(book_id, profile_key)

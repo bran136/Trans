@@ -225,6 +225,7 @@
         <p id="offlineCacheSummary" class="offline-cache-summary">请选择一本书后管理离线音频。</p>
         <div class="offline-cache-presets">
           <button id="selectAllOfflineBtn" type="button">全选</button>
+          <button id="selectRangeOfflineBtn" type="button">选择范围</button>
           <button id="clearOfflineSelectionBtn" type="button">清除选择</button>
         </div>
         <div id="offlineCacheProgress" class="offline-cache-progress" role="status" aria-live="polite" aria-hidden="true">
@@ -241,6 +242,27 @@
         </div>
         <p class="offline-cache-help">优先播放本机缓存；服务器缓存固定后不会自动清理。</p>
       </section>
+    </dialog>
+
+    <dialog id="offlineRangeDialog" class="reader-dialog offline-range-dialog">
+      <form id="offlineRangeForm" class="dialog-panel" novalidate>
+        <div class="dialog-head">
+          <h2>选择章节范围</h2>
+          <div class="dialog-actions">
+            <button type="submit">确定</button>
+            <button id="closeOfflineRangeBtn" type="button">取消</button>
+          </div>
+        </div>
+        <div id="offlineRangeMessage" class="reader-config-message" role="alert" hidden></div>
+        <div class="offline-range-fields">
+          <label class="offline-range-field">起始章节
+            <input id="offlineRangeStart" type="number" min="1" step="1" inputmode="numeric" required>
+          </label>
+          <label class="offline-range-field">结束章节
+            <input id="offlineRangeEnd" type="number" min="1" step="1" inputmode="numeric" required>
+          </label>
+        </div>
+      </form>
     </dialog>
 
     <dialog id="mimoCookieDialog" class="reader-dialog mimo-cookie-dialog">

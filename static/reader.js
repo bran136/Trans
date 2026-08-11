@@ -73,6 +73,7 @@ const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content ||
 const TTS_OFFLINE_DB_NAME = "trans-reader-offline-v1";
 const TTS_OFFLINE_PACK_STORE = "packs";
 const TTS_OFFLINE_DOWNLOAD_WORKERS = 6;
+const TTS_OFFLINE_MAX_CHAPTERS = 300;
 const TTS_PACK_PREFETCH_WORKERS = 4;
 const TTS_PACK_SCHEMA_VERSION = 2;
 const TTS_MAX_PACK_BYTES = 32 * 1024 * 1024;
@@ -3154,6 +3155,10 @@ function setOfflineCacheBusy(busy) {
   document.querySelectorAll("#offlineChapterList input[type=checkbox]").forEach((input) => {
     input.disabled = busy;
   });
+  ["selectAllOfflineBtn", "selectRangeOfflineBtn", "clearOfflineSelectionBtn"].forEach((id) => {
+    const button = $(id);
+    if (button) button.disabled = busy;
+  });
   const retryButton = $("retryOfflineJobBtn");
   if (retryButton) retryButton.disabled = busy || !readerState.offlineRetry;
 }
@@ -3421,8 +3426,11 @@ async function openOfflineCacheManager(book) {
       resumeOfflineJob(status.active_job, book.id);
     } else {
       setOfflineActiveJob(null);
+      const idleMessage = status.chapters?.length
+        ? "请选择章节后执行缓存操作"
+        : "当前书籍没有可缓存章节";
       showOfflineCacheProgress(
-        status.local_cache_error ? `服务器状态已加载；${status.local_cache_error}` : "",
+        status.local_cache_error ? `服务器状态已加载；${status.local_cache_error}` : idleMessage,
         status.local_cache_error ? "error" : "",
         book.id,
       );
@@ -3445,6 +3453,74 @@ function selectOfflineChapterRange(mode) {
     input.checked = mode === "all";
   });
   setOfflineCacheBusy(readerState.offlineBusy);
+}
+
+function showOfflineRangeMessage(message = "") {
+  const node = $("offlineRangeMessage");
+  node.textContent = message;
+  node.className = "reader-config-message error";
+  node.hidden = !message;
+}
+
+function openOfflineChapterRangeDialog() {
+  const inputs = [...document.querySelectorAll("#offlineChapterList input[type=checkbox]")];
+  if (!inputs.length || readerState.offlineBusy) return;
+  const selected = selectedOfflineChapterIndexes().sort((left, right) => left - right);
+  const maxChapter = Math.max(...inputs.map((input) => Number(input.value) + 1));
+  const defaultStart = selected.length ? selected[0] + 1 : 1;
+  const defaultEnd = selected.length
+    ? Math.min(selected[selected.length - 1] + 1, defaultStart + TTS_OFFLINE_MAX_CHAPTERS - 1)
+    : Math.min(maxChapter, TTS_OFFLINE_MAX_CHAPTERS);
+  [$("offlineRangeStart"), $("offlineRangeEnd")].forEach((input) => {
+    input.max = String(maxChapter);
+  });
+  $("offlineRangeStart").value = String(defaultStart);
+  $("offlineRangeEnd").value = String(defaultEnd);
+  showOfflineRangeMessage();
+  openReaderDialog($("offlineRangeDialog"));
+  window.setTimeout(() => {
+    $("offlineRangeStart").focus();
+    $("offlineRangeStart").select();
+  }, 0);
+}
+
+function applyOfflineChapterNumberRange(event) {
+  event.preventDefault();
+  if (readerState.offlineBusy) {
+    $("offlineRangeDialog").close();
+    return;
+  }
+  const inputs = [...document.querySelectorAll("#offlineChapterList input[type=checkbox]")];
+  const start = Number($("offlineRangeStart").value);
+  const end = Number($("offlineRangeEnd").value);
+  const maxChapter = Number($("offlineRangeEnd").max);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) {
+    showOfflineRangeMessage("请正确填写起始章节和结束章节");
+    return;
+  }
+  if (end > maxChapter) {
+    showOfflineRangeMessage(`当前书籍最多到第 ${maxChapter} 章`);
+    return;
+  }
+  if (end - start + 1 > TTS_OFFLINE_MAX_CHAPTERS) {
+    showOfflineRangeMessage(`单次最多选择 ${TTS_OFFLINE_MAX_CHAPTERS} 章`);
+    return;
+  }
+  const rangeInputs = inputs.filter((input) => {
+    const chapterNumber = Number(input.value) + 1;
+    return chapterNumber >= start && chapterNumber <= end;
+  });
+  if (!rangeInputs.length) {
+    showOfflineRangeMessage("该范围内没有章节");
+    return;
+  }
+  const rangeSet = new Set(rangeInputs);
+  inputs.forEach((input) => {
+    input.checked = rangeSet.has(input);
+  });
+  $("offlineRangeDialog").close();
+  showOfflineCacheProgress(`已选择第 ${start}-${end} 章，共 ${rangeInputs.length} 章`, "", readerState.offlineBookId);
+  setOfflineCacheBusy(false);
 }
 
 async function cancelOfflineJob() {
@@ -3691,6 +3767,14 @@ async function createOfflineCache(downloadToDevice, requestedChapterIndexes = nu
     .map(Number)
     .filter((index) => Number.isFinite(index) && validIndexes.has(index)))];
   if (!bookId || !chapterIndexes.length || readerState.offlineBusy) return;
+  if (chapterIndexes.length > TTS_OFFLINE_MAX_CHAPTERS) {
+    showOfflineCacheProgress(
+      `单次最多缓存 ${TTS_OFFLINE_MAX_CHAPTERS} 章，请使用“选择范围”分段处理`,
+      "error",
+      bookId,
+    );
+    return;
+  }
   readerState.offlineCancelRequested = false;
   setOfflineCacheBusy(true);
   try {
@@ -4168,6 +4252,9 @@ $("closeSettingsBtn").addEventListener("click", () => $("settingsDialog").close(
 
 $("closeOfflineCacheBtn")?.addEventListener("click", closeOfflineCacheManager);
 $("selectAllOfflineBtn")?.addEventListener("click", () => selectOfflineChapterRange("all"));
+$("selectRangeOfflineBtn")?.addEventListener("click", openOfflineChapterRangeDialog);
+$("offlineRangeForm")?.addEventListener("submit", applyOfflineChapterNumberRange);
+$("closeOfflineRangeBtn")?.addEventListener("click", () => $("offlineRangeDialog").close());
 $("clearOfflineSelectionBtn")?.addEventListener("click", () => selectOfflineChapterRange("clear"));
 $("cancelOfflineJobBtn")?.addEventListener("click", cancelOfflineJob);
 $("retryOfflineJobBtn")?.addEventListener("click", retryOfflineCache);

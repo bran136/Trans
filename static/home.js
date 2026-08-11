@@ -101,8 +101,15 @@ function stopMonitorRefresh() {
   monitorTimer = null;
 }
 
+function openRestartConfirmation() {
+  if ($("restartServiceBtn").disabled) return;
+  $("restartConfirmDialog").showModal();
+  window.setTimeout(() => $("confirmRestartBtn").focus(), 0);
+}
+
 async function restartService() {
-  if (!window.confirm("确定重启后端服务？正在进行的请求会中断。")) return;
+  if ($("restartServiceBtn").disabled) return;
+  $("restartConfirmDialog").close();
   $("restartServiceBtn").disabled = true;
   try {
     await api("/api/restart", { method: "POST", body: "{}" });
@@ -170,7 +177,9 @@ $("monitorBtn").addEventListener("click", () => {
 
 $("closeMonitorBtn").addEventListener("click", () => $("monitorDialog").close());
 $("refreshStatusBtn").addEventListener("click", () => loadServiceStatus());
-$("restartServiceBtn").addEventListener("click", restartService);
+$("restartServiceBtn").addEventListener("click", openRestartConfirmation);
+$("cancelRestartBtn").addEventListener("click", () => $("restartConfirmDialog").close());
+$("confirmRestartBtn").addEventListener("click", restartService);
 $("savePasswordBtn").addEventListener("click", saveAccessPassword);
 [$("currentPassword"), $("newPassword")].forEach((input) => {
   input.addEventListener("keydown", (event) => {

@@ -111,6 +111,21 @@
         </div>
       </section>
     </dialog>
+
+    <dialog id="restartConfirmDialog" class="restart-confirm-dialog">
+      <section class="restart-confirm-panel">
+        <div class="restart-confirm-icon" aria-hidden="true">!</div>
+        <div class="restart-confirm-copy">
+          <h2>确认重启服务？</h2>
+          <p>正在进行的请求会中断，服务恢复后监控状态会自动刷新。</p>
+        </div>
+        <div class="restart-confirm-actions">
+          <button class="ghost" id="cancelRestartBtn" type="button">取消</button>
+          <button class="danger-btn" id="confirmRestartBtn" type="button">确认重启</button>
+        </div>
+      </section>
+    </dialog>
+
     <div class="version-badge">
       <span>v{{ app_version() }}</span>
       <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">

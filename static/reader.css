@@ -1294,6 +1294,49 @@ a,
   overflow: hidden;
 }
 
+.offline-range-dialog {
+  width: min(400px, calc(100vw - 24px));
+}
+
+.offline-range-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.offline-range-field {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.offline-range-field input {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  outline: none;
+  background: #fff;
+  color: var(--ink);
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.offline-range-field input:focus {
+  border-color: rgba(107, 125, 227, 0.72);
+  box-shadow: 0 0 0 3px rgba(107, 125, 227, 0.12);
+}
+
+.reader-dark .offline-range-field input {
+  border-color: var(--line);
+  background: rgba(25, 32, 45, 0.92);
+  color: var(--ink);
+}
+
 .offline-cache-summary,
 .offline-cache-help {
   margin: 0;
@@ -2067,13 +2110,18 @@ a,
 }
 
 @media (max-width: 640px) {
+  .tts-dialog,
   .offline-cache-dialog {
     width: calc(100vw - 16px);
   }
 
+  .tts-dialog .dialog-panel,
   .offline-cache-dialog .dialog-panel {
     max-height: calc(100vh - 24px);
     max-height: calc(100dvh - max(12px, env(safe-area-inset-top)) - max(12px, env(safe-area-inset-bottom)));
+  }
+
+  .offline-cache-dialog .dialog-panel {
     padding-bottom: max(12px, env(safe-area-inset-bottom));
   }
 
