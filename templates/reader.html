@@ -10,6 +10,7 @@
     <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
     <script src="{{ asset_url('reader-theme.js') }}"></script>
     <link rel="stylesheet" href="{{ asset_url('reader.css') }}">
+    <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
   </head>
   <body class="reader-body" data-media-artwork-url="{{ asset_url('media-artwork.png') }}">
     <div class="reader-shell">
@@ -202,11 +203,11 @@
               <input id="ttsChunkChars" type="number" min="80" max="800" step="10">
             </label>
             <label class="tts-wide">风格 / 音色描述
-              <textarea id="ttsStylePrompt" rows="3"></textarea>
+              <textarea id="ttsStylePrompt" rows="1"></textarea>
             </label>
           </div>
           <div class="tts-cache-row">
-            <label class="setting-check"><input id="ttsCacheEnabled" type="checkbox"> 启用服务端音频缓存</label>
+            <label class="setting-check"><input id="ttsCacheEnabled" type="checkbox"> 复用服务端单句缓存</label>
             <span id="ttsCacheStats" class="tts-cache-stats"></span>
           </div>
         </section>
@@ -292,6 +293,7 @@
         <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
       </a>
     </div>
+    <script src="{{ asset_url('ui.js') }}"></script>
     <script src="{{ asset_url('font-cache.js') }}"></script>
     <script src="{{ asset_url('reader.js') }}"></script>
   </body>

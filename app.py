@@ -11,8 +11,10 @@ import re
 import shutil
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -45,6 +47,7 @@ READER_DIR = BASE_DIR / "reader_data"
 READER_BOOK_DIR = READER_DIR / "books"
 READER_INDEX_FILE = READER_DIR / "books.json"
 TTS_CACHE_DIR = READER_DIR / "tts_cache"
+TTS_PACK_CACHE_DIR = READER_DIR / "tts_pack_cache"
 TTS_OFFLINE_DB = READER_DIR / "tts_offline.sqlite3"
 
 
@@ -85,6 +88,8 @@ BUILD_VERSION_FILES = (
     BASE_DIR / "templates" / "login.html",
     BASE_DIR / "templates" / "reader.html",
     BASE_DIR / "static" / "styles.css",
+    BASE_DIR / "static" / "ui.css",
+    BASE_DIR / "static" / "ui.js",
     BASE_DIR / "static" / "app.js",
     BASE_DIR / "static" / "font-cache.js",
     BASE_DIR / "static" / "home.js",
@@ -112,7 +117,15 @@ MAX_EPUB_ENTRIES = 10_000
 MAX_PDF_PAGES = 5_000
 MAX_JSON_REQUEST_BYTES = 256 * 1024
 MAX_TTS_AUDIO_BYTES = 20 * 1024 * 1024
+MAX_TTS_PACK_BYTES = 32 * 1024 * 1024
+TTS_PACK_SCHEMA_VERSION = 2
+TTS_PACK_MIN_SECONDS = 5.1
+TTS_PACK_PAD_SECONDS = TTS_PACK_MIN_SECONDS + 0.25
+TTS_PACK_PRUNE_INTERVAL_SECONDS = 60
+TTS_CACHE_STATS_MAX_AGE_SECONDS = 60
+TTS_PACK_PREFETCH_HINT_LIMIT = 16
 CHAPTER_CACHE_VERSION = 5
+TTS_SENTENCE_INDEX_VERSION = 1
 OFFICIAL_DEEPSEEK_HOSTS = {"api.deepseek.com"}
 OFFICIAL_MIMO_TTS_HOSTS = {"api.xiaomimimo.com"}
 OFFICIAL_MIMO_BALANCE_HOSTS = {"platform.xiaomimimo.com"}
@@ -148,11 +161,27 @@ LOGIN_FAILURE_LOCK = threading.Lock()
 LOGIN_FAILURE_MAX_IPS = 10_000
 TTS_CACHE_LOCK = threading.RLock()
 TTS_CACHE_KEY_LOCKS = tuple(threading.Lock() for _ in range(64))
+TTS_PACK_KEY_LOCKS = tuple(threading.Lock() for _ in range(32))
+TTS_SENTENCE_INDEX_LOCKS = tuple(threading.Lock() for _ in range(32))
+TTS_PACK_CACHE_LOCK = threading.RLock()
+TTS_PACK_PRUNE_STATE = {"time": 0.0}
+TTS_CACHE_STATS_LOCK = threading.RLock()
+TTS_CACHE_STATS_READY = threading.Event()
+TTS_CACHE_STATS_STATE = {
+    "data": None,
+    "revision": 0,
+    "data_revision": -1,
+    "refreshed_at": 0.0,
+    "refreshing": False,
+    "refresh_again": False,
+}
+TTS_PACK_BUILD_SEMAPHORE = threading.BoundedSemaphore(2)
 TTS_OFFLINE_LOCK = threading.RLock()
 TTS_OFFLINE_JOB_LOCK = threading.RLock()
 TTS_OFFLINE_JOBS = OrderedDict()
 TTS_OFFLINE_JOB_RETENTION_SECONDS = 3600
 TTS_OFFLINE_CHAPTER_WORKERS = 2
+TTS_OFFLINE_PACK_WORKERS = 2
 UNSAFE_APP_PASSWORDS = {"", "changeme", "password", "admin", "123456", "replace-with-a-strong-password"}
 UNSAFE_SECRET_KEYS = {"", "replace-with-a-long-random-string", "changeme", "secret"}
 SECRET_KEY_FILE = CONFIG_DIR / "secret_key"
@@ -164,7 +193,7 @@ MIMO_BALANCE_COOKIE_NAMES = (
 )
 MIMO_BALANCE_REQUIRED_COOKIE_NAMES = {"api-platform_serviceToken", "userId"}
 TTS_AUDIO_FORMATS = {
-    "wav": "audio/wav",
+    "m4a": "audio/mp4",
 }
 TTS_MODEL_OPTIONS = [
     "mimo-v2.5-tts",
@@ -209,7 +238,7 @@ DEFAULT_CONFIG = {
         "balance_cookie": "",
         "model": "mimo-v2.5-tts",
         "voice_id": "mimo_default",
-        "format": "wav",
+        "format": "m4a",
         "style_prompt": "自然清晰地朗读，适合小说听书，语速适中，情绪跟随文本。",
         "timeout": 30,
         "chunk_chars": 260,
@@ -875,6 +904,10 @@ def book_chapter_cache_dir(book_id):
 
 def book_chapter_cache_path(book_id, chapter_index):
     return book_chapter_cache_dir(book_id) / f"{int(chapter_index):06d}.json"
+
+
+def book_tts_sentence_index_path(book_id):
+    return book_dir(book_id) / "tts_sentence_counts.json"
 
 
 def read_book_record(book_id):
@@ -2178,7 +2211,7 @@ def ensure_chapter_text(book, chapter_index):
         return chapter
 
 
-def chapter_payload(book, chapter_index):
+def chapter_payload(book, chapter_index, include_book=True):
     chapters = book.get("chapters", [])
     if chapter_index < 0 or chapter_index >= len(chapters):
         raise IndexError("章节不存在")
@@ -2228,8 +2261,7 @@ def chapter_payload(book, chapter_index):
             sentence_counter += 1
         if sentences:
             paragraphs.append({"index": paragraph_index, "sentences": sentences})
-    return {
-        "book": book_summary(book),
+    result = {
         "chapter": {
             "index": chapter_index,
             "title": chapter.get("title") or f"第 {chapter_index + 1} 章",
@@ -2237,6 +2269,9 @@ def chapter_payload(book, chapter_index):
             "sentence_count": sentence_counter,
         },
     }
+    if include_book:
+        result["book"] = book_summary(book)
+    return result
 
 
 load_dotenv()
@@ -2461,8 +2496,7 @@ def public_config(config):
     # must never be able to redirect requests carrying server credentials.
     safe["deepseek"]["allow_custom_base_url"] = False
     safe.pop("app_password", None)
-    if "reader_tts" in safe:
-        safe["reader_tts"] = public_reader_tts_config(config)
+    safe.pop("reader_tts", None)
     safe["deepseek_styles"] = [
         {"id": key, "name": value["name"]} for key, value in DEEPSEEK_STYLES.items()
     ]
@@ -2471,6 +2505,7 @@ def public_config(config):
 
 def public_reader_tts_config(config):
     settings = json.loads(json.dumps(config.get("reader_tts", DEFAULT_CONFIG["reader_tts"])))
+    settings["format"] = "m4a"
     settings["api_key_configured"] = bool(settings.get("api_key"))
     settings["api_key"] = ""
     settings["balance_cookie_configured"] = bool(settings.get("balance_cookie"))
@@ -2517,8 +2552,7 @@ def update_reader_tts_config(config, payload):
     env_updates["MIMO_TTS_MODEL"] = settings["model"]
     settings["voice_id"] = clean_single_line_value(payload.get("voice_id", settings["voice_id"]))[:200]
     env_updates["MIMO_TTS_VOICE"] = settings["voice_id"]
-    audio_format = clean_single_line_value(payload.get("format", settings["format"])).lower()
-    settings["format"] = audio_format if audio_format in TTS_AUDIO_FORMATS else "wav"
+    settings["format"] = "m4a"
     settings["style_prompt"] = clean_single_line_value(payload.get("style_prompt", settings.get("style_prompt", "")))[:1000]
     env_updates["MIMO_TTS_STYLE_PROMPT"] = settings["style_prompt"]
     settings["timeout"] = int(parse_number(payload.get("timeout"), settings["timeout"], 5, 90))
@@ -2741,38 +2775,103 @@ def tts_cache_ttl_seconds():
     return max(1, min(ttl_days, 365)) * 24 * 60 * 60
 
 
-def tts_cache_stats():
+def file_allocated_bytes(stat):
+    blocks = getattr(stat, "st_blocks", None)
+    if blocks is None or blocks <= 0:
+        return max(0, int(stat.st_size))
+    return int(blocks) * 512
+
+
+def scan_tts_cache_stats():
     now = time.time()
     ttl = tts_cache_ttl_seconds()
     limit = tts_cache_limit_bytes()
     entries = 0
     total_size = 0
+    total_disk_size = 0
     oldest_accessed_at = None
     newest_accessed_at = None
     expired_entries = 0
-    pinned_keys = pinned_tts_cache_keys()
+    pinned_keys = pinned_tts_cache_keys(completed_only=True)
     pinned_entries = 0
     pinned_size = 0
+    pinned_disk_size = 0
     if TTS_CACHE_DIR.exists():
-        for path in TTS_CACHE_DIR.glob("*"):
-            if not path.is_file():
+        for path in TTS_CACHE_DIR.glob("*.m4a"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            if not re.fullmatch(r"[0-9a-f]{64}", path.stem):
                 continue
             try:
                 stat = path.stat()
             except OSError:
                 continue
+            if stat.st_size <= 0 or stat.st_size > MAX_TTS_AUDIO_BYTES:
+                continue
+            allocated_size = file_allocated_bytes(stat)
             if path.stem in pinned_keys:
                 pinned_entries += 1
                 pinned_size += stat.st_size
+                pinned_disk_size += allocated_size
             entries += 1
             total_size += stat.st_size
+            total_disk_size += allocated_size
             oldest_accessed_at = stat.st_mtime if oldest_accessed_at is None else min(oldest_accessed_at, stat.st_mtime)
             newest_accessed_at = stat.st_mtime if newest_accessed_at is None else max(newest_accessed_at, stat.st_mtime)
             if now - stat.st_mtime > ttl and path.stem not in pinned_keys:
                 expired_entries += 1
+    pack_entries = 0
+    pack_size = 0
+    pack_disk_size = 0
+    pinned_pack_entries = 0
+    pinned_pack_size = 0
+    pinned_pack_disk_size = 0
+    pinned_pack_keys = pinned_tts_pack_keys()
+    if TTS_PACK_CACHE_DIR.exists():
+        for path in TTS_PACK_CACHE_DIR.glob("*.m4a"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            manifest = load_tts_pack_manifest(path.stem)
+            if not manifest:
+                continue
+            pinned = path.stem in pinned_pack_keys
+            allocated_size = file_allocated_bytes(stat)
+            pack_entries += 1
+            pack_size += stat.st_size
+            pack_disk_size += allocated_size
+            if pinned:
+                pinned_pack_entries += 1
+                pinned_pack_size += stat.st_size
+                pinned_pack_disk_size += allocated_size
+    pack_manifest_disk_size = 0
+    pinned_pack_manifest_disk_size = 0
+    if TTS_PACK_CACHE_DIR.exists():
+        for path in TTS_PACK_CACHE_DIR.glob("*.json"):
+            if not load_tts_pack_manifest(path.stem):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            allocated_size = file_allocated_bytes(stat)
+            pack_manifest_disk_size += allocated_size
+            if path.stem in pinned_pack_keys:
+                pinned_pack_manifest_disk_size += allocated_size
+    cache_entries = max(0, entries - pinned_entries)
+    cache_disk_size = (
+        max(0, total_disk_size - pinned_disk_size)
+        + max(0, pack_disk_size - pinned_pack_disk_size)
+        + max(0, pack_manifest_disk_size - pinned_pack_manifest_disk_size)
+    )
+    fixed_disk_size = pinned_disk_size + pinned_pack_disk_size + pinned_pack_manifest_disk_size
     return {
         "entries": entries,
         "size_bytes": total_size,
+        "disk_size_bytes": total_disk_size,
+        "cache_entries": cache_entries,
+        "cache_disk_size_bytes": cache_disk_size,
         "limit_bytes": limit,
         "ttl_days": max(1, round(ttl / 86400)),
         "oldest_accessed_at": int(oldest_accessed_at or 0),
@@ -2780,7 +2879,104 @@ def tts_cache_stats():
         "expired_entries": expired_entries,
         "pinned_entries": pinned_entries,
         "pinned_size_bytes": pinned_size,
+        "pinned_disk_size_bytes": pinned_disk_size,
+        "fixed_entries": pinned_entries,
+        "fixed_disk_size_bytes": fixed_disk_size,
+        "pack_entries": pack_entries,
+        "pack_size_bytes": pack_size,
+        "pinned_pack_entries": pinned_pack_entries,
+        "pinned_pack_size_bytes": pinned_pack_size,
     }
+
+
+def refresh_tts_cache_stats_snapshot(target_revision):
+    try:
+        data = scan_tts_cache_stats()
+    except Exception as exc:
+        app.logger.warning("tts cache stats refresh failed error=%s", exc)
+        with TTS_CACHE_STATS_LOCK:
+            TTS_CACHE_STATS_STATE["refreshing"] = False
+            refresh_again = TTS_CACHE_STATS_STATE["refresh_again"]
+            TTS_CACHE_STATS_STATE["refresh_again"] = False
+            TTS_CACHE_STATS_READY.set()
+        if refresh_again:
+            schedule_tts_cache_stats_refresh(force=True)
+        return
+    with TTS_CACHE_STATS_LOCK:
+        TTS_CACHE_STATS_STATE["data"] = data
+        TTS_CACHE_STATS_STATE["data_revision"] = target_revision
+        TTS_CACHE_STATS_STATE["refreshed_at"] = time.monotonic()
+        TTS_CACHE_STATS_STATE["refreshing"] = False
+        refresh_again = TTS_CACHE_STATS_STATE["refresh_again"]
+        TTS_CACHE_STATS_STATE["refresh_again"] = False
+        TTS_CACHE_STATS_READY.set()
+    if refresh_again:
+        schedule_tts_cache_stats_refresh(force=True)
+
+
+def schedule_tts_cache_stats_refresh(force=False):
+    now = time.monotonic()
+    with TTS_CACHE_STATS_LOCK:
+        state = TTS_CACHE_STATS_STATE
+        fresh = (
+            state["data"] is not None
+            and state["data_revision"] == state["revision"]
+            and now - state["refreshed_at"] < TTS_CACHE_STATS_MAX_AGE_SECONDS
+        )
+        if fresh and not force:
+            return False
+        if state["refreshing"]:
+            if force:
+                state["refresh_again"] = True
+            return False
+        state["refreshing"] = True
+        target_revision = state["revision"]
+        TTS_CACHE_STATS_READY.clear()
+    threading.Thread(
+        target=refresh_tts_cache_stats_snapshot,
+        args=(target_revision,),
+        name="tts-cache-stats",
+        daemon=True,
+    ).start()
+    return True
+
+
+def invalidate_tts_cache_stats(refresh=False):
+    with TTS_CACHE_STATS_LOCK:
+        TTS_CACHE_STATS_STATE["revision"] += 1
+    if refresh:
+        schedule_tts_cache_stats_refresh(force=True)
+
+
+def tts_cache_stats():
+    with TTS_CACHE_STATS_LOCK:
+        data = TTS_CACHE_STATS_STATE["data"]
+        stale = (
+            data is None
+            or TTS_CACHE_STATS_STATE["data_revision"] != TTS_CACHE_STATS_STATE["revision"]
+            or time.monotonic() - TTS_CACHE_STATS_STATE["refreshed_at"] >= TTS_CACHE_STATS_MAX_AGE_SECONDS
+        )
+    if data is not None:
+        schedule_tts_cache_stats_refresh()
+        result = dict(data)
+        result["refreshing"] = stale
+        return result
+    schedule_tts_cache_stats_refresh()
+    TTS_CACHE_STATS_READY.wait(timeout=1.0)
+    with TTS_CACHE_STATS_LOCK:
+        data = TTS_CACHE_STATS_STATE["data"]
+    if data is not None:
+        result = dict(data)
+        result["refreshing"] = False
+        return result
+    data = scan_tts_cache_stats()
+    with TTS_CACHE_STATS_LOCK:
+        TTS_CACHE_STATS_STATE["data"] = data
+        TTS_CACHE_STATS_STATE["data_revision"] = TTS_CACHE_STATS_STATE["revision"]
+        TTS_CACHE_STATS_STATE["refreshed_at"] = time.monotonic()
+    result = dict(data)
+    result["refreshing"] = False
+    return result
 
 
 def clean_tts_text(value, max_chars):
@@ -2795,10 +2991,10 @@ def tts_cache_payload(text, settings):
         "text": text,
         "model": settings.get("model"),
         "voice_id": settings.get("voice_id"),
-        "format": settings.get("format"),
+        # Keep the legacy cache namespace so converted WAV files retain their keys.
+        "format": "wav",
         "style_prompt": settings.get("style_prompt"),
     }
-
 
 def tts_cache_key(text, settings):
     raw = json.dumps(tts_cache_payload(text, settings), ensure_ascii=False, sort_keys=True)
@@ -2806,7 +3002,7 @@ def tts_cache_key(text, settings):
 
 
 def tts_cache_path(cache_key, audio_format):
-    suffix = audio_format if audio_format in TTS_AUDIO_FORMATS else "wav"
+    suffix = audio_format if audio_format in TTS_AUDIO_FORMATS else "m4a"
     return TTS_CACHE_DIR / f"{cache_key}.{suffix}"
 
 
@@ -2852,8 +3048,8 @@ def tts_offline_profile_key(settings):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def tts_offline_chapter_data(book, chapter_index, settings):
-    payload = chapter_payload(book, chapter_index)
+def tts_offline_chapter_data(book, chapter_index, settings, include_cache_keys=True):
+    payload = chapter_payload(book, chapter_index, include_book=False)
     chapter = payload["chapter"]
     max_chars = int(settings.get("chunk_chars", 260))
     sentences = []
@@ -2864,17 +3060,20 @@ def tts_offline_chapter_data(book, chapter_index, settings):
             text = clean_tts_text(sentence.get("text", ""), max_chars)
             if not text or not re.search(r"[A-Za-z0-9\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", text):
                 continue
-            sentences.append({
+            item = {
                 "index": int(sentence.get("index", len(sentences))),
                 "text": text,
-                "cache_key": tts_cache_key(text, settings),
-            })
+            }
+            if include_cache_keys:
+                item["cache_key"] = tts_cache_key(text, settings)
+            sentences.append(item)
     chapter_raw = json.dumps(
         [item["text"] for item in sentences],
         ensure_ascii=False,
         separators=(",", ":"),
     )
     return {
+        "book_id": book["id"],
         "index": int(chapter.get("index", chapter_index)),
         "title": chapter.get("title", f"第 {chapter_index + 1} 章"),
         "hash": hashlib.sha256(chapter_raw.encode("utf-8")).hexdigest(),
@@ -2882,16 +3081,137 @@ def tts_offline_chapter_data(book, chapter_index, settings):
     }
 
 
-def pinned_tts_cache_keys():
+
+def tts_sentence_index_book_key(book):
+    payload = {
+        "format": book.get("format", ""),
+        "metadata_version": int(book.get("metadata_version") or 0),
+    }
+    if book.get("format") == "epub":
+        stored_name = book.get("stored_name", "")
+        source_path = book_dir(book["id"]) / stored_name if stored_name else None
+        try:
+            stat = source_path.stat() if source_path else None
+        except OSError:
+            stat = None
+        payload.update({
+            "stored_name": stored_name,
+            "source_size": int(stat.st_size) if stat else -1,
+            "source_mtime_ns": int(stat.st_mtime_ns) if stat else -1,
+            "chapters": [
+                [
+                    int(chapter.get("index", index)),
+                    chapter.get("href", ""),
+                    chapter.get("fragment", ""),
+                    chapter.get("end_fragment", ""),
+                ]
+                for index, chapter in enumerate(book.get("chapters", []))
+            ],
+        })
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def tts_sentence_index_chapter_key(book, chapter_record, fallback_index, book_key):
+    if book.get("format") == "epub":
+        payload = {
+            "book": book_key,
+            "index": int(chapter_record.get("index", fallback_index)),
+            "href": chapter_record.get("href", ""),
+            "fragment": chapter_record.get("fragment", ""),
+            "end_fragment": chapter_record.get("end_fragment", ""),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    else:
+        raw = str(chapter_record.get("text", ""))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def load_tts_sentence_index(book_id):
+    path = book_tts_sentence_index_path(book_id)
+    with READER_IO_LOCK:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_tts_sentence_index(book_id, data):
+    with READER_IO_LOCK:
+        write_json_atomic(book_tts_sentence_index_path(book_id), data)
+
+
+def ensure_tts_sentence_counts(book, settings):
+    book_id = book["id"]
+    lock = TTS_SENTENCE_INDEX_LOCKS[int(book_id[:8], 16) % len(TTS_SENTENCE_INDEX_LOCKS)]
+    max_chars = int(settings.get("chunk_chars", 260))
+    started = time.perf_counter()
+    with lock:
+        latest = read_book_record(book_id)
+        book_key = tts_sentence_index_book_key(latest)
+        cached = load_tts_sentence_index(book_id)
+        cached_entries = cached.get("chapters", {}) if (
+            cached.get("version") == TTS_SENTENCE_INDEX_VERSION
+            and cached.get("book_key") == book_key
+            and int(cached.get("chunk_chars") or 0) == max_chars
+            and isinstance(cached.get("chapters"), dict)
+        ) else {}
+        entries = {}
+        counts = {}
+        parsed = 0
+        for fallback_index, chapter_record in enumerate(latest.get("chapters", [])):
+            chapter_index = int(chapter_record.get("index", fallback_index))
+            source_key = tts_sentence_index_chapter_key(latest, chapter_record, fallback_index, book_key)
+            cached_entry = cached_entries.get(str(chapter_index), {})
+            count = cached_entry.get("sentence_count") if (
+                isinstance(cached_entry, dict) and cached_entry.get("source_key") == source_key
+            ) else None
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                chapter = tts_offline_chapter_data(
+                    latest,
+                    chapter_index,
+                    settings,
+                    include_cache_keys=False,
+                )
+                count = len(chapter["sentences"])
+                parsed += 1
+            counts[chapter_index] = count
+            entries[str(chapter_index)] = {
+                "source_key": source_key,
+                "sentence_count": count,
+            }
+        data = {
+            "version": TTS_SENTENCE_INDEX_VERSION,
+            "book_key": book_key,
+            "chunk_chars": max_chars,
+            "chapters": entries,
+        }
+        if data != cached:
+            save_tts_sentence_index(book_id, data)
+    if parsed:
+        app.logger.info(
+            "tts sentence index updated book=%s parsed=%s cached=%s elapsed=%.3fs",
+            book_id,
+            parsed,
+            len(counts) - parsed,
+            time.perf_counter() - started,
+        )
+    return latest, counts
+
+
+def pinned_tts_cache_keys(completed_only=False):
     pending_cutoff = time.time() - TTS_OFFLINE_JOB_RETENTION_SECONDS
+    where = "size_bytes > 0 AND audio_format = 'm4a'" if completed_only else "size_bytes > 0 OR created_at >= ?"
+    params = () if completed_only else (pending_cutoff,)
     with TTS_OFFLINE_LOCK:
         connection = open_tts_offline_db()
         try:
             return {
                 row["cache_key"]
                 for row in connection.execute(
-                    "SELECT DISTINCT cache_key FROM offline_tts_refs WHERE size_bytes > 0 OR created_at >= ?",
-                    (pending_cutoff,),
+                    f"SELECT DISTINCT cache_key FROM offline_tts_refs WHERE {where}",
+                    params,
                 )
             }
         finally:
@@ -2961,65 +3281,157 @@ def remove_tts_offline_ref(book_id, chapter_index, sentence_index, profile_key):
             connection.close()
 
 
-def tts_offline_book_status(book, settings):
-    profile_key = tts_offline_profile_key(settings)
+def load_tts_offline_refs_by_chapter(book_id, profile_key):
     with TTS_OFFLINE_LOCK:
         connection = open_tts_offline_db()
         try:
             rows = connection.execute(
                 """
-                SELECT chapter_index, chapter_hash, sentence_index, sentence_text, cache_key, audio_format
+                SELECT chapter_index, chapter_hash, sentence_index, sentence_text,
+                       cache_key, audio_format
                 FROM offline_tts_refs
                 WHERE book_id = ? AND profile_key = ? AND size_bytes > 0
                 """,
-                (book["id"], profile_key),
+                (book_id, profile_key),
             ).fetchall()
         finally:
             connection.close()
-    rows_by_chapter = {}
+    grouped = {}
     for row in rows:
-        rows_by_chapter.setdefault(int(row["chapter_index"]), []).append(row)
-    chapters = []
-    for index, chapter_record in enumerate(book.get("chapters", [])):
-        chapter_index = int(chapter_record.get("index", index))
-        chapter = tts_offline_chapter_data(book, chapter_index, settings)
-        sentences = {int(item["index"]): item for item in chapter["sentences"]}
-        sentence_count = 0
-        size_bytes = 0
-        cache_keys = set()
-        for row in rows_by_chapter.get(chapter_index, []):
-            sentence = sentences.get(int(row["sentence_index"]))
-            if (
-                row["chapter_hash"] != chapter["hash"]
-                or not sentence
-                or row["sentence_text"] != sentence["text"]
-                or row["cache_key"] != sentence["cache_key"]
-            ):
-                continue
-            path = tts_cache_path(row["cache_key"], row["audio_format"])
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            if not path.is_file() or stat.st_size <= 0:
-                continue
-            sentence_count += 1
-            if row["cache_key"] not in cache_keys:
-                cache_keys.add(row["cache_key"])
-                size_bytes += stat.st_size
-        chapters.append({
+        grouped.setdefault(int(row["chapter_index"]), []).append(row)
+    return grouped
+
+
+def valid_tts_offline_sentence_indexes_from_rows(chapter, rows):
+    expected = {int(item["index"]): item for item in chapter["sentences"]}
+    valid = set()
+    for row in rows:
+        sentence = expected.get(int(row["sentence_index"]))
+        if (
+            row["audio_format"] != "m4a"
+            or row["chapter_hash"] != chapter["hash"]
+            or not sentence
+            or row["sentence_text"] != sentence["text"]
+            or row["cache_key"] != sentence["cache_key"]
+        ):
+            continue
+        path = tts_cache_path(row["cache_key"], "m4a")
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                valid.add(int(row["sentence_index"]))
+        except OSError:
+            continue
+    return valid
+
+
+def valid_tts_offline_sentence_indexes(book_id, chapter, profile_key):
+    rows = load_tts_offline_refs_by_chapter(book_id, profile_key).get(int(chapter["index"]), [])
+    return valid_tts_offline_sentence_indexes_from_rows(chapter, rows)
+
+
+def valid_tts_offline_pack(book_id, chapter, spec, profile_key, valid_sentences=None):
+    required = {int(item["index"]) for item in spec["sentences"]}
+    if valid_sentences is None:
+        valid_sentences = valid_tts_offline_sentence_indexes(book_id, chapter, profile_key)
+    if not required or not required.issubset(valid_sentences):
+        return None
+    manifest = load_tts_pack_manifest(spec["pack_key"])
+    if not tts_pack_manifest_matches(manifest, book_id, chapter, spec, profile_key):
+        return None
+    segment_indexes = {int(item.get("index", -1)) for item in manifest.get("segments", [])}
+    return manifest if segment_indexes == required else None
+
+
+def tts_offline_chapter_status(
+    book,
+    chapter_record,
+    fallback_index,
+    settings,
+    profile_key,
+    chapter_rows=None,
+    inspect=False,
+    known_sentence_count=None,
+):
+    chapter_index = int(chapter_record.get("index", fallback_index))
+    rows = list(chapter_rows or [])
+    if not rows and not inspect:
+        if known_sentence_count is None:
+            known_sentence_count = len(tts_offline_chapter_data(
+                book, chapter_index, settings, include_cache_keys=False,
+            )["sentences"])
+        return {
             "index": chapter_index,
-            "title": display_chapter_title(chapter_record, index),
-            "chapter_hash": chapter["hash"],
-            "server_sentences": sentence_count,
-            "total_sentences": len(chapter["sentences"]),
-            "server_size_bytes": size_bytes,
-        })
+            "title": display_chapter_title(chapter_record, fallback_index),
+            "chapter_hash": "",
+            "server_sentences": 0,
+            "total_sentences": int(known_sentence_count),
+            "server_packs": 0,
+            "total_packs": None,
+            "server_size_bytes": 0,
+            "server_sentence_size_bytes": 0,
+            "server_pack_size_bytes": 0,
+        }
+
+    chapter = tts_offline_chapter_data(book, chapter_index, settings)
+    valid_sentences = valid_tts_offline_sentence_indexes_from_rows(chapter, rows)
+    sentence_size_bytes = 0
+    seen_sentence_keys = set()
+    for sentence in chapter["sentences"]:
+        if sentence["index"] not in valid_sentences or sentence["cache_key"] in seen_sentence_keys:
+            continue
+        seen_sentence_keys.add(sentence["cache_key"])
+        try:
+            sentence_size_bytes += tts_cache_path(sentence["cache_key"], "m4a").stat().st_size
+        except OSError:
+            pass
+    pack_size_bytes = 0
+    pack_count = 0
+    specs = tts_pack_specs(chapter, settings)
+    for spec in specs:
+        manifest = valid_tts_offline_pack(book["id"], chapter, spec, profile_key, valid_sentences)
+        if not manifest:
+            continue
+        pack_count += 1
+        pack_size_bytes += int(manifest.get(
+            "cache_size_bytes",
+            manifest.get("size_bytes", 0),
+        ))
+    return {
+        "index": chapter_index,
+        "title": display_chapter_title(chapter_record, fallback_index),
+        "chapter_hash": chapter["hash"],
+        "server_sentences": len(valid_sentences),
+        "total_sentences": len(chapter["sentences"]),
+        "server_packs": pack_count,
+        "total_packs": len(specs),
+        "server_size_bytes": sentence_size_bytes + pack_size_bytes,
+        "server_sentence_size_bytes": sentence_size_bytes,
+        "server_pack_size_bytes": pack_size_bytes,
+    }
+
+
+def tts_offline_book_status(book, settings):
+    book, sentence_counts = ensure_tts_sentence_counts(book, settings)
+    profile_key = tts_offline_profile_key(settings)
+    refs_by_chapter = load_tts_offline_refs_by_chapter(book["id"], profile_key)
+    chapters = [
+        tts_offline_chapter_status(
+            book,
+            chapter_record,
+            index,
+            settings,
+            profile_key,
+            refs_by_chapter.get(int(chapter_record.get("index", index)), []),
+            known_sentence_count=sentence_counts[int(chapter_record.get("index", index))],
+        )
+        for index, chapter_record in enumerate(book.get("chapters", []))
+    ]
     voice_id = settings.get("voice_id") or "mimo_default"
     voice = next((item for item in TTS_VOICE_OPTIONS if item.get("id") == voice_id), None)
     return {
         "profile_key": profile_key,
         "profile_label": (voice or {}).get("name") or voice_id,
+        "pack_schema_version": TTS_PACK_SCHEMA_VERSION,
         "chapters": chapters,
     }
 
@@ -3028,36 +3440,18 @@ def tts_offline_chapter_manifest(book, chapter_index, config):
     settings = config["reader_tts"]
     profile_key = tts_offline_profile_key(settings)
     chapter = tts_offline_chapter_data(book, chapter_index, settings)
-    with TTS_OFFLINE_LOCK:
-        connection = open_tts_offline_db()
-        try:
-            rows = connection.execute(
-                """
-                SELECT sentence_index, sentence_text, cache_key, audio_format, size_bytes
-                FROM offline_tts_refs
-                WHERE book_id = ? AND chapter_index = ? AND chapter_hash = ? AND profile_key = ? AND size_bytes > 0
-                """,
-                (book["id"], chapter["index"], chapter["hash"], profile_key),
-            ).fetchall()
-        finally:
-            connection.close()
-    cached = {int(row["sentence_index"]): row for row in rows}
+    valid_sentences = valid_tts_offline_sentence_indexes(book["id"], chapter, profile_key)
     entries = []
-    for sentence in chapter["sentences"]:
-        row = cached.get(sentence["index"])
-        if not row or row["sentence_text"] != sentence["text"] or row["cache_key"] != sentence["cache_key"]:
+    specs = tts_pack_specs(chapter, settings)
+    for position, spec in enumerate(specs):
+        manifest = valid_tts_offline_pack(book["id"], chapter, spec, profile_key, valid_sentences)
+        if not manifest:
             continue
-        path = tts_cache_path(row["cache_key"], row["audio_format"])
-        if not path.is_file() or path.stat().st_size <= 0:
-            continue
-        entries.append({
-            "sentence_index": sentence["index"],
-            "text": sentence["text"],
-            "cache_key": row["cache_key"],
-            "format": row["audio_format"],
-            "size_bytes": path.stat().st_size,
-            "url": f"/api/books/{book['id']}/tts-offline/audio/{row['cache_key']}",
-        })
+        entries.append(public_tts_pack_manifest(
+            manifest,
+            f"/api/books/{book['id']}/tts-offline/chapters/{chapter['index']}/packs/{spec['pack_key']}",
+            specs[position + 1:],
+        ))
     return {
         "book_id": book["id"],
         "chapter_index": chapter["index"],
@@ -3065,6 +3459,7 @@ def tts_offline_chapter_manifest(book, chapter_index, config):
         "chapter_hash": chapter["hash"],
         "profile_key": profile_key,
         "sentence_count": len(chapter["sentences"]),
+        "pack_count": len(specs),
         "entries": entries,
     }
 
@@ -3094,7 +3489,8 @@ def public_tts_offline_job(job):
         for key in (
             "id", "book_id", "chapter_indexes", "status", "message", "progress", "total_sentences",
             "completed_sentences", "failed_sentences", "cached_sentences", "generated_sentences",
-            "size_bytes", "error", "cancel_requested", "created_at", "updated_at",
+            "total_packs", "completed_packs", "failed_packs", "size_bytes", "error",
+            "cancel_requested", "created_at", "updated_at",
         )
     }
 
@@ -3129,6 +3525,7 @@ def process_tts_offline_job(job_id, book_id, chapter_indexes):
         book = read_book_record(book_id)
         chapters = [tts_offline_chapter_data(book, index, settings) for index in chapter_indexes]
         total = sum(len(chapter["sentences"]) for chapter in chapters)
+        total_packs = sum(len(tts_pack_specs(chapter, settings)) for chapter in chapters)
         if tts_offline_job_cancel_requested(job_id):
             update_tts_offline_job(job_id, status="cancelled", message="任务已取消", total_sentences=total)
             return
@@ -3141,14 +3538,17 @@ def process_tts_offline_job(job_id, book_id, chapter_indexes):
             status="running",
             message=message,
             total_sentences=total,
+            total_packs=total_packs,
         )
         profile_key = tts_offline_profile_key(settings)
-        audio_format = settings.get("format", "wav")
+        audio_format = "m4a"
         stats = {
             "completed_sentences": 0,
             "failed_sentences": 0,
             "cached_sentences": 0,
             "generated_sentences": 0,
+            "completed_packs": 0,
+            "failed_packs": 0,
             "size_bytes": 0,
             "error": "",
         }
@@ -3191,6 +3591,44 @@ def process_tts_offline_job(job_id, book_id, chapter_indexes):
                         stats["error"] = error
                     update_tts_offline_job(job_id, **stats)
 
+            if tts_offline_job_cancel_requested(job_id):
+                return
+            valid_sentences = valid_tts_offline_sentence_indexes(book_id, chapter, profile_key)
+            pack_specs = tts_pack_specs(chapter, settings)
+            if pack_specs:
+                update_tts_offline_job(job_id, message="正在生成固定播放包")
+
+            def process_pack(spec):
+                if tts_offline_job_cancel_requested(job_id):
+                    return
+                required = {int(item["index"]) for item in spec["sentences"]}
+                succeeded = False
+                error = ""
+                try:
+                    if not required.issubset(valid_sentences):
+                        raise ValueError("播放包包含生成失败的句子")
+                    build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=False)
+                    succeeded = True
+                except Exception as exc:
+                    error = str(exc)
+                with stats_lock:
+                    if succeeded:
+                        stats["completed_packs"] += 1
+                    else:
+                        stats["failed_packs"] += 1
+                        stats["error"] = error
+                    update_tts_offline_job(job_id, **stats)
+
+            pack_worker_count = min(TTS_OFFLINE_PACK_WORKERS, len(pack_specs))
+            if pack_worker_count == 1:
+                process_pack(pack_specs[0])
+            elif pack_worker_count > 1:
+                with ThreadPoolExecutor(
+                    max_workers=pack_worker_count,
+                    thread_name_prefix="tts-offline-pack",
+                ) as executor:
+                    list(executor.map(process_pack, pack_specs))
+
         if worker_count == 1:
             process_chapter(chapters[0])
         else:
@@ -3200,11 +3638,15 @@ def process_tts_offline_job(job_id, book_id, chapter_indexes):
             ) as executor:
                 list(executor.map(process_chapter, chapters))
 
+        maybe_prune_tts_pack_cache(force=True)
+
         with stats_lock:
             final_stats = dict(stats)
         cached = final_stats["cached_sentences"]
         generated = final_stats["generated_sentences"]
         failed = final_stats["failed_sentences"]
+        completed_packs = final_stats["completed_packs"]
+        failed_packs = final_stats["failed_packs"]
         total_size = final_stats["size_bytes"]
         if tts_offline_job_cancel_requested(job_id):
             message = f"已取消：复用 {cached} 句，生成 {generated} 句"
@@ -3224,6 +3666,9 @@ def process_tts_offline_job(job_id, book_id, chapter_indexes):
         message = f"完成：复用 {cached} 句，生成 {generated} 句"
         if failed:
             message += f"，失败 {failed} 句"
+        message += f"；播放包 {completed_packs}/{total_packs}"
+        if failed_packs:
+            message += f"，失败 {failed_packs} 包"
         update_tts_offline_job(job_id, status="done", message=message)
         app.logger.info(
             "tts offline job done book=%s chapters=%s cached=%s generated=%s failed=%s bytes=%s",
@@ -3237,6 +3682,8 @@ def process_tts_offline_job(job_id, book_id, chapter_indexes):
     except Exception as exc:
         app.logger.warning("tts offline job failed book=%s error=%s", book_id, exc)
         update_tts_offline_job(job_id, status="error", message="服务器固定缓存失败", error=str(exc))
+    finally:
+        invalidate_tts_cache_stats(refresh=True)
 
 
 def delete_tts_offline_refs(book_id, chapter_indexes=None, profile_key=None, delete_files=False):
@@ -3272,9 +3719,18 @@ def delete_tts_offline_refs(book_id, chapter_indexes=None, profile_key=None, del
         finally:
             connection.close()
     affected_size = sum(max(0, int(row["size_bytes"] or 0)) for row in rows)
-    removed_size = 0
+    with TTS_PACK_CACHE_LOCK:
+        removed_packs = delete_unpinned_tts_pack_files(book_id, chapter_indexes, profile_key)
+    removed_size = int(removed_packs["size_bytes"])
     if not delete_files:
-        return {"entries": len(rows), "size_bytes": affected_size, "removed_size_bytes": 0}
+        result = {
+            "entries": len(rows),
+            "pack_entries": removed_packs["entries"],
+            "size_bytes": affected_size + removed_size,
+            "removed_size_bytes": removed_size,
+        }
+        invalidate_tts_cache_stats(refresh=True)
+        return result
     for row in rows:
         if row["cache_key"] in remaining:
             continue
@@ -3284,7 +3740,98 @@ def delete_tts_offline_refs(book_id, chapter_indexes=None, profile_key=None, del
             path.unlink()
         except OSError:
             pass
-    return {"entries": len(rows), "size_bytes": affected_size, "removed_size_bytes": removed_size}
+    result = {
+        "entries": len(rows),
+        "pack_entries": removed_packs["entries"],
+        "size_bytes": affected_size + removed_packs["size_bytes"],
+        "removed_size_bytes": removed_size,
+    }
+    invalidate_tts_cache_stats(refresh=True)
+    return result
+
+
+def pinned_tts_pack_keys():
+    if not TTS_PACK_CACHE_DIR.is_dir():
+        return set()
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            rows = connection.execute(
+                """
+                SELECT book_id, chapter_index, chapter_hash, profile_key, sentence_index,
+                       cache_key, audio_format
+                FROM offline_tts_refs WHERE size_bytes > 0
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+    references = set()
+    for row in rows:
+        path = tts_cache_path(row["cache_key"], row["audio_format"])
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        references.add((
+            row["book_id"], int(row["chapter_index"]), row["chapter_hash"],
+            row["profile_key"], int(row["sentence_index"]),
+        ))
+    pinned = set()
+    for manifest_path in TTS_PACK_CACHE_DIR.glob("*.json"):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("kind", "chapter") != "chapter":
+                continue
+            identity = (
+                manifest["book_id"], int(manifest["chapter_index"]),
+                manifest["chapter_hash"], manifest["profile_key"],
+            )
+            required = {identity + (int(segment["index"]),) for segment in manifest["segments"]}
+            pack_key = manifest["pack_key"]
+        except (OSError, KeyError, TypeError, ValueError):
+            continue
+        if required and required.issubset(references):
+            pinned.add(pack_key)
+    return pinned
+
+
+def delete_unpinned_tts_pack_files(book_id, chapter_indexes=None, profile_key=None):
+    selected = None if chapter_indexes is None else {int(index) for index in chapter_indexes}
+    entries = 0
+    size_bytes = 0
+    if not TTS_PACK_CACHE_DIR.is_dir():
+        return {"entries": 0, "size_bytes": 0}
+    pinned_keys = pinned_tts_pack_keys()
+    for manifest_path in TTS_PACK_CACHE_DIR.glob("*.json"):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        pack_key = manifest_path.stem
+        if not re.fullmatch(r"[0-9a-f]{64}", pack_key) or manifest.get("pack_key") != pack_key:
+            continue
+        if manifest.get("book_id") != book_id:
+            continue
+        if selected is not None and int(manifest.get("chapter_index", -1)) not in selected:
+            continue
+        if profile_key and manifest.get("profile_key") != profile_key:
+            continue
+        if pack_key in pinned_keys:
+            continue
+        audio_path, stored_manifest_path = tts_pack_cache_paths(pack_key)
+        try:
+            size_bytes += audio_path.stat().st_size
+        except OSError:
+            pass
+        for candidate in (audio_path, stored_manifest_path):
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+        entries += 1
+    return {"entries": entries, "size_bytes": size_bytes}
+
 
 def find_cached_tts(cache_path):
     if not cache_path.exists():
@@ -3293,9 +3840,11 @@ def find_cached_tts(cache_path):
         stat = cache_path.stat()
         if not cache_path.is_file() or stat.st_size <= 0:
             cache_path.unlink(missing_ok=True)
+            invalidate_tts_cache_stats()
             return None
         if time.time() - stat.st_mtime > tts_cache_ttl_seconds() and not is_tts_cache_pinned(cache_path.stem):
             cache_path.unlink()
+            invalidate_tts_cache_stats()
             return None
         os.chmod(cache_path, 0o600)
         os.utime(cache_path, None)
@@ -3328,7 +3877,7 @@ def prune_tts_cache():
             continue
         files.append((stat.st_mtime, stat.st_size, path))
         total += stat.st_size
-    limit = tts_cache_limit_bytes()
+    limit = max(5 * 1024 * 1024, tts_cache_limit_bytes() // 2)
     if total <= limit:
         return
     for _, size, path in sorted(files):
@@ -3339,6 +3888,98 @@ def prune_tts_cache():
             continue
         if total <= limit:
             break
+
+
+def prune_tts_pack_cache():
+    ensure_private_directory(TTS_PACK_CACHE_DIR)
+    now = time.time()
+    ttl = tts_cache_ttl_seconds()
+    candidates = []
+    total = 0
+    pinned_keys = pinned_tts_pack_keys()
+    for manifest_path in TTS_PACK_CACHE_DIR.glob("*.json"):
+        pack_key = manifest_path.stem
+        try:
+            indexed = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            indexed = None
+        if (
+            not isinstance(indexed, dict)
+            or not re.fullmatch(r"[0-9a-f]{64}", pack_key)
+            or indexed.get("pack_key") != pack_key
+        ):
+            for candidate in tts_pack_cache_paths(pack_key):
+                try:
+                    candidate.unlink()
+                except OSError:
+                    pass
+            continue
+        manifest = load_tts_pack_manifest(pack_key)
+        if not manifest:
+            for candidate in tts_pack_cache_paths(pack_key):
+                try:
+                    candidate.unlink()
+                except OSError:
+                    pass
+            continue
+        if manifest.get("audio_source") != "tts_cache":
+            continue
+        if pack_key in pinned_keys:
+            continue
+        try:
+            if now - manifest_path.stat().st_mtime > ttl:
+                manifest_path.unlink()
+        except OSError:
+            pass
+    for audio_path in TTS_PACK_CACHE_DIR.glob("*.m4a"):
+        manifest = load_tts_pack_manifest(audio_path.stem)
+        if not manifest:
+            for candidate in tts_pack_cache_paths(audio_path.stem):
+                try:
+                    candidate.unlink()
+                except OSError:
+                    pass
+            continue
+        try:
+            stat = audio_path.stat()
+        except OSError:
+            continue
+        if audio_path.stem in pinned_keys:
+            continue
+        _, manifest_path = tts_pack_cache_paths(audio_path.stem)
+        if now - stat.st_mtime > ttl:
+            for candidate in (audio_path, manifest_path):
+                try:
+                    candidate.unlink()
+                except OSError:
+                    pass
+            continue
+        candidates.append((stat.st_mtime, stat.st_size, audio_path, manifest_path))
+        total += stat.st_size
+    limit = max(5 * 1024 * 1024, tts_cache_limit_bytes() // 2)
+    for _, size, audio_path, manifest_path in sorted(candidates):
+        if total <= limit:
+            break
+        for candidate in (audio_path, manifest_path):
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+        total -= size
+
+
+def maybe_prune_tts_pack_cache(force=False):
+    now = time.monotonic()
+    with TTS_PACK_CACHE_LOCK:
+        if not force and now - TTS_PACK_PRUNE_STATE["time"] < TTS_PACK_PRUNE_INTERVAL_SECONDS:
+            return False
+        TTS_PACK_PRUNE_STATE["time"] = now
+        try:
+            prune_tts_pack_cache()
+        except (OSError, sqlite3.Error) as exc:
+            app.logger.warning("tts pack cache prune failed error=%s", exc)
+            return False
+    return True
 
 
 def decode_mimo_audio_payload(payload):
@@ -3368,8 +4009,601 @@ def decode_mimo_audio_payload(payload):
     return data
 
 
+
+def transcode_wav_to_aac(data):
+    if not data:
+        raise ValueError("MiMo TTS 返回的音频为空")
+    try:
+        with tempfile.TemporaryDirectory(prefix="trans-tts-") as temporary_dir:
+            output_path = Path(temporary_dir) / "audio.m4a"
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "wav",
+                    "-i",
+                    "pipe:0",
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "24000",
+                    "-c:a",
+                    "aac",
+                    "-profile:a",
+                    "aac_low",
+                    "-b:a",
+                    "80k",
+                    "-movflags",
+                    "+faststart",
+                    "-f",
+                    "ipod",
+                    str(output_path),
+                ],
+                input=data,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=45,
+                check=False,
+            )
+            if result.returncode != 0 or not output_path.is_file():
+                detail = result.stderr.decode("utf-8", "replace").strip()[:300]
+                raise ValueError("AAC 音频转码失败" + (f": {detail}" if detail else ""))
+            if output_path.stat().st_size > MAX_TTS_AUDIO_BYTES:
+                raise ValueError("AAC 音频过大")
+            encoded = output_path.read_bytes()
+    except FileNotFoundError as exc:
+        raise ValueError("服务器未安装 ffmpeg，无法生成 AAC 音频") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("AAC 音频转码超时") from exc
+    except OSError as exc:
+        raise ValueError("AAC 音频临时文件处理失败") from exc
+    if not encoded:
+        raise ValueError("AAC 音频转码结果为空")
+    return encoded
+
+def iso_bmff_boxes(data, start=0, end=None):
+    limit = len(data) if end is None else min(int(end), len(data))
+    position = max(0, int(start))
+    while position + 8 <= limit:
+        size = struct.unpack_from(">I", data, position)[0]
+        box_type = data[position + 4:position + 8]
+        header_size = 8
+        if size == 1:
+            if position + 16 > limit:
+                raise ValueError("M4A 扩展容器头无效")
+            size = struct.unpack_from(">Q", data, position + 8)[0]
+            header_size = 16
+        elif size == 0:
+            size = limit - position
+        if size < header_size or position + size > limit:
+            raise ValueError("M4A 容器长度无效")
+        yield box_type, position + header_size, position + size
+        position += size
+
+
+def iso_bmff_child(data, start, end, expected_type):
+    return next(
+        ((payload_start, box_end) for box_type, payload_start, box_end in iso_bmff_boxes(data, start, end)
+         if box_type == expected_type),
+        None,
+    )
+
+
+def m4a_container_duration(path):
+    data = path.read_bytes()
+    moov = iso_bmff_child(data, 0, len(data), b"moov")
+    if not moov:
+        raise ValueError("M4A 缺少 moov 容器")
+    movie_header = iso_bmff_child(data, *moov, b"mvhd")
+    if not movie_header:
+        raise ValueError("M4A 缺少 mvhd 时间轴")
+    has_audio = False
+    for box_type, track_start, track_end in iso_bmff_boxes(data, *moov):
+        if box_type != b"trak":
+            continue
+        media = iso_bmff_child(data, track_start, track_end, b"mdia")
+        if not media:
+            continue
+        handler = iso_bmff_child(data, *media, b"hdlr")
+        if handler and handler[0] + 12 <= handler[1] and data[handler[0] + 8:handler[0] + 12] == b"soun":
+            has_audio = True
+            break
+    if not has_audio:
+        raise ValueError("M4A 缺少音频轨道")
+    payload_start, payload_end = movie_header
+    if payload_start >= payload_end:
+        raise ValueError("M4A 时间轴为空")
+    version = data[payload_start]
+    if version == 0 and payload_start + 20 <= payload_end:
+        timescale = struct.unpack_from(">I", data, payload_start + 12)[0]
+        duration_ticks = struct.unpack_from(">I", data, payload_start + 16)[0]
+    elif version == 1 and payload_start + 32 <= payload_end:
+        timescale = struct.unpack_from(">I", data, payload_start + 20)[0]
+        duration_ticks = struct.unpack_from(">Q", data, payload_start + 24)[0]
+    else:
+        raise ValueError("M4A 时间轴版本无效")
+    if not timescale or not duration_ticks:
+        raise ValueError("M4A 时间轴无效")
+    duration = duration_ticks / timescale
+    if not duration > 0:
+        raise ValueError("M4A 音频时长无效")
+    return duration
+
+
+def tts_audio_duration(path):
+    try:
+        return m4a_container_duration(path)
+    except (OSError, ValueError, struct.error):
+        pass
+    try:
+        result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("服务器未安装 ffprobe，无法生成播放包时间轴") from exc
+    if result.returncode != 0:
+        raise ValueError("无法读取 AAC 音频时长")
+    try:
+        duration = float(result.stdout.strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AAC 音频时长无效") from exc
+    if not duration > 0:
+        raise ValueError("AAC 音频时长无效")
+    return duration
+
+def estimate_tts_duration(text):
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if not compact:
+        return 0.0
+    latin_tokens = re.findall(r"[A-Za-z0-9]+", compact)
+    latin_words = len(latin_tokens)
+    cjk_chars = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", compact))
+    punctuation = len(re.findall(r"[，。！？；：,.!?;:]", compact))
+    other = max(0, len(compact) - cjk_chars - sum(len(word) for word in latin_tokens))
+    return max(0.8, cjk_chars / 4.6 + latin_words / 2.5 + other / 5.0 + punctuation * 0.12)
+
+
+def tts_pack_sentence_groups(chapter):
+    groups = []
+    current = []
+    estimated = 0.0
+
+    for sentence in chapter["sentences"]:
+        current.append(sentence)
+        estimated += estimate_tts_duration(sentence["text"])
+        if estimated >= TTS_PACK_MIN_SECONDS:
+            groups.append(current)
+            current = []
+            estimated = 0.0
+
+    if current:
+        if groups:
+            groups[-1].extend(current)
+        else:
+            groups.append(current)
+    return groups
+
+
+def tts_pack_specs(chapter, settings):
+    profile_key = tts_offline_profile_key(settings)
+    groups = []
+    for current in tts_pack_sentence_groups(chapter):
+        estimated = sum(estimate_tts_duration(item["text"]) for item in current)
+        payload = {
+            "schema": TTS_PACK_SCHEMA_VERSION,
+            "kind": "chapter",
+            "book_id": chapter["book_id"],
+            "chapter_index": int(chapter["index"]),
+            "profile_key": profile_key,
+            "chapter_hash": chapter["hash"],
+            "sentences": [[item["index"], item["cache_key"]] for item in current],
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        groups.append({
+            "kind": "chapter",
+            "pack_key": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "start_sentence_index": current[0]["index"],
+            "end_sentence_index": current[-1]["index"],
+            "sentence_count": len(current),
+            "estimated_duration": round(estimated, 3),
+            "sentences": list(current),
+        })
+    return groups
+
+
+def tts_pack_cache_paths(pack_key):
+    return TTS_PACK_CACHE_DIR / f"{pack_key}.m4a", TTS_PACK_CACHE_DIR / f"{pack_key}.json"
+
+
+def indexed_tts_pack_key_matches(manifest):
+    if manifest.get("audio_source") != "tts_cache":
+        return True
+    try:
+        segment = manifest["segments"][0]
+        payload = {
+            "schema": TTS_PACK_SCHEMA_VERSION,
+            "kind": manifest.get("kind", "chapter"),
+            "book_id": manifest["book_id"],
+            "chapter_index": int(manifest["chapter_index"]),
+            "profile_key": manifest["profile_key"],
+            "chapter_hash": manifest["chapter_hash"],
+            "sentences": [[
+                int(segment["index"]),
+                manifest["audio_cache_key"],
+            ]],
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest() == manifest["pack_key"]
+    except (IndexError, KeyError, TypeError, ValueError):
+        return False
+
+
+def tts_pack_audio_path(manifest):
+    if manifest.get("audio_source") == "tts_cache":
+        cache_key = str(manifest.get("audio_cache_key") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", cache_key):
+            raise ValueError("单句播放包索引无效")
+        return tts_cache_path(cache_key, "m4a")
+    return tts_pack_cache_paths(manifest["pack_key"])[0]
+
+
+def touch_tts_pack_cache(pack_key, manifest=None):
+    current = manifest or load_tts_pack_manifest(pack_key)
+    paths = [tts_pack_cache_paths(pack_key)[1]]
+    if current:
+        try:
+            paths.append(tts_pack_audio_path(current))
+        except (KeyError, TypeError, ValueError):
+            pass
+    else:
+        paths.append(tts_pack_cache_paths(pack_key)[0])
+    for path in paths:
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
+
+
+def tts_pack_key_lock(pack_key):
+    return TTS_PACK_KEY_LOCKS[int(pack_key[:8], 16) % len(TTS_PACK_KEY_LOCKS)]
+
+
+def load_tts_pack_manifest(pack_key):
+    _, manifest_path = tts_pack_cache_paths(pack_key)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return None
+        audio_path = tts_pack_audio_path(manifest)
+        audio_size = audio_path.stat().st_size
+    except (KeyError, OSError, ValueError, TypeError):
+        return None
+    audio_source = manifest.get("audio_source", "pack_cache")
+    size_limit = MAX_TTS_AUDIO_BYTES if audio_source == "tts_cache" else MAX_TTS_PACK_BYTES
+    if (
+        manifest.get("pack_key") != pack_key
+        or int(manifest.get("schema_version", 0)) != TTS_PACK_SCHEMA_VERSION
+        or not isinstance(manifest.get("segments"), list)
+        or not manifest["segments"]
+        or audio_source not in {"pack_cache", "tts_cache"}
+        or not indexed_tts_pack_key_matches(manifest)
+        or audio_size <= 0
+        or audio_size > size_limit
+        or (
+            audio_source == "tts_cache"
+            and (
+                int(manifest.get("sentence_count", 0)) != 1
+                or len(manifest["segments"]) != 1
+            )
+        )
+    ):
+        return None
+    previous_end = 0.0
+    first_segment = True
+    try:
+        for segment in manifest["segments"]:
+            start = float(segment["start"])
+            end = float(segment["end"])
+            int(segment["index"])
+            if (first_segment and abs(start) > 0.05) or start < previous_end - 0.01 or end <= start:
+                return None
+            first_segment = False
+            previous_end = end
+        if int(manifest.get("sentence_count", 0)) != len(manifest["segments"]):
+            return None
+        duration = float(manifest.get("duration", 0))
+        if duration < TTS_PACK_MIN_SECONDS - 0.05 or abs(previous_end - duration) > 0.1:
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    return manifest
+
+
+def tts_pack_manifest_matches(manifest, book_id, chapter, spec, profile_key):
+    if not manifest:
+        return False
+    try:
+        if (
+            manifest.get("kind", "chapter") != spec.get("kind", "chapter")
+            or manifest.get("book_id") != book_id
+            or int(manifest.get("chapter_index", -1)) != int(chapter["index"])
+            or manifest.get("chapter_hash") != chapter["hash"]
+            or manifest.get("profile_key") != profile_key
+            or int(manifest.get("start_sentence_index", -1)) != int(spec["start_sentence_index"])
+            or int(manifest.get("end_sentence_index", -1)) != int(spec["end_sentence_index"])
+            or int(manifest.get("sentence_count", 0)) != int(spec["sentence_count"])
+        ):
+            return False
+        expected = [(int(item["index"]), item["text"]) for item in spec["sentences"]]
+        actual = [
+            (int(item.get("index", -1)), item.get("text", ""))
+            for item in manifest.get("segments", [])
+        ]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return actual == expected
+
+
+def reader_tts_pack_manifest(
+    book_id,
+    chapter,
+    spec,
+    profile_key,
+    duration,
+    size_bytes,
+    segments,
+    **extra,
+):
+    return {
+        "schema_version": TTS_PACK_SCHEMA_VERSION,
+        "kind": "chapter",
+        "pack_key": spec["pack_key"],
+        "book_id": book_id,
+        "chapter_index": int(chapter["index"]),
+        "chapter_hash": chapter["hash"],
+        "profile_key": profile_key,
+        "start_sentence_index": spec["start_sentence_index"],
+        "end_sentence_index": spec["end_sentence_index"],
+        "sentence_count": spec["sentence_count"],
+        "duration": round(duration, 3),
+        "size_bytes": int(size_bytes),
+        "segments": segments,
+        "created_at": time.time(),
+        **extra,
+    }
+
+
+def index_single_sentence_tts_pack(book_id, chapter, spec, profile_key):
+    if int(spec.get("sentence_count", 0)) != 1 or len(spec.get("sentences", [])) != 1:
+        return None
+    sentence = spec["sentences"][0]
+    cache_key = str(sentence.get("cache_key") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", cache_key):
+        return None
+    with TTS_CACHE_LOCK:
+        source_path = find_cached_tts(tts_cache_path(cache_key, "m4a"))
+    if source_path is None:
+        return None
+    try:
+        source_size = source_path.stat().st_size
+        if source_size > MAX_TTS_AUDIO_BYTES:
+            return None
+        duration = tts_audio_duration(source_path)
+    except (OSError, ValueError):
+        return None
+    if duration < TTS_PACK_MIN_SECONDS:
+        return None
+    manifest = reader_tts_pack_manifest(
+        book_id,
+        chapter,
+        spec,
+        profile_key,
+        duration,
+        source_size,
+        [{
+            "index": int(sentence["index"]),
+            "start": 0.0,
+            "end": round(duration, 3),
+            "text": sentence["text"],
+        }],
+        audio_source="tts_cache",
+        audio_cache_key=cache_key,
+        cache_size_bytes=0,
+    )
+    audio_path, manifest_path = tts_pack_cache_paths(spec["pack_key"])
+    with TTS_PACK_CACHE_LOCK:
+        write_json_atomic(manifest_path, manifest)
+        try:
+            audio_path.unlink()
+        except OSError:
+            pass
+    invalidate_tts_cache_stats()
+    return manifest
+
+
+def public_tts_pack_manifest(manifest, audio_url, next_specs=None):
+    following = list(next_specs or [])
+    return {
+        "schema_version": TTS_PACK_SCHEMA_VERSION,
+        "kind": manifest.get("kind", "chapter"),
+        "pack_key": manifest["pack_key"],
+        "book_id": manifest["book_id"],
+        "chapter_index": int(manifest["chapter_index"]),
+        "chapter_hash": manifest["chapter_hash"],
+        "profile_key": manifest["profile_key"],
+        "start_sentence_index": int(manifest["start_sentence_index"]),
+        "end_sentence_index": int(manifest["end_sentence_index"]),
+        "sentence_count": int(manifest["sentence_count"]),
+        "duration": float(manifest["duration"]),
+        "size_bytes": int(manifest["size_bytes"]),
+        "format": "m4a",
+        "segments": manifest["segments"],
+        "url": audio_url,
+        "next_start_sentence_indexes": [
+            int(spec["start_sentence_index"])
+            for spec in following[:TTS_PACK_PREFETCH_HINT_LIMIT]
+        ],
+        "remaining_pack_count": len(following),
+    }
+
+
+def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True):
+    pack_key = spec["pack_key"]
+    audio_path, manifest_path = tts_pack_cache_paths(pack_key)
+    with tts_pack_key_lock(pack_key):
+        settings = config["reader_tts"]
+        profile_key = tts_offline_profile_key(settings)
+        cached = load_tts_pack_manifest(pack_key)
+        if tts_pack_manifest_matches(cached, book_id, chapter, spec, profile_key):
+            touch_tts_pack_cache(pack_key, cached)
+            return cached
+        if cached:
+            for candidate in (audio_path, manifest_path):
+                try:
+                    candidate.unlink()
+                except OSError:
+                    pass
+        with TTS_PACK_BUILD_SEMAPHORE:
+            ensure_private_directory(TTS_PACK_CACHE_DIR)
+            try:
+                if settings.get("cache_enabled", True):
+                    indexed = index_single_sentence_tts_pack(
+                        book_id, chapter, spec, profile_key,
+                    )
+                    if indexed:
+                        if prune_cache:
+                            maybe_prune_tts_pack_cache()
+                        return indexed
+                with tempfile.TemporaryDirectory(prefix="trans-tts-pack-") as temporary_dir:
+                    temporary_root = Path(temporary_dir)
+                    segments = []
+                    offset = 0.0
+                    list_lines = []
+                    for position, sentence in enumerate(spec["sentences"]):
+                        input_path = temporary_root / f"sentence-{position}.m4a"
+                        result = synthesize_reader_tts(sentence["text"], config)
+                        source_path = result.get("path")
+                        if source_path and len(spec["sentences"]) == 1:
+                            indexed = index_single_sentence_tts_pack(
+                                book_id, chapter, spec, profile_key,
+                            )
+                            if indexed:
+                                if prune_cache:
+                                    maybe_prune_tts_pack_cache()
+                                return indexed
+                        if source_path:
+                            with TTS_CACHE_LOCK:
+                                shutil.copyfile(source_path, input_path)
+                        else:
+                            write_private_bytes_atomic(input_path, result.get("data", b""))
+                        duration = tts_audio_duration(input_path)
+                        segments.append({
+                            "index": int(sentence["index"]),
+                            "start": round(offset, 3),
+                            "end": round(offset + duration, 3),
+                            "text": sentence["text"],
+                        })
+                        offset += duration
+                        list_lines.append(f"file '{input_path.name}'\n")
+                    list_path = temporary_root / "concat.txt"
+                    list_path.write_text("".join(list_lines), encoding="utf-8")
+                    output_path = temporary_root / "pack.m4a"
+                    copy_command = [
+                        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "concat", "-safe", "1", "-i", list_path.name,
+                        "-map", "0:a:0", "-c:a", "copy", "-movflags", "+faststart",
+                        "-f", "ipod", output_path.name,
+                    ]
+                    encode_command = [
+                        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "concat", "-safe", "1", "-i", list_path.name,
+                        "-af", f"apad=whole_dur={TTS_PACK_PAD_SECONDS}",
+                        "-vn", "-ac", "1", "-ar", "24000", "-c:a", "aac",
+                        "-profile:a", "aac_low", "-b:a", "80k", "-movflags", "+faststart",
+                        "-f", "ipod", output_path.name,
+                    ]
+                    command = encode_command if offset < TTS_PACK_MIN_SECONDS else copy_command
+                    result = subprocess.run(
+                        command,
+                        cwd=temporary_root,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=90,
+                        check=False,
+                    )
+                    if result.returncode != 0 and command is copy_command:
+                        result = subprocess.run(
+                            encode_command,
+                            cwd=temporary_root,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            timeout=90,
+                            check=False,
+                        )
+                    if result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size <= 0:
+                        detail = result.stderr.decode("utf-8", "replace").strip()[:300]
+                        raise ValueError("AAC 播放包生成失败" + (f": {detail}" if detail else ""))
+                    if output_path.stat().st_size > MAX_TTS_PACK_BYTES:
+                        raise ValueError("AAC 播放包过大")
+                    output_duration = tts_audio_duration(output_path)
+                    if output_duration < TTS_PACK_MIN_SECONDS and command is copy_command:
+                        result = subprocess.run(
+                            encode_command,
+                            cwd=temporary_root,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            timeout=90,
+                            check=False,
+                        )
+                        if result.returncode != 0 or not output_path.is_file() or output_path.stat().st_size <= 0:
+                            detail = result.stderr.decode("utf-8", "replace").strip()[:300]
+                            raise ValueError("AAC 播放包补齐失败" + (f": {detail}" if detail else ""))
+                        if output_path.stat().st_size > MAX_TTS_PACK_BYTES:
+                            raise ValueError("AAC 播放包过大")
+                        output_duration = tts_audio_duration(output_path)
+                    if output_duration < TTS_PACK_MIN_SECONDS - 0.05:
+                        raise ValueError("AAC 播放包实际时长不足")
+                    if offset < TTS_PACK_MIN_SECONDS and segments:
+                        segments[0]["start"] = 0.0
+                        segments[-1]["end"] = round(output_duration, 3)
+                    elif offset > 0 and segments:
+                        scale = output_duration / offset
+                        for segment in segments:
+                            segment["start"] = round(segment["start"] * scale, 3)
+                            segment["end"] = round(segment["end"] * scale, 3)
+                        segments[0]["start"] = 0.0
+                        segments[-1]["end"] = round(output_duration, 3)
+                    output_size = output_path.stat().st_size
+                    manifest = reader_tts_pack_manifest(
+                        book_id,
+                        chapter,
+                        spec,
+                        profile_key,
+                        output_duration,
+                        output_size,
+                        segments,
+                        audio_source="pack_cache",
+                        cache_size_bytes=output_size,
+                    )
+                    with TTS_PACK_CACHE_LOCK:
+                        write_private_bytes_atomic(audio_path, output_path.read_bytes())
+                        write_json_atomic(manifest_path, manifest)
+                        if prune_cache:
+                            maybe_prune_tts_pack_cache()
+                    invalidate_tts_cache_stats()
+                    return manifest
+            except FileNotFoundError as exc:
+                raise ValueError("服务器未安装 ffmpeg 或 ffprobe，无法生成播放包") from exc
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError("AAC 播放包生成超时") from exc
+
+
 def request_mimo_tts(text, settings):
-    audio_format = settings.get("format", "wav")
+    audio_format = "wav"
     model = settings.get("model", "mimo-v2.5-tts")
     style_prompt = clean_single_line_value(settings.get("style_prompt", ""))
     messages = []
@@ -3421,36 +4655,12 @@ def prepare_reader_tts_request(text, config):
     text = clean_tts_text(text, int(settings.get("chunk_chars", 260)))
     if not text:
         raise ValueError("没有可朗读文本")
-    audio_format = settings.get("format", "wav")
+    audio_format = settings.get("format", "m4a")
     if audio_format not in TTS_AUDIO_FORMATS:
-        audio_format = "wav"
+        audio_format = "m4a"
     cache_key = tts_cache_key(text, settings)
     cache_path = tts_cache_path(cache_key, audio_format)
     return settings, text, audio_format, cache_key, cache_path
-
-
-def reader_tts_cache_status(text, config):
-    settings, _, audio_format, cache_key, cache_path = prepare_reader_tts_request(text, config)
-    cache_started = time.perf_counter()
-    cached_path = None
-    if settings.get("cache_enabled", True):
-        with TTS_CACHE_LOCK:
-            cached_path = find_cached_tts(cache_path)
-    cache_ms = (time.perf_counter() - cache_started) * 1000
-    size_bytes = 0
-    if cached_path is not None:
-        try:
-            size_bytes = cached_path.stat().st_size
-        except OSError:
-            cached_path = None
-    return {
-        "cached": cached_path is not None,
-        "cache_enabled": bool(settings.get("cache_enabled", True)),
-        "cache_key": cache_key,
-        "format": audio_format,
-        "size_bytes": size_bytes,
-        "cache_ms": round(cache_ms, 2),
-    }
 
 
 def synthesize_reader_tts(text, config):
@@ -3475,7 +4685,7 @@ def synthesize_reader_tts(text, config):
                     }
         cache_ms = (time.perf_counter() - cache_started) * 1000
         generate_started = time.perf_counter()
-        data = request_mimo_tts(text, settings)
+        data = transcode_wav_to_aac(request_mimo_tts(text, settings))
         generate_ms = (time.perf_counter() - generate_started) * 1000
         write_ms = 0.0
         if settings.get("cache_enabled", True) and data:
@@ -3486,6 +4696,7 @@ def synthesize_reader_tts(text, config):
                     write_private_bytes_atomic(cache_path, data)
                     os.utime(cache_path, None)
                     prune_tts_cache()
+                    invalidate_tts_cache_stats()
                     write_ms = (time.perf_counter() - write_started) * 1000
                     if cache_path.exists():
                         return {
@@ -3625,21 +4836,33 @@ def validate_runtime_security():
         raise RuntimeError("拒绝启动：请先把 APP_PASSWORD 设置为至少 12 位的非默认密码")
 
 
+def running_under_gunicorn():
+    executable = Path(sys.argv[0]).name.lower()
+    return "gunicorn" in executable or "gunicorn" in sys.modules
+
+
 def restart_process_later(delay=0.35):
     def restart():
         time.sleep(delay)
         try:
+            if running_under_gunicorn():
+                # Let the Gunicorn master replace this worker with the same command.
+                os._exit(0)
             subprocess.Popen(
-                [sys.executable, str(BASE_DIR / "app.py")],
+                [
+                    sys.executable,
+                    "-c",
+                    "import os, sys, time; time.sleep(1.0); os.execv(sys.executable, [sys.executable, sys.argv[1]])",
+                    str(BASE_DIR / "app.py"),
+                ],
                 cwd=BASE_DIR,
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            os._exit(0)
         except Exception as exc:
-            app.logger.error("restart spawn failed error=%s", exc)
-            return
-        os._exit(0)
+            app.logger.error("restart failed error=%s", exc)
 
     threading.Thread(target=restart, daemon=True).start()
 
@@ -4107,6 +5330,7 @@ LOGIN_TARGETS = {
 def index():
     if not require_auth():
         return redirect(url_for("login"))
+    schedule_tts_cache_stats_refresh()
     return render_template("home.html")
 
 
@@ -4121,6 +5345,7 @@ def translate_page():
 def reader_page():
     if not require_auth():
         return redirect(url_for("login"))
+    schedule_tts_cache_stats_refresh()
     return render_template("reader.html")
 
 
@@ -4143,6 +5368,8 @@ def login():
             session["authenticated"] = True
             session["auth_version"] = authentication_version(config["app_password"])
             clear_login_failures(ip)
+            if target == "reader":
+                schedule_tts_cache_stats_refresh()
             app.logger.info("login success ip=%s", ip)
             return redirect(url_for(LOGIN_TARGETS[target]))
         record_login_failure(ip)
@@ -4212,64 +5439,78 @@ def api_reader_mimo_balance():
         return jsonify({"error": str(exc), "code": code, "balance": mimo_balance_snapshot()}), mimo_balance_http_status(exc)
 
 
-@app.route("/api/reader/tts", methods=["POST"])
-def api_reader_tts():
+@app.route("/api/reader/tts-pack", methods=["POST"])
+def api_reader_tts_pack():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     try:
+        started = time.perf_counter()
         payload = request_json_object()
+        book_id = str(payload.get("book_id") or "")
+        chapter_index = int(payload.get("chapter_index"))
+        sentence_index = int(payload.get("sentence_index"))
         config = load_config()
-        result = synthesize_reader_tts(payload.get("text", ""), config)
-        audio_format = result.get("format", "wav")
-        mimetype = TTS_AUDIO_FORMATS.get(audio_format, "audio/mpeg")
-        if result.get("path"):
-            response = send_file(
-                result["path"],
-                mimetype=mimetype,
-                download_name=f"reader-tts.{audio_format}",
-                max_age=0,
-                conditional=True,
-            )
-        else:
-            response = send_file(
-                BytesIO(result.get("data", b"")),
-                mimetype=mimetype,
-                download_name=f"reader-tts.{audio_format}",
-                max_age=0,
-            )
-        response.headers["X-TTS-Cache"] = "hit" if result.get("cached") else "miss"
-        response.headers["X-TTS-Cache-Ms"] = str(result.get("cache_ms", 0))
-        response.headers["X-TTS-Generate-Ms"] = str(result.get("generate_ms", 0))
-        response.headers["X-TTS-Write-Ms"] = str(result.get("write_ms", 0))
-        response.headers["X-TTS-Total-Ms"] = str(result.get("total_ms", 0))
+        settings = config["reader_tts"]
+        if not settings.get("enabled") or not settings.get("api_key"):
+            raise ValueError("请先启用并配置听书服务")
+        book = read_book_record(book_id)
+        chapter = tts_offline_chapter_data(book, chapter_index, settings)
+        specs = tts_pack_specs(chapter, settings)
+        spec_position = next((
+            position for position, item in enumerate(specs)
+            if item["start_sentence_index"] <= sentence_index <= item["end_sentence_index"]
+        ), None)
+        if spec_position is None:
+            raise ValueError("当前句没有可用播放包")
+        spec = specs[spec_position]
+        manifest = build_reader_tts_pack(book_id, chapter, spec, config)
         app.logger.info(
-            "reader tts ok ip=%s cached=%s format=%s key=%s cache=%.1fms generate=%.1fms write=%.1fms total=%.1fms",
+            "reader tts pack ready ip=%s book=%s chapter=%s sentence=%s kind=%s elapsed=%.3fs",
             request.remote_addr,
-            bool(result.get("cached")),
-            audio_format,
-            str(result.get("cache_key", ""))[:12],
-            float(result.get("cache_ms", 0)),
-            float(result.get("generate_ms", 0)),
-            float(result.get("write_ms", 0)),
-            float(result.get("total_ms", 0)),
+            book_id,
+            chapter_index,
+            sentence_index,
+            manifest.get("kind", "chapter"),
+            time.perf_counter() - started,
         )
-        return response
-    except Exception as exc:
-        app.logger.warning("reader tts failed ip=%s error=%s", request.remote_addr, exc)
+        return jsonify(public_tts_pack_manifest(
+            manifest,
+            url_for("api_reader_tts_pack_audio", pack_key=manifest["pack_key"]),
+            specs[spec_position + 1:],
+        ))
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except (TypeError, ValueError, IndexError) as exc:
+        app.logger.warning("reader tts pack failed ip=%s error=%s", request.remote_addr, exc)
         return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        app.logger.exception("reader tts pack failed ip=%s", request.remote_addr)
+        return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/api/reader/tts/cache", methods=["POST"])
-def api_reader_tts_cache_status():
+@app.route("/api/reader/tts-packs/<pack_key>")
+def api_reader_tts_pack_audio(pack_key):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    try:
-        payload = request_json_object()
-        status = reader_tts_cache_status(payload.get("text", ""), load_config())
-        return jsonify(status)
-    except Exception as exc:
-        app.logger.warning("reader tts cache check failed ip=%s error=%s", request.remote_addr, exc)
-        return jsonify({"error": str(exc)}), 400
+    if not re.fullmatch(r"[0-9a-f]{64}", pack_key):
+        return jsonify({"error": "播放包缓存键无效"}), 400
+    manifest = load_tts_pack_manifest(pack_key)
+    if not manifest:
+        return jsonify({"error": "播放包不存在，请重新生成"}), 404
+    current_profile = tts_offline_profile_key(load_config()["reader_tts"])
+    if manifest.get("profile_key") != current_profile:
+        return jsonify({"error": "听书配置已变化，请重新生成播放包"}), 409
+    touch_tts_pack_cache(pack_key, manifest)
+    audio_path = tts_pack_audio_path(manifest)
+    response = send_file(
+        audio_path,
+        mimetype="audio/mp4",
+        download_name=f"{pack_key}.m4a",
+        conditional=True,
+        max_age=0,
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 @app.route("/api/books/<book_id>/tts-offline")
@@ -4301,6 +5542,50 @@ def api_book_tts_offline_create(book_id):
         requested = payload.get("chapters")
         if not isinstance(requested, list) or not requested:
             raise ValueError("请选择需要缓存的章节")
+        book = read_book_record(book_id)
+        valid_indexes = {int(chapter.get("index", index)) for index, chapter in enumerate(book.get("chapters", []))}
+        requested_indexes = sorted({int(index) for index in requested if int(index) in valid_indexes})
+        if not requested_indexes:
+            raise ValueError("没有有效的章节")
+        if len(requested_indexes) > 100:
+            raise ValueError("单次最多缓存 100 章")
+
+        profile_key = tts_offline_profile_key(settings)
+        refs_by_chapter = load_tts_offline_refs_by_chapter(book_id, profile_key)
+        chapter_records = {
+            int(chapter.get("index", index)): (index, chapter)
+            for index, chapter in enumerate(book.get("chapters", []))
+        }
+        chapter_indexes = []
+        for chapter_index in requested_indexes:
+            fallback_index, chapter_record = chapter_records[chapter_index]
+            chapter_status = tts_offline_chapter_status(
+                book,
+                chapter_record,
+                fallback_index,
+                settings,
+                profile_key,
+                refs_by_chapter.get(chapter_index, []),
+                inspect=True,
+            )
+            sentences_incomplete = (
+                int(chapter_status["server_sentences"])
+                < int(chapter_status["total_sentences"])
+            )
+            packs_incomplete = (
+                int(chapter_status["server_packs"])
+                < int(chapter_status["total_packs"])
+            )
+            if sentences_incomplete or packs_incomplete:
+                chapter_indexes.append(chapter_index)
+        if not chapter_indexes:
+            return jsonify({
+                "ok": True,
+                "complete": True,
+                "chapter_indexes": requested_indexes,
+                "message": "所选章节已完整固定",
+            })
+
         with TTS_OFFLINE_JOB_LOCK:
             active = next(
                 (job for job in TTS_OFFLINE_JOBS.values() if job.get("status") in {"queued", "running"}),
@@ -4308,13 +5593,6 @@ def api_book_tts_offline_create(book_id):
             )
             if active:
                 return jsonify({"error": "已有离线缓存任务正在运行", "job": public_tts_offline_job(active)}), 429
-            book = read_book_record(book_id)
-            valid_indexes = {int(chapter.get("index", index)) for index, chapter in enumerate(book.get("chapters", []))}
-            chapter_indexes = sorted({int(index) for index in requested if int(index) in valid_indexes})
-            if not chapter_indexes:
-                raise ValueError("没有有效的章节")
-            if len(chapter_indexes) > 100:
-                raise ValueError("单次最多缓存 100 章")
             job_id = uuid.uuid4().hex
             now = time.time()
             TTS_OFFLINE_JOBS[job_id] = {
@@ -4329,6 +5607,9 @@ def api_book_tts_offline_create(book_id):
                 "failed_sentences": 0,
                 "cached_sentences": 0,
                 "generated_sentences": 0,
+                "total_packs": 0,
+                "completed_packs": 0,
+                "failed_packs": 0,
                 "size_bytes": 0,
                 "error": "",
                 "cancel_requested": False,
@@ -4373,7 +5654,7 @@ def api_reader_tts_offline_job_cancel(job_id):
             return jsonify({"error": "离线缓存任务不存在或已过期"}), 404
         if job.get("status") in {"queued", "running"}:
             job["cancel_requested"] = True
-            job["message"] = "正在取消，当前正在处理的句子完成后停止"
+            job["message"] = "正在取消，当前处理完成后停止"
             job["updated_at"] = time.time()
         return jsonify({"ok": True, "job": public_tts_offline_job(job)})
 
@@ -4389,36 +5670,40 @@ def api_book_tts_offline_manifest(book_id, chapter_index):
         return jsonify({"error": str(exc)}), 400
 
 
-@app.route("/api/books/<book_id>/tts-offline/audio/<cache_key>")
-def api_book_tts_offline_audio(book_id, cache_key):
+@app.route("/api/books/<book_id>/tts-offline/chapters/<int:chapter_index>/packs/<pack_key>")
+def api_book_tts_offline_pack(book_id, chapter_index, pack_key):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    if not re.fullmatch(r"[0-9a-f]{64}", cache_key):
-        return jsonify({"error": "音频缓存键无效"}), 400
-    with TTS_OFFLINE_LOCK:
-        connection = open_tts_offline_db()
-        try:
-            row = connection.execute(
-                "SELECT audio_format FROM offline_tts_refs WHERE book_id = ? AND cache_key = ? AND size_bytes > 0 LIMIT 1",
-                (book_id, cache_key),
-            ).fetchone()
-        finally:
-            connection.close()
-    if not row:
-        return jsonify({"error": "离线音频不存在"}), 404
-    audio_format = row["audio_format"]
-    path = tts_cache_path(cache_key, audio_format)
-    if not path.is_file():
-        return jsonify({"error": "离线音频文件不存在，请重新生成"}), 404
-    response = send_file(
-        path,
-        mimetype=TTS_AUDIO_FORMATS.get(audio_format, "audio/mpeg"),
-        download_name=f"{cache_key}.{audio_format}",
-        conditional=True,
-        max_age=0,
-    )
-    response.headers["Cache-Control"] = "private, no-store"
-    return response
+    if not re.fullmatch(r"[0-9a-f]{64}", pack_key):
+        return jsonify({"error": "播放包缓存键无效"}), 400
+    try:
+        config = load_config()
+        settings = config["reader_tts"]
+        profile_key = tts_offline_profile_key(settings)
+        book = read_book_record(book_id)
+        chapter = tts_offline_chapter_data(book, chapter_index, settings)
+        matched = next((item for item in tts_pack_specs(chapter, settings) if item["pack_key"] == pack_key), None)
+        manifest = (
+            valid_tts_offline_pack(book_id, chapter, matched, profile_key)
+            if matched else None
+        )
+        if not manifest:
+            return jsonify({"error": "离线播放包不存在或未完整固定"}), 404
+        touch_tts_pack_cache(pack_key, manifest)
+        audio_path = tts_pack_audio_path(manifest)
+        response = send_file(
+            audio_path,
+            mimetype="audio/mp4",
+            download_name=f"{pack_key}.m4a",
+            conditional=True,
+            max_age=0,
+        )
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/books/<book_id>/tts-offline", methods=["DELETE"])

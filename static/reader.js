@@ -9,18 +9,17 @@ const readerState = {
   voices: [],
   reading: false,
   paused: false,
+  ttsPreparing: false,
   playbackRate: 1,
   ttsConfig: null,
   ttsAudio: null,
   ttsToken: 0,
   ttsScope: 0,
-  ttsUrls: new Map(),
-  ttsBlobs: new Map(),
-  ttsWavInfo: new Map(),
-  ttsUrlSizes: new Map(),
-  ttsUrlOrder: [],
-  ttsPending: new Map(),
-  activeTtsPlaybackUrl: "",
+  ttsPacks: new Map(),
+  ttsPackPending: new Map(),
+  ttsPackOrder: [],
+  ttsPackPrepareMs: 0,
+  activeTtsPackKey: "",
   ttsPlaybackSegments: [],
   nextChapterPrefetch: null,
   mediaMetadataSignature: "",
@@ -36,6 +35,8 @@ const readerState = {
   lastSentenceTapAt: 0,
   sleepTimerId: null,
   sleepCountdownId: null,
+  sleepBoundaryTimerId: null,
+  sleepFadeTimerId: null,
   sleepDeadline: 0,
   sleepPausePending: false,
   sleepFadeStarted: false,
@@ -69,17 +70,18 @@ const readerState = {
 const $ = (id) => document.getElementById(id);
 const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || "";
 const TTS_OFFLINE_DB_NAME = "trans-reader-offline-v1";
-const TTS_OFFLINE_STORE = "audio";
+const TTS_OFFLINE_PACK_STORE = "packs";
+const TTS_OFFLINE_DOWNLOAD_WORKERS = 4;
+const TTS_PACK_PREFETCH_WORKERS = 4;
+const TTS_PACK_SCHEMA_VERSION = 2;
+const TTS_MAX_PACK_BYTES = 32 * 1024 * 1024;
+const OFFLINE_DOWNLOAD_INTENT_KEY = "readerOfflineDownloadIntentV1";
 let ttsOfflineDbPromise = null;
-const TTS_BROWSER_CACHE_LIMIT = 12;
-const TTS_BROWSER_CACHE_MAX_BYTES = 64 * 1024 * 1024;
-const TTS_PREFETCH_MIN_ITEMS = 2;
-const TTS_PREFETCH_MAX_ITEMS = 5;
-const TTS_SHORT_AUDIO_SECONDS = 5;
-const TTS_MERGED_AUDIO_TARGET_SECONDS = 6;
-const TTS_MERGED_AUDIO_MAX_ITEMS = 6;
-const TTS_NEXT_CHAPTER_PREFETCH_MULTIPLIER = 2;
+let ttsCacheStatsRetryTimer = null;
+let mediaVolumeAdjustmentSupported = null;
+const TTS_BROWSER_PACK_CACHE_LIMIT = 20;
 const TTS_SLEEP_FADE_SECONDS = 7;
+const TTS_AUDIO_READY_TIMEOUT_MS = 3 * 60 * 1000;
 const BOOK_DATE_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
   year: "numeric",
   month: "2-digit",
@@ -135,6 +137,18 @@ let fontApplyGeneration = 0;
 function isIOSLike() {
   return /iPad|iPhone|iPod/.test(navigator.userAgent)
     || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+function canAdjustMediaVolume() {
+  if (mediaVolumeAdjustmentSupported !== null) return mediaVolumeAdjustmentSupported;
+  try {
+    const probe = document.createElement("audio");
+    probe.volume = 0.5;
+    mediaVolumeAdjustmentSupported = Math.abs(probe.volume - 0.5) < 0.01;
+  } catch {
+    mediaVolumeAdjustmentSupported = false;
+  }
+  return mediaVolumeAdjustmentSupported;
 }
 
 function availableFontOptions() {
@@ -285,6 +299,22 @@ function initializeMediaSession() {
   setHandler("stop", () => stopListening());
 }
 
+function promiseWithTimeout(promise, timeoutMs, message) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => {
+        window.clearTimeout(timeoutId);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timeoutId);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: {
@@ -305,61 +335,42 @@ async function api(path, options = {}) {
   return response.json();
 }
 
-async function apiBlob(path, options = {}, onResponse = null) {
-  const response = await fetch(path, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.method && !["GET", "HEAD"].includes(options.method.toUpperCase()) ? { "X-CSRF-Token": CSRF_TOKEN } : {}),
-      ...(options.headers || {}),
-    },
-    ...options,
-  });
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || `请求失败：${response.status}`);
-  }
-  const cacheState = response.headers.get("X-TTS-Cache") || "";
-  const serverTiming = {
-    cacheMs: Number(response.headers.get("X-TTS-Cache-Ms")) || 0,
-    generateMs: Number(response.headers.get("X-TTS-Generate-Ms")) || 0,
-    writeMs: Number(response.headers.get("X-TTS-Write-Ms")) || 0,
-    totalMs: Number(response.headers.get("X-TTS-Total-Ms")) || 0,
-  };
-  if (typeof onResponse === "function") onResponse({ cacheState, ...serverTiming });
-  const blob = await response.blob();
-  return {
-    blob,
-    cacheState,
-    ...serverTiming,
-  };
-}
-
 function openTtsOfflineDb() {
   if (!("indexedDB" in window)) return Promise.reject(new Error("当前浏览器不支持本机离线缓存"));
   if (ttsOfflineDbPromise) return ttsOfflineDbPromise;
   let openPromise;
   openPromise = new Promise((resolve, reject) => {
-    const request = window.indexedDB.open(TTS_OFFLINE_DB_NAME, 2);
+    const request = window.indexedDB.open(TTS_OFFLINE_DB_NAME, 6);
     let settled = false;
+    const timeoutId = window.setTimeout(() => {
+      fail(new Error("读取本机离线缓存超时，请关闭其他读书页面后重试"));
+    }, 8000);
     const fail = (error) => {
       if (settled) return;
       settled = true;
+      window.clearTimeout(timeoutId);
       if (ttsOfflineDbPromise === openPromise) ttsOfflineDbPromise = null;
       reject(error);
     };
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const database = request.result;
-      const store = database.objectStoreNames.contains(TTS_OFFLINE_STORE)
-        ? request.transaction.objectStore(TTS_OFFLINE_STORE)
-        : database.createObjectStore(TTS_OFFLINE_STORE, { keyPath: "id" });
-      if (!store.indexNames.contains("book")) {
-        store.createIndex("book", "bookId", { unique: false });
+      if (database.objectStoreNames.contains("audio")) {
+        database.deleteObjectStore("audio");
       }
-      if (!store.indexNames.contains("bookProfile")) {
-        store.createIndex("bookProfile", ["bookId", "profileKey"], { unique: false });
+      if (Number(event.oldVersion) < 6 && database.objectStoreNames.contains(TTS_OFFLINE_PACK_STORE)) {
+        database.deleteObjectStore(TTS_OFFLINE_PACK_STORE);
       }
-      if (store.indexNames.contains("bookChapter")) {
-        store.deleteIndex("bookChapter");
+      const packStore = database.objectStoreNames.contains(TTS_OFFLINE_PACK_STORE)
+        ? request.transaction.objectStore(TTS_OFFLINE_PACK_STORE)
+        : database.createObjectStore(TTS_OFFLINE_PACK_STORE, { keyPath: "id" });
+      if (!packStore.indexNames.contains("book")) {
+        packStore.createIndex("book", "bookId", { unique: false });
+      }
+      if (!packStore.indexNames.contains("bookProfile")) {
+        packStore.createIndex("bookProfile", ["bookId", "profileKey"], { unique: false });
+      }
+      if (!packStore.indexNames.contains("bookProfileChapter")) {
+        packStore.createIndex("bookProfileChapter", ["bookId", "profileKey", "chapterIndex"], { unique: false });
       }
     };
     request.onsuccess = () => {
@@ -369,6 +380,7 @@ function openTtsOfflineDb() {
         return;
       }
       settled = true;
+      window.clearTimeout(timeoutId);
       database.onversionchange = () => {
         database.close();
         if (ttsOfflineDbPromise === openPromise) ttsOfflineDbPromise = null;
@@ -382,56 +394,188 @@ function openTtsOfflineDb() {
   return openPromise;
 }
 
-function offlineAudioRecordId(bookId, profileKey, chapterIndex, sentenceIndex) {
-  return `${bookId}:${profileKey}:${Number(chapterIndex)}:${Number(sentenceIndex)}`;
-}
-
 function normalizedOfflineTtsText(value) {
   const maxChars = Math.max(80, Math.min(Number(readerState.ttsConfig?.chunk_chars) || 260, 800));
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, maxChars);
 }
 
-async function localOfflineAudio(index, text) {
-  const bookId = readerState.currentBookId;
-  const profileKey = readerState.ttsConfig?.offline_profile_key;
+function offlinePackRecordId(bookId, profileKey, chapterIndex, packKey) {
+  return `${bookId}:${profileKey}:${Number(chapterIndex)}:${packKey}`;
+}
+
+function validPackSegments(segments) {
+  if (!Array.isArray(segments) || !segments.length) return false;
+  let previousEnd = 0;
+  let previousIndex = -1;
+  return segments.every((segment) => {
+    const index = Number(segment.index);
+    const start = Number(segment.start);
+    const end = Number(segment.end);
+    const first = previousIndex < 0;
+    const valid = Number.isInteger(index)
+      && index > previousIndex
+      && Number.isFinite(start)
+      && Number.isFinite(end)
+      && (!first || Math.abs(start) <= 0.05)
+      && start >= previousEnd - 0.01
+      && end > start;
+    previousIndex = index;
+    previousEnd = end;
+    return valid;
+  });
+}
+
+function samePackSegments(left, right) {
+  return validPackSegments(left)
+    && validPackSegments(right)
+    && left.length === right.length
+    && left.every((segment, index) => (
+      Number(segment.index) === Number(right[index].index)
+      && Math.abs(Number(segment.start) - Number(right[index].start)) <= 0.002
+      && Math.abs(Number(segment.end) - Number(right[index].end)) <= 0.002
+      && normalizedOfflineTtsText(segment.text) === normalizedOfflineTtsText(right[index].text)
+    ));
+}
+
+function chapterSentenceTextMap(chapter) {
+  const result = new Map();
+  (chapter?.paragraphs || []).forEach((paragraph) => {
+    if (paragraph?.type === "image") return;
+    (paragraph?.sentences || []).forEach((sentence) => {
+      result.set(Number(sentence.index), normalizedOfflineTtsText(sentence.text));
+    });
+  });
+  return result;
+}
+
+async function localOfflinePackForChapter(bookId, profileKey, chapterIndex, index, textByIndex) {
   if (!bookId || !profileKey) return null;
-  const chapterIndex = readerState.currentChapter;
   try {
     const database = await openTtsOfflineDb();
-    const id = offlineAudioRecordId(bookId, profileKey, chapterIndex, index);
-    const record = await new Promise((resolve, reject) => {
-      const request = database.transaction(TTS_OFFLINE_STORE, "readonly").objectStore(TTS_OFFLINE_STORE).get(id);
-      request.onsuccess = () => resolve(request.result || null);
+    return await new Promise((resolve, reject) => {
+      const request = database.transaction(TTS_OFFLINE_PACK_STORE, "readonly")
+        .objectStore(TTS_OFFLINE_PACK_STORE).index("bookProfileChapter")
+        .openCursor(IDBKeyRange.only([bookId, profileKey, Number(chapterIndex)]));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) {
+          resolve(null);
+          return;
+        }
+        const record = cursor.value;
+        const recordSegments = Array.isArray(record.segments) ? record.segments : [];
+        const lastSegment = recordSegments[recordSegments.length - 1];
+        const valid = Number(record.chapterIndex) === Number(chapterIndex)
+          && Number(record.schemaVersion) === TTS_PACK_SCHEMA_VERSION
+          && record.format === "m4a"
+          && record.blob instanceof Blob
+          && record.blob.size > 0
+          && record.blob.size <= TTS_MAX_PACK_BYTES
+          && Number(record.duration) >= 5
+          && Number(record.sentenceCount) === recordSegments.length
+          && Number.isInteger(Number(record.chapterSentenceCount))
+          && Number(record.chapterSentenceCount) >= recordSegments.length
+          && Math.abs(Number(lastSegment?.end) - Number(record.duration)) <= 0.15
+          && validPackSegments(recordSegments)
+          && recordSegments.some((segment) => Number(segment.index) === Number(index))
+          && recordSegments.every((segment) => (
+            textByIndex.get(Number(segment.index)) === normalizedOfflineTtsText(segment.text)
+          ));
+        if (valid) {
+          resolve(record);
+          return;
+        }
+        cursor.continue();
+      };
       request.onerror = () => reject(request.error);
     });
-    if (!record || record.text !== normalizedOfflineTtsText(text) || !(record.blob instanceof Blob) || record.blob.size <= 0) return null;
-    return record.blob;
   } catch {
     return null;
   }
 }
 
-async function saveLocalOfflineAudio(manifest, entry, blob) {
+async function hasLocalOfflinePack(manifest, entry) {
+  try {
+    const database = await openTtsOfflineDb();
+    const id = offlinePackRecordId(
+      manifest.book_id,
+      manifest.profile_key,
+      manifest.chapter_index,
+      entry.pack_key,
+    );
+    const record = await new Promise((resolve, reject) => {
+      const request = database.transaction(TTS_OFFLINE_PACK_STORE, "readonly")
+        .objectStore(TTS_OFFLINE_PACK_STORE).get(id);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+    normalizedPackManifest(record || {}, record?.blob, null, {
+      bookId: manifest.book_id,
+      chapterIndex: manifest.chapter_index,
+      profileKey: manifest.profile_key,
+      chapterHash: manifest.chapter_hash,
+    });
+    return !!record
+      && record.chapterHash === manifest.chapter_hash
+      && Number(record.chapterSentenceCount) === Number(manifest.sentence_count)
+      && Number(record.schemaVersion) === Number(entry.schema_version || TTS_PACK_SCHEMA_VERSION)
+      && record.packKey === entry.pack_key
+      && Number(record.startSentenceIndex) === Number(entry.start_sentence_index)
+      && Number(record.endSentenceIndex) === Number(entry.end_sentence_index)
+      && Number(record.sentenceCount) === Number(entry.sentence_count)
+      && Math.abs(Number(record.duration) - Number(entry.duration)) <= 0.1
+      && record.format === entry.format
+      && Number(record.size) === Number(record.blob?.size)
+      && samePackSegments(record.segments, entry.segments)
+      && record.blob instanceof Blob
+      && record.blob.size > 0
+      && record.blob.size <= TTS_MAX_PACK_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+async function saveLocalOfflinePack(manifest, entry, blob) {
+  if (!(blob instanceof Blob) || !blob.size || blob.size > TTS_MAX_PACK_BYTES) {
+    throw new Error("下载的播放包大小无效");
+  }
+  const normalized = normalizedPackManifest(entry, blob, null, {
+    bookId: manifest.book_id,
+    chapterIndex: manifest.chapter_index,
+    profileKey: manifest.profile_key,
+    chapterHash: manifest.chapter_hash,
+  });
+  const chapterSentenceCount = Number(manifest.sentence_count);
+  if (!Number.isInteger(chapterSentenceCount) || chapterSentenceCount < normalized.sentenceCount) {
+    throw new Error("离线章节句数无效");
+  }
   const database = await openTtsOfflineDb();
   const record = {
-    id: offlineAudioRecordId(manifest.book_id, manifest.profile_key, manifest.chapter_index, entry.sentence_index),
+    id: offlinePackRecordId(manifest.book_id, manifest.profile_key, manifest.chapter_index, normalized.packKey),
     bookId: manifest.book_id,
     profileKey: manifest.profile_key,
     chapterIndex: Number(manifest.chapter_index),
     chapterHash: manifest.chapter_hash,
-    sentenceIndex: Number(entry.sentence_index),
-    cacheKey: entry.cache_key,
-    text: entry.text,
-    format: entry.format,
-    size: Number(blob.size) || Number(entry.size_bytes) || 0,
+    chapterSentenceCount,
+    schemaVersion: normalized.schemaVersion,
+    packKey: normalized.packKey,
+    startSentenceIndex: normalized.startSentenceIndex,
+    endSentenceIndex: normalized.endSentenceIndex,
+    sentenceCount: normalized.sentenceCount,
+    segments: normalized.segments,
+    duration: normalized.duration,
+    format: normalized.format,
+    nextStartSentenceIndexes: normalized.nextStartSentenceIndexes,
+    remainingPackCount: normalized.remainingPackCount,
+    size: blob.size,
     savedAt: Date.now(),
     blob,
   };
   await new Promise((resolve, reject) => {
-    const transaction = database.transaction(TTS_OFFLINE_STORE, "readwrite");
-    transaction.objectStore(TTS_OFFLINE_STORE).put(record);
+    const transaction = database.transaction(TTS_OFFLINE_PACK_STORE, "readwrite");
+    transaction.objectStore(TTS_OFFLINE_PACK_STORE).put(record);
     transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error || new Error("写入本机缓存失败"));
+    transaction.onerror = () => reject(transaction.error || new Error("写入本机播放包失败"));
     transaction.onabort = () => reject(transaction.error || new Error("本机缓存空间不足"));
   });
 }
@@ -439,13 +583,18 @@ async function saveLocalOfflineAudio(manifest, entry, blob) {
 async function localOfflineStats(bookId, profileKey, chapters = []) {
   const stats = new Map();
   if (!bookId || !profileKey) return stats;
-  const chapterHashes = new Map(chapters.map((chapter) => [Number(chapter.index), chapter.chapter_hash]));
+  const chapterHashes = new Map(chapters
+    .filter((chapter) => /^[0-9a-f]{64}$/.test(String(chapter.chapter_hash || "")))
+    .map((chapter) => [Number(chapter.index), chapter.chapter_hash]));
+  const chapterSentenceCounts = new Map(chapters
+    .filter((chapter) => chapter.total_sentences !== null && Number.isInteger(Number(chapter.total_sentences)))
+    .map((chapter) => [Number(chapter.index), Number(chapter.total_sentences)]));
   try {
     const database = await openTtsOfflineDb();
     await new Promise((resolve, reject) => {
-      const transaction = database.transaction(TTS_OFFLINE_STORE, "readonly");
-      const index = transaction.objectStore(TTS_OFFLINE_STORE).index("bookProfile");
-      const request = index.openCursor(IDBKeyRange.only([bookId, profileKey]));
+      const request = database.transaction(TTS_OFFLINE_PACK_STORE, "readonly")
+        .objectStore(TTS_OFFLINE_PACK_STORE).index("bookProfile")
+        .openCursor(IDBKeyRange.only([bookId, profileKey]));
       request.onsuccess = () => {
         const cursor = request.result;
         if (!cursor) {
@@ -454,37 +603,61 @@ async function localOfflineStats(bookId, profileKey, chapters = []) {
         }
         const record = cursor.value;
         const chapterIndex = Number(record.chapterIndex);
-        if (chapterHashes.get(chapterIndex) === record.chapterHash && record.blob instanceof Blob && record.blob.size > 0) {
-          const current = stats.get(chapterIndex) || { entries: 0, sizeBytes: 0 };
-          current.entries += 1;
-          current.sizeBytes += Number(record.size) || Number(record.blob?.size) || 0;
+        const recordSegments = Array.isArray(record.segments) ? record.segments : [];
+        const lastSegment = recordSegments[recordSegments.length - 1];
+        const expectedChapterHash = chapterHashes.get(chapterIndex);
+        const expectedChapterSentenceCount = chapterSentenceCounts.get(chapterIndex);
+        if ((!expectedChapterHash || expectedChapterHash === record.chapterHash)
+          && (expectedChapterSentenceCount === undefined || expectedChapterSentenceCount === Number(record.chapterSentenceCount))
+          && Number(record.schemaVersion) === TTS_PACK_SCHEMA_VERSION
+          && record.format === "m4a"
+          && Number(record.duration) >= 5
+          && Number(record.sentenceCount) === recordSegments.length
+          && Number.isInteger(Number(record.chapterSentenceCount))
+          && Number(record.chapterSentenceCount) >= recordSegments.length
+          && Math.abs(Number(lastSegment?.end) - Number(record.duration)) <= 0.15
+          && record.blob instanceof Blob
+          && record.blob.size > 0
+          && record.blob.size <= TTS_MAX_PACK_BYTES
+          && validPackSegments(recordSegments)) {
+          const current = stats.get(chapterIndex) || {
+            entries: 0,
+            packs: 0,
+            sizeBytes: 0,
+            totalSentences: 0,
+            indexes: new Set(),
+          };
+          recordSegments.forEach((segment) => current.indexes.add(Number(segment.index)));
+          current.entries = current.indexes.size;
+          current.packs += 1;
+          current.sizeBytes += Number(record.size) || Number(record.blob.size) || 0;
+          current.totalSentences = Math.max(current.totalSentences, Number(record.chapterSentenceCount));
           stats.set(chapterIndex, current);
         }
         cursor.continue();
       };
       request.onerror = () => reject(request.error);
     });
-  } catch {
-    return stats;
+  } catch (error) {
+    throw error;
   }
   return stats;
 }
 
-async function deleteLocalOfflineChapters(bookId, profileKey, chapterIndexes) {
-  if (!bookId || !profileKey || !chapterIndexes.length) return { entries: 0, sizeBytes: 0 };
-  const database = await openTtsOfflineDb();
-  const selected = new Set(chapterIndexes.map(Number));
+async function deleteLocalOfflineStoreRecords(database, storeName, bookId, profileKey = "", chapterIndexes = null) {
+  const selected = chapterIndexes ? new Set(chapterIndexes.map(Number)) : null;
   let entries = 0;
   let sizeBytes = 0;
   await new Promise((resolve, reject) => {
-    const transaction = database.transaction(TTS_OFFLINE_STORE, "readwrite");
-    const store = transaction.objectStore(TTS_OFFLINE_STORE);
-    const index = store.index("bookProfile");
-    const request = index.openCursor(IDBKeyRange.only([bookId, profileKey]));
+    const transaction = database.transaction(storeName, "readwrite");
+    const store = transaction.objectStore(storeName);
+    const indexName = profileKey ? "bookProfile" : "book";
+    const key = profileKey ? [bookId, profileKey] : bookId;
+    const request = store.index(indexName).openCursor(IDBKeyRange.only(key));
     request.onsuccess = () => {
       const cursor = request.result;
       if (!cursor) return;
-      if (selected.has(Number(cursor.value.chapterIndex))) {
+      if (!selected || selected.has(Number(cursor.value.chapterIndex))) {
         entries += 1;
         sizeBytes += Number(cursor.value.size) || Number(cursor.value.blob?.size) || 0;
         cursor.delete();
@@ -499,29 +672,18 @@ async function deleteLocalOfflineChapters(bookId, profileKey, chapterIndexes) {
   return { entries, sizeBytes };
 }
 
-async function deleteLocalOfflineBook(bookId) {
-  if (!bookId) return { entries: 0, sizeBytes: 0 };
+async function deleteLocalOfflineChapters(bookId, profileKey, chapterIndexes) {
+  if (!bookId || !profileKey || !chapterIndexes.length) return { entries: 0, packs: 0, sizeBytes: 0 };
   const database = await openTtsOfflineDb();
-  let entries = 0;
-  let sizeBytes = 0;
-  await new Promise((resolve, reject) => {
-    const transaction = database.transaction(TTS_OFFLINE_STORE, "readwrite");
-    const index = transaction.objectStore(TTS_OFFLINE_STORE).index("book");
-    const request = index.openCursor(IDBKeyRange.only(bookId));
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (!cursor) return;
-      entries += 1;
-      sizeBytes += Number(cursor.value.size) || Number(cursor.value.blob?.size) || 0;
-      cursor.delete();
-      cursor.continue();
-    };
-    request.onerror = () => reject(request.error || new Error("读取本机缓存失败"));
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error || new Error("删除本机缓存失败"));
-    transaction.onabort = () => reject(transaction.error || new Error("删除本机缓存失败"));
-  });
-  return { entries, sizeBytes };
+  const packs = await deleteLocalOfflineStoreRecords(database, TTS_OFFLINE_PACK_STORE, bookId, profileKey, chapterIndexes);
+  return { entries: packs.entries, packs: packs.entries, sizeBytes: packs.sizeBytes };
+}
+
+async function deleteLocalOfflineBook(bookId) {
+  if (!bookId) return { entries: 0, packs: 0, sizeBytes: 0 };
+  const database = await openTtsOfflineDb();
+  const packs = await deleteLocalOfflineStoreRecords(database, TTS_OFFLINE_PACK_STORE, bookId);
+  return { entries: packs.entries, packs: packs.entries, sizeBytes: packs.sizeBytes };
 }
 
 async function discardLocalOfflineBook(bookId) {
@@ -537,10 +699,12 @@ async function browserStorageSummary() {
     return window.isSecureContext ? "本机容量不可查询" : "HTTP 下无法查询本机容量";
   }
   try {
-    const estimate = await navigator.storage.estimate();
-    const persisted = window.isSecureContext && navigator.storage.persisted
-      ? await navigator.storage.persisted()
-      : false;
+    const [estimate, persisted] = await Promise.all([
+      promiseWithTimeout(navigator.storage.estimate(), 3000, "读取本机存储容量超时"),
+      window.isSecureContext && navigator.storage.persisted
+        ? promiseWithTimeout(navigator.storage.persisted(), 3000, "读取持久化状态超时")
+        : Promise.resolve(false),
+    ]);
     const persistence = !window.isSecureContext
       ? " · HTTP 下不能持久化"
       : persisted ? " · 已持久化" : " · 可能被回收";
@@ -554,7 +718,7 @@ async function browserStorageSummary() {
 async function requestPersistentBrowserStorage() {
   if (!window.isSecureContext || !navigator.storage?.persist) return false;
   try {
-    return await navigator.storage.persist();
+    return await promiseWithTimeout(navigator.storage.persist(), 5000, "申请持久化存储超时");
   } catch {
     return false;
   }
@@ -1288,10 +1452,10 @@ async function loadChapter(chapterIndex, sentenceIndex = 0) {
     && preparedEntry.bookId === bookId
     && preparedEntry.chapterIndex === normalizedChapterIndex
     && preparedEntry.scope === readerState.ttsScope;
-  if (canUsePrepared) preparedEntry.adopted = true;
-  const prepared = canUsePrepared
-    ? await (preparedEntry.readyPromise || preparedEntry.promise)
-    : null;
+  let prepared = canUsePrepared ? preparedEntry.prepared : null;
+  if (!prepared && canUsePrepared && readerState.reading) {
+    prepared = await preparedEntry.promise;
+  }
   if (readerState.currentBookId !== bookId) return;
   const data = prepared?.data || await api(`/api/books/${bookId}/chapters/${normalizedChapterIndex}`);
   if (readerState.currentBookId !== bookId) return;
@@ -1299,14 +1463,14 @@ async function loadChapter(chapterIndex, sentenceIndex = 0) {
   readerState.currentChapter = data.chapter.index;
   readerState.currentSentence = sentenceIndex;
   $("chapterSelect").value = String(readerState.currentChapter);
-  renderChapter(data.chapter, prepared?.audios || []);
+  renderChapter(data.chapter, prepared?.packs || []);
   highlightSentence(sentenceIndex, true);
   saveProgressSoon();
   setStatus(readerState.currentBook.title);
   if (readerState.reading) updateMediaSessionMetadata();
 }
 
-function renderChapter(chapter, prefetchedAudios = []) {
+function renderChapter(chapter, prefetchedPacks = []) {
   clearTtsBrowserCache();
   const content = $("bookContent");
   content.classList.remove("empty");
@@ -1352,10 +1516,14 @@ function renderChapter(chapter, prefetchedAudios = []) {
     content.classList.add("empty");
     content.textContent = "本章没有可阅读文本";
   }
-  prefetchedAudios.forEach((audio) => {
-    if (sentenceText(audio.index) !== audio.text || !(audio.blob instanceof Blob)) return;
-    rememberTtsUrl(audio.index, URL.createObjectURL(audio.blob), audio.blob);
-    if (audio.wavInfo) readerState.ttsWavInfo.set(Number(audio.index), Promise.resolve(audio.wavInfo));
+  prefetchedPacks.forEach((pack) => {
+    if (!(pack?.blob instanceof Blob) || !validPackSegments(pack.segments)) return;
+    const textByIndex = new Map(readerState.sentences.map((sentence) => [
+      Number(sentence.index),
+      normalizedOfflineTtsText(sentence.text),
+    ]));
+    if (!pack.segments.every((segment) => textByIndex.get(Number(segment.index)) === segment.text)) return;
+    rememberTtsPack(pack, pack.blob);
   });
 }
 
@@ -1473,10 +1641,21 @@ function audioErrorMessage(audio) {
   return messages[code] || "音频播放失败";
 }
 
-function waitForAudioReady(audio) {
+function waitForAudioReady(audio, token, scope) {
   if (audio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) return Promise.resolve();
   return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("浏览器加载播放包超时，请重试"));
+    }, TTS_AUDIO_READY_TIMEOUT_MS);
+    const cancelId = window.setInterval(() => {
+      if (token === readerState.ttsToken && scope === readerState.ttsScope) return;
+      cleanup();
+      reject(new Error("播放准备已取消"));
+    }, 100);
     const cleanup = () => {
+      window.clearTimeout(timeoutId);
+      window.clearInterval(cancelId);
       audio.removeEventListener("canplay", handleReady);
       audio.removeEventListener("loadeddata", handleReady);
       audio.removeEventListener("error", handleError);
@@ -1497,21 +1676,25 @@ function waitForAudioReady(audio) {
 }
 
 function updateListenButtons() {
-  $("listenPauseBtn").classList.toggle("active", readerState.paused);
-  $("listenPauseBtn").textContent = readerState.paused ? "继续" : "暂停";
+  const pauseButton = $("listenPauseBtn");
+  pauseButton.classList.toggle("active", readerState.paused);
+  pauseButton.textContent = readerState.paused ? "继续" : "暂停";
 }
 
 function applyAudioPlaybackRate(audio) {
   if (!audio) return;
-  const rate = Math.max(0.5, Math.min(Number(readerState.playbackRate) || 1, 4));
+  const rate = Math.max(0.8, Math.min(Number(readerState.playbackRate) || 1, 2));
   audio.defaultPlaybackRate = rate;
   audio.playbackRate = rate;
 }
 
 function updatePlaybackRate() {
-  readerState.playbackRate = Number($("playbackRateSelect").value) || 1;
+  const selectedRate = Number($("playbackRateSelect").value);
+  readerState.playbackRate = [0.8, 1, 1.2, 1.5, 2].includes(selectedRate) ? selectedRate : 1;
+  $("playbackRateSelect").value = String(readerState.playbackRate);
   window.localStorage.setItem("readerPlaybackRate", String(readerState.playbackRate));
   applyAudioPlaybackRate(readerState.ttsAudio);
+  if (readerState.sleepPausePending) scheduleSleepBoundaryPause();
   if (readerState.reading) {
     const segments = readerState.ttsPlaybackSegments;
     const lastSegment = segments.length ? segments[segments.length - 1] : null;
@@ -1536,12 +1719,6 @@ function formatCountdown(ms) {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-function formatStageDuration(ms) {
-  const value = Math.max(0, Number(ms) || 0);
-  if (value < 1000) return `${Math.max(1, Math.round(value))} 毫秒`;
-  return `${(value / 1000).toFixed(value >= 10000 ? 1 : 2)} 秒`;
-}
-
 function updateSleepTimerButton() {
   const button = $("sleepTimerBtn");
   if (!button) return;
@@ -1562,7 +1739,10 @@ function updateSleepTimerButton() {
 function clearSleepTimer(resetInput = false) {
   window.clearTimeout(readerState.sleepTimerId);
   window.clearInterval(readerState.sleepCountdownId);
+  window.clearTimeout(readerState.sleepBoundaryTimerId);
+  stopSleepFade();
   readerState.sleepTimerId = null;
+  readerState.sleepBoundaryTimerId = null;
   readerState.sleepCountdownId = null;
   readerState.sleepDeadline = 0;
   readerState.sleepPausePending = false;
@@ -1611,27 +1791,48 @@ function applyCustomSleepTimer() {
   $("sleepTimerDialog").close();
 }
 
+function stopSleepFade(resetVolume = true) {
+  window.clearInterval(readerState.sleepFadeTimerId);
+  readerState.sleepFadeTimerId = null;
+  readerState.sleepFadeStarted = false;
+  if (resetVolume && readerState.ttsAudio) readerState.ttsAudio.volume = 1;
+}
+
 function startSleepFadeIfNeeded(audio, stopAt = audio?.duration) {
-  if (isIOSLike() || !readerState.sleepPausePending || !audio || !Number.isFinite(audio.duration)) return;
+  if (!canAdjustMediaVolume()
+    || !readerState.sleepPausePending
+    || !audio
+    || !Number.isFinite(audio.duration)) return;
   const normalizedStopAt = Number.isFinite(Number(stopAt)) ? Number(stopAt) : audio.duration;
-  const remaining = normalizedStopAt - audio.currentTime;
-  if (remaining > TTS_SLEEP_FADE_SECONDS + 0.2) return;
+  const secondsLeft = () => Math.max(
+    0,
+    (normalizedStopAt - audio.currentTime)
+      / Math.max(0.8, Math.min(Number(audio.playbackRate) || 1, 2)),
+  );
+  if (secondsLeft() > TTS_SLEEP_FADE_SECONDS + 0.2) return;
   const applyVolume = () => {
-    const secondsLeft = Math.max(0, normalizedStopAt - audio.currentTime);
-    audio.volume = Math.max(0.05, Math.min(1, secondsLeft / TTS_SLEEP_FADE_SECONDS));
+    const remainingSeconds = secondsLeft();
+    audio.volume = Math.max(0.05, Math.min(1, remainingSeconds / TTS_SLEEP_FADE_SECONDS));
   };
   applyVolume();
   if (readerState.sleepFadeStarted) return;
   readerState.sleepFadeStarted = true;
-  const tick = () => {
-    if (!readerState.sleepPausePending || audio.paused || audio.ended) return;
+  readerState.sleepFadeTimerId = window.setInterval(() => {
+    if (!readerState.sleepPausePending || audio.paused || audio.ended || readerState.ttsAudio !== audio) {
+      stopSleepFade(false);
+      return;
+    }
     applyVolume();
-    if (audio.volume > 0.05) window.requestAnimationFrame(tick);
-  };
-  window.requestAnimationFrame(tick);
+    if (audio.volume <= 0.05) stopSleepFade(false);
+  }, 200);
 }
 
 function finishSleepPause(index) {
+  window.clearTimeout(readerState.sleepBoundaryTimerId);
+  stopSleepFade();
+  readerState.sleepBoundaryTimerId = null;
+  const finishedChapter = readerState.currentChapter;
+  const currentBookId = readerState.currentBookId;
   const nextIndex = nextReadableSentenceIndex(Number(index) + 1);
   if (nextIndex >= 0) highlightSentence(nextIndex, false);
   readerState.reading = false;
@@ -1645,18 +1846,33 @@ function finishSleepPause(index) {
   syncReaderWakeLock();
   setMediaSessionPlaybackState("paused");
   setListenStatus("定时已暂停");
+  if (nextIndex < 0 && finishedChapter + 1 < readerState.chapters.length) {
+    window.setTimeout(async () => {
+      if (readerState.reading
+        || readerState.currentBookId !== currentBookId
+        || readerState.currentChapter !== finishedChapter) return;
+      try {
+        await loadChapter(finishedChapter + 1, 0);
+        const firstIndex = nextReadableSentenceIndex(0);
+        if (firstIndex >= 0) highlightSentence(firstIndex, false);
+        setListenStatus("定时已暂停｜下次从下一章开始");
+      } catch (error) {
+        setListenStatus(error.message || "下一章准备失败，下次播放时重试");
+      }
+    }, 0);
+  }
 }
 
 function clearTtsBrowserCache() {
   readerState.ttsScope += 1;
   readerState.nextChapterPrefetch = null;
-  readerState.ttsPending.clear();
-  readerState.ttsUrls.forEach((url) => URL.revokeObjectURL(url));
-  readerState.ttsUrls.clear();
-  readerState.ttsBlobs.clear();
-  readerState.ttsWavInfo.clear();
-  readerState.ttsUrlSizes.clear();
-  readerState.ttsUrlOrder = [];
+  readerState.ttsPackPending.clear();
+  readerState.ttsPacks.forEach((pack) => {
+    if (pack?.url) URL.revokeObjectURL(pack.url);
+  });
+  readerState.ttsPacks.clear();
+  readerState.ttsPackOrder = [];
+  readerState.activeTtsPackKey = "";
 }
 
 function sentenceText(index) {
@@ -1677,263 +1893,223 @@ function nextReadableSentenceIndex(startIndex) {
   return -1;
 }
 
-function upcomingReadableSentenceIndexes(startIndex, maxItems = TTS_PREFETCH_MAX_ITEMS) {
-  const indexes = [];
-  let index = nextReadableSentenceIndex(startIndex);
-  while (index >= 0 && indexes.length < maxItems) {
-    indexes.push(index);
-    index = nextReadableSentenceIndex(index + 1);
+function rememberedTtsPack(chapterIndex, sentenceIndex, bookId = readerState.currentBookId) {
+  for (const pack of readerState.ttsPacks.values()) {
+    if (pack.bookId !== bookId
+      || pack.profileKey !== readerState.ttsConfig?.offline_profile_key
+      || Number(pack.chapterIndex) !== Number(chapterIndex)) continue;
+    if (pack.segments.some((segment) => Number(segment.index) === Number(sentenceIndex))) return pack;
   }
-  return indexes;
+  return null;
 }
 
-function ttsTextLength(text) {
-  return String(text || "").replace(/\s+/g, "").length;
+function trimTtsPackBrowserCache() {
+  while (readerState.ttsPackOrder.length > TTS_BROWSER_PACK_CACHE_LIMIT) {
+    const removable = readerState.ttsPackOrder.find((key) => key !== readerState.activeTtsPackKey);
+    if (!removable) break;
+    readerState.ttsPackOrder = readerState.ttsPackOrder.filter((key) => key !== removable);
+    const stale = readerState.ttsPacks.get(removable);
+    if (stale?.url) URL.revokeObjectURL(stale.url);
+    readerState.ttsPacks.delete(removable);
+  }
 }
 
-function ttsPrefetchBudgetForText(text, requestedRate = readerState.playbackRate) {
-  const length = ttsTextLength(text);
-  let base;
-  if (length <= 35) base = { targetChars: 360, maxItems: 5 };
-  else if (length <= 90) base = { targetChars: 280, maxItems: 4 };
-  else base = { targetChars: 180, maxItems: 3 };
-  const rate = Math.max(1, Math.min(Number(requestedRate) || 1, 2));
-  const extraItems = Math.ceil(Math.max(0, rate - 1) * 2);
+function rememberTtsPack(manifest, blob) {
+  const existing = readerState.ttsPacks.get(manifest.packKey);
+  if (existing) {
+    readerState.ttsPackOrder = readerState.ttsPackOrder.filter((key) => key !== manifest.packKey);
+    readerState.ttsPackOrder.push(manifest.packKey);
+    return existing;
+  }
+  const pack = { ...manifest, blob, url: URL.createObjectURL(blob) };
+  readerState.ttsPacks.set(pack.packKey, pack);
+  readerState.ttsPackOrder = readerState.ttsPackOrder.filter((key) => key !== pack.packKey);
+  readerState.ttsPackOrder.push(pack.packKey);
+  trimTtsPackBrowserCache();
+  return pack;
+}
+
+function normalizedPackManifest(raw, blob, textByIndex, expected = {}) {
+  const packKey = String(raw.pack_key || raw.packKey || "");
+  const chapterIndex = Number(raw.chapter_index ?? raw.chapterIndex);
+  const segments = (raw.segments || []).map((segment) => ({
+    chapterIndex,
+    index: Number(segment.index),
+    start: Number(segment.start),
+    end: Number(segment.end),
+    text: normalizedOfflineTtsText(segment.text),
+  }));
+  const schemaVersion = Number(raw.schema_version ?? raw.schemaVersion ?? 0);
+  const kind = String(raw.kind || "chapter");
+  const duration = Number(raw.duration);
+  const sentenceCount = Number(raw.sentence_count ?? raw.sentenceCount);
+  const startSentenceIndex = Number(raw.start_sentence_index ?? raw.startSentenceIndex);
+  const endSentenceIndex = Number(raw.end_sentence_index ?? raw.endSentenceIndex);
+  const format = String(raw.format || "").toLowerCase();
+  const chapterHash = String(raw.chapter_hash ?? raw.chapterHash ?? "");
+  const nextStartSentenceIndexes = [...new Set(
+    (raw.next_start_sentence_indexes || raw.nextStartSentenceIndexes || []).map(Number),
+  )];
+  const hasRemainingPackCount = raw.remaining_pack_count !== undefined
+    || raw.remainingPackCount !== undefined;
+  const remainingPackCount = hasRemainingPackCount
+    ? Number(raw.remaining_pack_count ?? raw.remainingPackCount)
+    : null;
+  const blobSize = Number(blob?.size) || 0;
+  const firstSegment = segments[0];
+  const lastSegment = segments[segments.length - 1];
+  if (schemaVersion !== TTS_PACK_SCHEMA_VERSION
+    || kind !== "chapter"
+    || !/^[0-9a-f]{64}$/.test(packKey)
+    || !Number.isInteger(chapterIndex)
+    || chapterIndex < 0
+    || !/^[0-9a-f]{64}$/.test(chapterHash)
+    || format !== "m4a"
+    || blobSize <= 0
+    || blobSize > TTS_MAX_PACK_BYTES
+    || !Number.isFinite(duration)
+    || duration < 5
+    || !validPackSegments(segments)
+    || sentenceCount !== segments.length
+    || startSentenceIndex !== Number(firstSegment?.index)
+    || endSentenceIndex !== Number(lastSegment?.index)
+    || Math.abs(Number(lastSegment?.end) - duration) > 0.15
+    || nextStartSentenceIndexes.some((index) => (
+      !Number.isInteger(index)
+      || index <= endSentenceIndex
+      || (textByIndex && !textByIndex.has(index))
+    ))
+    || (remainingPackCount !== null && (
+      !Number.isInteger(remainingPackCount)
+      || remainingPackCount < nextStartSentenceIndexes.length
+    ))) {
+    throw new Error("播放包时间轴无效");
+  }
+  if (textByIndex && !segments.every((segment) => textByIndex.get(segment.index) === segment.text)) {
+    throw new Error("播放包与当前章节内容不一致，请重新生成");
+  }
+  const manifestBookId = String(raw.book_id ?? raw.bookId ?? "");
+  const manifestProfileKey = String(raw.profile_key ?? raw.profileKey ?? "");
+  if ((expected.bookId && manifestBookId !== String(expected.bookId))
+    || (Number.isFinite(Number(expected.chapterIndex)) && chapterIndex !== Number(expected.chapterIndex))
+    || (expected.profileKey && manifestProfileKey !== String(expected.profileKey))
+    || (expected.chapterHash && chapterHash !== String(expected.chapterHash))) {
+    throw new Error("播放包身份不一致，请重新生成");
+  }
   return {
-    targetChars: Math.round(base.targetChars * rate),
-    minItems: TTS_PREFETCH_MIN_ITEMS + extraItems,
-    maxItems: base.maxItems + extraItems,
-  };
-}
-
-function ttsPrefetchBudget(currentIndex) {
-  return ttsPrefetchBudgetForText(sentenceText(currentIndex));
-}
-
-function ttsPrefetchIndexes(currentIndex) {
-  const indexes = [];
-  let totalChars = 0;
-  const budget = ttsPrefetchBudget(currentIndex);
-  for (const index of upcomingReadableSentenceIndexes(Number(currentIndex) + 1, budget.maxItems)) {
-    indexes.push(index);
-    totalChars += ttsTextLength(sentenceText(index));
-    if (indexes.length >= budget.minItems && totalChars >= budget.targetChars) break;
-  }
-  return indexes;
-}
-
-function ttsBrowserCacheSize() {
-  let total = 0;
-  readerState.ttsUrlSizes.forEach((size) => {
-    total += Number(size) || 0;
-  });
-  return total;
-}
-
-function trimTtsBrowserCache(keepIndexes = []) {
-  const keep = new Set(keepIndexes.map((item) => Number(item)));
-  while (readerState.ttsUrlOrder.length > TTS_BROWSER_CACHE_LIMIT || ttsBrowserCacheSize() > TTS_BROWSER_CACHE_MAX_BYTES) {
-    const removableIndex = readerState.ttsUrlOrder.findIndex((item) => !keep.has(Number(item)));
-    if (removableIndex < 0) break;
-    const staleIndex = readerState.ttsUrlOrder.splice(removableIndex, 1)[0];
-    const staleUrl = readerState.ttsUrls.get(staleIndex);
-    if (staleUrl) URL.revokeObjectURL(staleUrl);
-    readerState.ttsUrls.delete(staleIndex);
-    readerState.ttsBlobs.delete(staleIndex);
-    readerState.ttsWavInfo.delete(staleIndex);
-    readerState.ttsUrlSizes.delete(staleIndex);
-  }
-}
-
-function rememberTtsUrl(index, url, blob) {
-  const normalizedIndex = Number(index);
-  const existing = readerState.ttsUrls.get(normalizedIndex);
-  if (existing && existing !== url) URL.revokeObjectURL(existing);
-  readerState.ttsUrls.set(normalizedIndex, url);
-  readerState.ttsBlobs.set(normalizedIndex, blob);
-  readerState.ttsWavInfo.delete(normalizedIndex);
-  readerState.ttsUrlSizes.set(normalizedIndex, Number(blob?.size) || 0);
-  readerState.ttsUrlOrder = readerState.ttsUrlOrder.filter((item) => Number(item) !== normalizedIndex);
-  readerState.ttsUrlOrder.push(normalizedIndex);
-  trimTtsBrowserCache([readerState.currentSentence, ...upcomingReadableSentenceIndexes(readerState.currentSentence + 1, TTS_BROWSER_CACHE_LIMIT - 1)]);
-}
-
-function wavChunkName(view, offset) {
-  return String.fromCharCode(
-    view.getUint8(offset),
-    view.getUint8(offset + 1),
-    view.getUint8(offset + 2),
-    view.getUint8(offset + 3),
-  );
-}
-
-async function parseWavBlob(blob) {
-  if (!blob || blob.size < 44) return null;
-  const header = await blob.slice(0, Math.min(blob.size, 64 * 1024)).arrayBuffer();
-  const view = new DataView(header);
-  if (wavChunkName(view, 0) !== "RIFF" || wavChunkName(view, 8) !== "WAVE") return null;
-  let format = null;
-  let data = null;
-  for (let offset = 12; offset + 8 <= view.byteLength;) {
-    const name = wavChunkName(view, offset);
-    const size = view.getUint32(offset + 4, true);
-    const valueOffset = offset + 8;
-    if (name === "fmt " && size >= 16 && valueOffset + 16 <= view.byteLength) {
-      format = {
-        audioFormat: view.getUint16(valueOffset, true),
-        channels: view.getUint16(valueOffset + 2, true),
-        sampleRate: view.getUint32(valueOffset + 4, true),
-        byteRate: view.getUint32(valueOffset + 8, true),
-        blockAlign: view.getUint16(valueOffset + 12, true),
-        bitsPerSample: view.getUint16(valueOffset + 14, true),
-      };
-    } else if (name === "data") {
-      data = {
-        offset: valueOffset,
-        size: Math.max(0, Math.min(size, blob.size - valueOffset)),
-      };
-      break;
-    }
-    offset = valueOffset + size + (size % 2);
-  }
-  if (!format || !data || format.audioFormat !== 1 || !format.byteRate || !data.size) return null;
-  return { ...format, ...data, duration: data.size / format.byteRate };
-}
-
-function wavInfoForIndex(index) {
-  const normalizedIndex = Number(index);
-  if (!readerState.ttsWavInfo.has(normalizedIndex)) {
-    const promise = parseWavBlob(readerState.ttsBlobs.get(normalizedIndex)).catch(() => null);
-    readerState.ttsWavInfo.set(normalizedIndex, promise);
-  }
-  return readerState.ttsWavInfo.get(normalizedIndex);
-}
-
-function sameWavFormat(left, right) {
-  return !!left && !!right
-    && left.audioFormat === right.audioFormat
-    && left.channels === right.channels
-    && left.sampleRate === right.sampleRate
-    && left.byteRate === right.byteRate
-    && left.blockAlign === right.blockAlign
-    && left.bitsPerSample === right.bitsPerSample;
-}
-
-function buildWavHeader(format, dataSize) {
-  const buffer = new ArrayBuffer(44);
-  const view = new DataView(buffer);
-  const writeName = (offset, value) => {
-    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
-  };
-  writeName(0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
-  writeName(8, "WAVE");
-  writeName(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, format.audioFormat, true);
-  view.setUint16(22, format.channels, true);
-  view.setUint32(24, format.sampleRate, true);
-  view.setUint32(28, format.byteRate, true);
-  view.setUint16(32, format.blockAlign, true);
-  view.setUint16(34, format.bitsPerSample, true);
-  writeName(36, "data");
-  view.setUint32(40, dataSize, true);
-  return buffer;
-}
-
-async function prefetchedTtsBlob(index, scope) {
-  const normalizedIndex = Number(index);
-  let blob = readerState.ttsBlobs.get(normalizedIndex);
-  if (blob) return blob;
-  const pending = readerState.ttsPending.get(`${scope}:${normalizedIndex}`);
-  if (!pending) return null;
-  await pending.catch(() => "");
-  blob = readerState.ttsBlobs.get(normalizedIndex);
-  return blob || null;
-}
-
-async function prepareTtsPlayback(index, originalUrl, scope) {
-  // Merge browser WAV blobs, including an in-flight prefetch. Server generation and cache entries remain per sentence.
-  const normalizedIndex = Number(index);
-  const chapterIndex = Number(readerState.currentChapter);
-  const firstBlob = readerState.ttsBlobs.get(normalizedIndex);
-  const firstInfo = await wavInfoForIndex(normalizedIndex);
-  if (!firstBlob || !firstInfo) {
-    return {
-      url: originalUrl,
-      owned: false,
-      lastIndex: normalizedIndex,
-      lastChapterIndex: chapterIndex,
-      segments: [],
-    };
-  }
-  const parts = [{ chapterIndex, index: normalizedIndex, blob: firstBlob, info: firstInfo }];
-  let duration = firstInfo.duration;
-  if (firstInfo.duration < TTS_SHORT_AUDIO_SECONDS) {
-    for (const nextIndex of upcomingReadableSentenceIndexes(normalizedIndex + 1, TTS_MERGED_AUDIO_MAX_ITEMS - 1)) {
-      const nextBlob = await prefetchedTtsBlob(nextIndex, scope);
-      if (!nextBlob) break;
-      const nextInfo = await wavInfoForIndex(nextIndex);
-      if (!nextInfo || !sameWavFormat(firstInfo, nextInfo)) break;
-      parts.push({ chapterIndex, index: nextIndex, blob: nextBlob, info: nextInfo });
-      duration += nextInfo.duration;
-      if (duration >= TTS_MERGED_AUDIO_TARGET_SECONDS) break;
-    }
-  }
-  const lastCurrentPart = parts[parts.length - 1];
-  if (nextReadableSentenceIndex(Number(lastCurrentPart.index) + 1) < 0) {
-    const entry = readerState.nextChapterPrefetch;
-    const prepared = entry?.prepared;
-    if (entry
-      && prepared
-      && entry.bookId === readerState.currentBookId
-      && entry.chapterIndex === chapterIndex + 1
-      && entry.scope === scope) {
-      let nextChapterDuration = 0;
-      for (const audio of prepared.audios.slice(0, Math.max(1, TTS_MERGED_AUDIO_MAX_ITEMS - parts.length))) {
-        const nextInfo = audio.wavInfo || await parseWavBlob(audio.blob).catch(() => null);
-        if (!nextInfo || !sameWavFormat(firstInfo, nextInfo)) break;
-        parts.push({
-          chapterIndex: entry.chapterIndex,
-          index: Number(audio.index),
-          blob: audio.blob,
-          info: nextInfo,
-        });
-        nextChapterDuration += nextInfo.duration;
-        if (nextChapterDuration >= TTS_MERGED_AUDIO_TARGET_SECONDS) break;
-      }
-    }
-  }
-  const segments = [];
-  let segmentStart = 0;
-  parts.forEach((part) => {
-    segments.push({
-      chapterIndex: part.chapterIndex,
-      index: part.index,
-      start: segmentStart,
-      end: segmentStart + part.info.duration,
-    });
-    segmentStart += part.info.duration;
-  });
-  if (parts.length < 2) {
-    return {
-      url: originalUrl,
-      owned: false,
-      lastIndex: normalizedIndex,
-      lastChapterIndex: chapterIndex,
-      segments,
-    };
-  }
-  const dataSize = parts.reduce((total, part) => total + part.info.size, 0);
-  const body = parts.map((part) => part.blob.slice(part.info.offset, part.info.offset + part.info.size));
-  const mergedBlob = new Blob([buildWavHeader(firstInfo, dataSize), ...body], { type: "audio/wav" });
-  return {
-    url: URL.createObjectURL(mergedBlob),
-    owned: true,
-    lastIndex: parts[parts.length - 1].index,
-    lastChapterIndex: parts[parts.length - 1].chapterIndex,
+    packKey,
+    kind,
+    schemaVersion,
+    bookId: manifestBookId,
+    profileKey: manifestProfileKey,
+    chapterIndex,
+    chapterHash,
+    startSentenceIndex,
+    endSentenceIndex,
+    sentenceCount,
+    duration,
+    size: blobSize,
+    format,
     segments,
+    nextStartSentenceIndexes,
+    remainingPackCount,
   };
+}
+
+async function fetchPackBlob(url) {
+  const response = await fetch(url, { credentials: "same-origin" });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `播放包下载失败：${response.status}`);
+  }
+  const blob = await response.blob();
+  if (!blob.size || blob.size > TTS_MAX_PACK_BYTES) {
+    throw new Error("播放包音频大小无效");
+  }
+  return blob;
+}
+
+async function requestTtsPackForChapter(
+  bookId,
+  chapterIndex,
+  sentenceIndex,
+  textByIndex,
+  scope,
+) {
+  const remembered = rememberedTtsPack(chapterIndex, sentenceIndex, bookId);
+  if (remembered) return remembered;
+  const pendingKey = `${scope}:${bookId}:${Number(chapterIndex)}:${Number(sentenceIndex)}`;
+  if (readerState.ttsPackPending.has(pendingKey)) return readerState.ttsPackPending.get(pendingKey);
+  const pending = (async () => {
+    const local = await promiseWithTimeout(
+      localOfflinePackForChapter(
+        bookId,
+        readerState.ttsConfig?.offline_profile_key,
+        chapterIndex,
+        sentenceIndex,
+        textByIndex,
+      ),
+      8000,
+      "读取本机播放包超时，请关闭其他读书页面后重试",
+    ).catch(() => null);
+    if (local) {
+      if (scope !== readerState.ttsScope) return null;
+      const manifest = normalizedPackManifest(local, local.blob, textByIndex, {
+        bookId,
+        chapterIndex,
+        profileKey: readerState.ttsConfig?.offline_profile_key,
+      });
+      manifest.source = "local";
+      return rememberTtsPack(manifest, local.blob);
+    }
+    const serverStartedAt = performance.now();
+    const raw = await api("/api/reader/tts-pack", {
+      method: "POST",
+      body: JSON.stringify({
+        book_id: bookId,
+        chapter_index: Number(chapterIndex),
+        sentence_index: Number(sentenceIndex),
+      }),
+    });
+    const blob = await fetchPackBlob(raw.url);
+    const prepareMs = Math.max(0, performance.now() - serverStartedAt);
+    readerState.ttsPackPrepareMs = Math.max(prepareMs, Number(readerState.ttsPackPrepareMs || 0) * 0.75);
+    if (scope !== readerState.ttsScope) return null;
+    const manifest = normalizedPackManifest(raw, blob, textByIndex, {
+      bookId,
+      chapterIndex,
+      profileKey: readerState.ttsConfig?.offline_profile_key,
+    });
+    manifest.source = "server";
+    return rememberTtsPack(manifest, blob);
+  })().finally(() => readerState.ttsPackPending.delete(pendingKey));
+  readerState.ttsPackPending.set(pendingKey, pending);
+  return pending;
+}
+
+async function fetchTtsPack(
+  index,
+  token = readerState.ttsToken,
+  scope = readerState.ttsScope,
+) {
+  const normalizedIndex = Number(index);
+  if (!Number.isFinite(normalizedIndex) || normalizedIndex < 0 || normalizedIndex >= readerState.sentences.length) {
+    throw new Error("没有可朗读文本");
+  }
+  const textByIndex = new Map(readerState.sentences.map((sentence) => [
+    Number(sentence.index),
+    normalizedOfflineTtsText(sentence.text),
+  ]));
+  const pack = await requestTtsPackForChapter(
+    readerState.currentBookId,
+    readerState.currentChapter,
+    normalizedIndex,
+    textByIndex,
+    scope,
+  );
+  if (token !== readerState.ttsToken || scope !== readerState.ttsScope) return null;
+  if (pack?.source === "local") setListenStatus("本机离线播放包命中｜正在准备播放");
+  return pack;
 }
 
 function playbackSegmentAtTime(segments, currentTime) {
@@ -1946,6 +2122,22 @@ function playbackSegmentAtTime(segments, currentTime) {
   return active;
 }
 
+function scheduleSleepBoundaryPause() {
+  window.clearTimeout(readerState.sleepBoundaryTimerId);
+  readerState.sleepBoundaryTimerId = null;
+  const audio = readerState.ttsAudio;
+  const target = readerState.sleepPauseTarget;
+  if (!readerState.sleepPausePending || !audio || audio.paused || !target || !Number.isFinite(Number(target.time))) return;
+  const rate = Math.max(0.8, Math.min(Number(audio.playbackRate) || 1, 2));
+  const delay = Math.max(0, (Number(target.time) - audio.currentTime) / rate * 1000);
+  readerState.sleepBoundaryTimerId = window.setTimeout(() => {
+    if (!readerState.sleepPausePending || readerState.ttsAudio !== audio || readerState.sleepPauseTarget !== target) return;
+    audio.pause();
+    audio.volume = 1;
+    finishSleepPause(target.index);
+  }, delay);
+}
+
 function setSleepPauseTargetForCurrentAudio() {
   const audio = readerState.ttsAudio;
   if (!audio) {
@@ -1956,6 +2148,7 @@ function setSleepPauseTargetForCurrentAudio() {
   readerState.sleepPauseTarget = segment
     ? { chapterIndex: segment.chapterIndex, index: segment.index, time: segment.end }
     : { chapterIndex: readerState.currentChapter, index: readerState.currentSentence, time: audio.duration };
+  scheduleSleepBoundaryPause();
 }
 
 function adoptPrefetchedChapterForPlayback(chapterIndex) {
@@ -1964,14 +2157,14 @@ function adoptPrefetchedChapterForPlayback(chapterIndex) {
   if (!entry
     || !prepared
     || entry.bookId !== readerState.currentBookId
-    || entry.chapterIndex !== Number(chapterIndex)) return false;
-  entry.adopted = true;
+    || entry.chapterIndex !== Number(chapterIndex)
+    || entry.scope !== readerState.ttsScope) return false;
   const data = prepared.data;
   readerState.currentBook = data.book;
   readerState.currentChapter = data.chapter.index;
   readerState.currentSentence = 0;
   $("chapterSelect").value = String(readerState.currentChapter);
-  renderChapter(data.chapter, [...prepared.audios]);
+  renderChapter(data.chapter, [...(prepared.packs || [])]);
   saveProgressSoon();
   setStatus(readerState.currentBook.title);
   updateMediaSessionMetadata();
@@ -2000,231 +2193,209 @@ function syncTtsPlaybackSegment(audio, token) {
 }
 
 function releaseActiveTtsPlaybackUrl() {
-  if (readerState.activeTtsPlaybackUrl) URL.revokeObjectURL(readerState.activeTtsPlaybackUrl);
-  readerState.activeTtsPlaybackUrl = "";
+  readerState.activeTtsPackKey = "";
   readerState.ttsPlaybackSegments = [];
 }
 
-async function fetchTtsAudio(index, token = readerState.ttsToken, scope = readerState.ttsScope) {
-  const normalizedIndex = Number(index);
-  if (!Number.isFinite(normalizedIndex) || normalizedIndex < 0 || normalizedIndex >= readerState.sentences.length) {
-    throw new Error("没有可朗读文本");
-  }
-  if (token === readerState.ttsToken && scope === readerState.ttsScope && readerState.ttsUrls.has(normalizedIndex)) {
-    return readerState.ttsUrls.get(normalizedIndex);
-  }
-  const pendingKey = `${scope}:${normalizedIndex}`;
-  if (readerState.ttsPending.has(pendingKey)) {
-    // Reuse an in-flight prefetch instead of spending a second MiMo request for the same sentence.
-    const isCurrentSentence = Number(readerState.currentSentence) === normalizedIndex;
-    if (token === readerState.ttsToken && scope === readerState.ttsScope && readerState.reading && isCurrentSentence) {
-      setListenStatus("预加载尚未完成｜等待语音");
+function ttsPrefetchPackCount(rate = readerState.playbackRate) {
+  const normalizedRate = Math.max(0.8, Math.min(Number(rate) || 1, 2));
+  const baseCount = Math.max(2, Math.ceil(normalizedRate * 2));
+  const minimumWallSeconds = 5 / normalizedRate;
+  const measuredPrepareSeconds = Math.max(0, Number(readerState.ttsPackPrepareMs || 0) / 1000);
+  const latencyCount = measuredPrepareSeconds > minimumWallSeconds * 0.5
+    ? Math.ceil(measuredPrepareSeconds / minimumWallSeconds) + 2
+    : baseCount;
+  return Math.min(8, Math.max(baseCount, latencyCount));
+}
+
+async function prefetchChapterPackStarts(
+  bookId,
+  chapterIndex,
+  sentenceIndexes,
+  textByIndex,
+  token = readerState.ttsToken,
+  scope = readerState.ttsScope,
+) {
+  const indexes = [...new Set(sentenceIndexes.map(Number).filter(Number.isFinite))];
+  const results = new Array(indexes.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < indexes.length) {
+      if (token !== readerState.ttsToken
+        || scope !== readerState.ttsScope
+        || readerState.currentBookId !== bookId
+        || !readerState.reading) return;
+      const position = cursor;
+      cursor += 1;
+      results[position] = await requestTtsPackForChapter(
+        bookId,
+        chapterIndex,
+        indexes[position],
+        textByIndex,
+        scope,
+      );
     }
-    return readerState.ttsPending.get(pendingKey);
+  };
+  const workerCount = Math.min(TTS_PACK_PREFETCH_WORKERS, indexes.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  if (results.some((pack) => !pack)) return null;
+  return results;
+}
+
+async function prefetchNextChapterIfNeeded(pack, preparedCount, token, scope) {
+  if (pack.remainingPackCount === null || pack.remainingPackCount > preparedCount) return;
+  const nextChapter = await prefetchNextChapterAudio(token, scope);
+  if (Number(readerState.currentChapter) + 1 < readerState.chapters.length && !nextChapter) {
+    throw new Error("下一章播放缓冲准备失败");
   }
-  const text = sentenceText(normalizedIndex);
-  if (!text || !hasReadableText(text)) throw new Error("没有可朗读文本");
-  const isActiveCurrentSentence = () => (
-    token === readerState.ttsToken
-    && scope === readerState.ttsScope
-    && readerState.reading
-    && Number(readerState.currentSentence) === normalizedIndex
-  );
-  const pending = (async () => {
-    const offlineBlob = await localOfflineAudio(normalizedIndex, text);
-    if (offlineBlob) {
-      if (isActiveCurrentSentence()) setListenStatus("本机离线缓存命中｜正在准备播放");
-      return { blob: offlineBlob, cacheState: "local" };
-    }
-    if (isActiveCurrentSentence()) {
-      setListenStatus("正在检查服务器音频缓存");
-      try {
-        const cacheStatus = await api("/api/reader/tts/cache", {
-          method: "POST",
-          body: JSON.stringify({ text }),
-        });
-        if (isActiveCurrentSentence()) {
-          setListenStatus(cacheStatus.cached
-            ? "服务器缓存命中｜读取音频中"
-            : "服务器缓存未命中｜等待 MiMo 生成");
-        }
-      } catch {
-        if (isActiveCurrentSentence()) setListenStatus("缓存状态检查失败，正在直接获取语音");
-      }
-    }
-    return apiBlob(
-      "/api/reader/tts",
-      {
-        method: "POST",
-        body: JSON.stringify({ text }),
-      },
-      ({ cacheState, generateMs }) => {
-        if (!isActiveCurrentSentence()) return;
-        if (cacheState === "hit") {
-          setListenStatus("服务器缓存命中｜读取音频中");
-        } else {
-          setListenStatus(`MiMo 生成 ${formatStageDuration(generateMs)}｜下载音频中`);
-        }
-      },
+}
+
+async function prefetchFollowingTtsPacks(pack, token = readerState.ttsToken, scope = readerState.ttsScope) {
+  if (!pack || token !== readerState.ttsToken || scope !== readerState.ttsScope || !readerState.reading) return;
+  const desiredPacks = ttsPrefetchPackCount();
+  const hintedIndexes = Array.isArray(pack.nextStartSentenceIndexes)
+    ? pack.nextStartSentenceIndexes.slice(0, desiredPacks)
+    : [];
+  if (pack.remainingPackCount !== null) {
+    const textByIndex = new Map(readerState.sentences.map((sentence) => [
+      Number(sentence.index),
+      normalizedOfflineTtsText(sentence.text),
+    ]));
+    const prepared = await prefetchChapterPackStarts(
+      readerState.currentBookId,
+      readerState.currentChapter,
+      hintedIndexes,
+      textByIndex,
+      token,
+      scope,
     );
-  })().then(({ blob }) => {
-    const url = URL.createObjectURL(blob);
-    readerState.ttsPending.delete(pendingKey);
-    if (scope !== readerState.ttsScope) {
-      URL.revokeObjectURL(url);
-      return "";
+    if (prepared === null) return;
+    await prefetchNextChapterIfNeeded(pack, hintedIndexes.length, token, scope);
+    return;
+  }
+
+  let nextIndex = nextReadableSentenceIndex(Number(pack.endSentenceIndex) + 1);
+  let prepared = 0;
+  while (nextIndex >= 0 && prepared < desiredPacks) {
+    if (token !== readerState.ttsToken || scope !== readerState.ttsScope || !readerState.reading) return;
+    const nextPack = await fetchTtsPack(nextIndex, token, scope);
+    if (!nextPack) return;
+    prepared += 1;
+    nextIndex = nextReadableSentenceIndex(Number(nextPack.endSentenceIndex) + 1);
+  }
+  if (nextIndex < 0 && token === readerState.ttsToken && scope === readerState.ttsScope && readerState.reading) {
+    const nextChapter = await prefetchNextChapterAudio(token, scope);
+    if (Number(readerState.currentChapter) + 1 < readerState.chapters.length && !nextChapter) {
+      throw new Error("下一章播放缓冲准备失败");
     }
-    rememberTtsUrl(normalizedIndex, url, blob);
-    return url;
-  }).catch((error) => {
-    readerState.ttsPending.delete(pendingKey);
-    throw error;
-  });
-  readerState.ttsPending.set(pendingKey, pending);
-  return pending;
+  }
 }
 
 async function prefetchUpcomingTtsAudio(index, token = readerState.ttsToken, scope = readerState.ttsScope) {
-  const prefetches = ttsPrefetchIndexes(index);
-  const budget = ttsPrefetchBudget(index);
-  const nextChapterWindow = budget.maxItems * TTS_NEXT_CHAPTER_PREFETCH_MULTIPLIER;
-  const remainingWindow = upcomingReadableSentenceIndexes(
-    Number(index) + 1,
-    nextChapterWindow + 1,
-  );
-  const shouldPrefetchNextChapter = remainingWindow.length <= nextChapterWindow;
-  for (const nextIndex of prefetches) {
-    if (token !== readerState.ttsToken || scope !== readerState.ttsScope || !readerState.reading) return;
-    try {
-      await fetchTtsAudio(nextIndex, token, scope);
-    } catch {
-      // Prefetch failures are retried normally when the sentence becomes current.
-    }
-  }
-  if (token === readerState.ttsToken
-    && scope === readerState.ttsScope
-    && readerState.reading
-    && shouldPrefetchNextChapter) {
-    await prefetchNextChapterAudio(token, scope);
+  if (token !== readerState.ttsToken || scope !== readerState.ttsScope || !readerState.reading) return;
+  try {
+    const pack = rememberedTtsPack(readerState.currentChapter, Number(index), readerState.currentBookId)
+      || await fetchTtsPack(Number(index), token, scope);
+    await prefetchFollowingTtsPacks(pack, token, scope);
+  } catch {
+    // Playback performs the authoritative retry when a prefetched pack is needed.
   }
 }
 
-function readableChapterSentences(chapter, limit = TTS_MERGED_AUDIO_MAX_ITEMS) {
+function readableChapterSentences(chapter) {
   const sentences = [];
   for (const paragraph of chapter?.paragraphs || []) {
     if (paragraph?.type === "image") continue;
     for (const sentence of paragraph?.sentences || []) {
-      if (!hasReadableText(sentence?.text)) continue;
-      sentences.push(sentence);
-      if (sentences.length >= limit) return sentences;
+      if (hasReadableText(sentence?.text)) sentences.push(sentence);
     }
   }
   return sentences;
 }
 
-async function extendNextChapterAudio(entry, prepared, token, scope) {
-  if (!prepared
-    || entry.adopted
-    || token !== readerState.ttsToken
-    || scope !== readerState.ttsScope
-    || readerState.currentBookId !== entry.bookId
-    || !readerState.reading) {
-    return prepared;
-  }
-  const firstSentence = readableChapterSentences(prepared.data.chapter, 1)[0];
-  if (!firstSentence) return prepared;
-  const budget = ttsPrefetchBudgetForText(firstSentence.text, entry.playbackRate);
-  const candidates = readableChapterSentences(prepared.data.chapter, budget.maxItems);
-  let totalChars = prepared.audios.reduce((total, audio) => total + ttsTextLength(audio.text), 0);
-  for (const sentence of candidates.slice(prepared.audios.length)) {
-    if (token !== readerState.ttsToken
-      || scope !== readerState.ttsScope
-      || readerState.currentBookId !== entry.bookId
-      || !readerState.reading) break;
-    try {
-      const { blob } = await apiBlob("/api/reader/tts", {
-        method: "POST",
-        body: JSON.stringify({ text: sentence.text }),
-      });
-      if (entry.adopted
-        || token !== readerState.ttsToken
-        || scope !== readerState.ttsScope
-        || readerState.currentBookId !== entry.bookId
-        || !readerState.reading) break;
-      const wavInfo = await parseWavBlob(blob).catch(() => null);
-      prepared.audios.push({ index: Number(sentence.index), text: sentence.text, blob, wavInfo });
-      totalChars += ttsTextLength(sentence.text);
-      if (prepared.audios.length >= budget.minItems && totalChars >= budget.targetChars) break;
-    } catch {
-      // The normal current-sentence request retries if chapter-boundary prefetch fails.
-      break;
-    }
-  }
-  return prepared;
-}
-
-function prefetchNextChapterAudio(token = readerState.ttsToken, scope = readerState.ttsScope) {
+function prefetchNextChapterAudio(
+  token = readerState.ttsToken,
+  scope = readerState.ttsScope,
+) {
   const bookId = readerState.currentBookId;
   const chapterIndex = Number(readerState.currentChapter) + 1;
-  const playbackRate = Math.max(1, Math.min(Number(readerState.playbackRate) || 1, 2));
   if (!bookId || chapterIndex >= readerState.chapters.length) return Promise.resolve(null);
   const existing = readerState.nextChapterPrefetch;
   if (existing
     && existing.bookId === bookId
     && existing.chapterIndex === chapterIndex
-    && existing.scope === scope) {
-    if (playbackRate > existing.playbackRate) {
-      existing.playbackRate = playbackRate;
-      existing.promise = existing.promise
-        .then((prepared) => extendNextChapterAudio(existing, prepared, token, scope))
-        .catch(() => null);
-    }
-    return existing.promise;
-  }
+    && existing.scope === scope) return existing.promise;
   const entry = {
     bookId,
     chapterIndex,
     scope,
-    playbackRate,
-    adopted: false,
     prepared: null,
-    readyPromise: null,
     promise: null,
   };
-  entry.readyPromise = (async () => {
+  entry.promise = (async () => {
     const data = await api(`/api/books/${bookId}/chapters/${chapterIndex}`);
-    const prepared = { data, audios: [] };
-    entry.prepared = prepared;
-    const firstSentence = readableChapterSentences(data.chapter, 1)[0];
-    if (!firstSentence
+    const chapterSentences = readableChapterSentences(data.chapter);
+    const firstSentence = chapterSentences[0];
+    const prepared = { data, packs: [] };
+    if (!firstSentence) {
+      entry.prepared = prepared;
+      return prepared;
+    }
+    if (token !== readerState.ttsToken
+      || scope !== readerState.ttsScope
+      || readerState.currentBookId !== bookId
+      || !readerState.reading) return null;
+    const textByIndex = chapterSentenceTextMap(data.chapter);
+    const firstPack = await requestTtsPackForChapter(
+      bookId,
+      chapterIndex,
+      Number(firstSentence.index),
+      textByIndex,
+      scope,
+    );
+    if (!firstPack) return null;
+    const desiredPacks = ttsPrefetchPackCount();
+    const hintedIndexes = Array.isArray(firstPack.nextStartSentenceIndexes)
+      ? firstPack.nextStartSentenceIndexes.slice(0, Math.max(0, desiredPacks - 1))
+      : [];
+    let following = [];
+    if (firstPack.remainingPackCount !== null) {
+      following = await prefetchChapterPackStarts(
+        bookId,
+        chapterIndex,
+        hintedIndexes,
+        textByIndex,
+        token,
+        scope,
+      );
+    } else {
+      let nextSentence = chapterSentences.find(
+        (sentence) => Number(sentence.index) > Number(firstPack.endSentenceIndex),
+      );
+      while (nextSentence && following.length < Math.max(0, desiredPacks - 1)) {
+        const pack = await requestTtsPackForChapter(
+          bookId,
+          chapterIndex,
+          Number(nextSentence.index),
+          textByIndex,
+          scope,
+        );
+        if (!pack) return null;
+        following.push(pack);
+        nextSentence = chapterSentences.find(
+          (sentence) => Number(sentence.index) > Number(pack.endSentenceIndex),
+        );
+      }
+    }
+    if (following === null
       || token !== readerState.ttsToken
       || scope !== readerState.ttsScope
       || readerState.currentBookId !== bookId
-      || !readerState.reading) return prepared;
-    try {
-      const { blob } = await apiBlob("/api/reader/tts", {
-        method: "POST",
-        body: JSON.stringify({ text: firstSentence.text }),
-      });
-      if (token !== readerState.ttsToken
-        || scope !== readerState.ttsScope
-        || readerState.currentBookId !== bookId
-        || !readerState.reading) return prepared;
-      const wavInfo = await parseWavBlob(blob).catch(() => null);
-      prepared.audios.push({
-        index: Number(firstSentence.index),
-        text: firstSentence.text,
-        blob,
-        wavInfo,
-      });
-    } catch {
-      // Normal playback retries the first sentence if this early request fails.
-    }
+      || !readerState.reading) return null;
+    prepared.packs = [firstPack, ...following];
+    entry.prepared = prepared;
     return prepared;
   })().catch(() => null);
-  entry.promise = entry.readyPromise
-    .then((prepared) => extendNextChapterAudio(entry, prepared, token, scope))
-    .catch(() => null);
   readerState.nextChapterPrefetch = entry;
   return entry.promise;
 }
@@ -2233,9 +2404,14 @@ function stopListening(resetStatus = true, clearTimer = true) {
   readerState.ttsToken += 1;
   readerState.reading = false;
   readerState.paused = false;
+  readerState.ttsPreparing = false;
+  stopSleepFade();
   if (clearTimer) clearSleepTimer(true);
   if (readerState.ttsAudio) {
     readerState.ttsAudio.pause();
+    window.clearTimeout(readerState.sleepBoundaryTimerId);
+    readerState.sleepBoundaryTimerId = null;
+    readerState.ttsAudio.autoplay = false;
     readerState.ttsAudio.onplaying = null;
     readerState.ttsAudio.onended = null;
     readerState.ttsAudio.onerror = null;
@@ -2262,12 +2438,21 @@ async function startListeningFrom(index = readerState.currentSentence) {
   readerState.ttsToken += 1;
   readerState.reading = true;
   readerState.paused = false;
+  readerState.ttsPreparing = true;
+  const token = readerState.ttsToken;
   updateListenButtons();
   syncReaderWakeLock();
-  await playSentence(nextReadableSentenceIndex(index), readerState.ttsToken);
+  try {
+    await playSentence(nextReadableSentenceIndex(index), token);
+  } finally {
+    if (token === readerState.ttsToken) {
+      readerState.ttsPreparing = false;
+      updateListenButtons();
+    }
+  }
 }
 
-async function playSentence(index, token = readerState.ttsToken) {
+async function playSentence(index, token = readerState.ttsToken, continuous = false) {
   if (!readerState.reading || token !== readerState.ttsToken) return;
   const readableIndex = nextReadableSentenceIndex(index);
   if (readableIndex < 0 || readableIndex >= readerState.sentences.length) {
@@ -2276,7 +2461,7 @@ async function playSentence(index, token = readerState.ttsToken) {
       setMediaSessionPlaybackState("playing");
       try {
         await loadChapter(readerState.currentChapter + 1, 0);
-        await playSentence(nextReadableSentenceIndex(0), token);
+        await playSentence(nextReadableSentenceIndex(0), token, true);
       } catch (error) {
         if (readerState.reading && token === readerState.ttsToken) {
           setListenStatus(error.message || "切换下一章失败");
@@ -2289,58 +2474,59 @@ async function playSentence(index, token = readerState.ttsToken) {
     setListenStatus("本书朗读完成");
     return;
   }
+
   index = readableIndex;
   highlightSentence(index, true);
   updateMediaSessionMetadata();
   setMediaSessionPlaybackState("playing");
   let scope = readerState.ttsScope;
   saveProgressSoon();
-  setListenStatus(readerState.ttsUrls.has(Number(index)) ? "浏览器内存缓存命中，正在准备播放" : "正在准备检查服务器缓存");
+  const remembered = rememberedTtsPack(readerState.currentChapter, index, readerState.currentBookId);
+  setListenStatus(remembered ? "播放包内存缓存命中｜正在准备播放" : "正在准备当前句音频");
+
   try {
-    const url = await fetchTtsAudio(index, token, scope);
-    if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
-    if (!url) return;
-    prefetchUpcomingTtsAudio(index, token, scope);
-    const playback = await prepareTtsPlayback(index, url, scope);
-    if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) {
-      if (playback.owned) URL.revokeObjectURL(playback.url);
-      return;
-    }
-    if (playback.lastChapterIndex === Number(readerState.currentChapter)
-      && playback.lastIndex !== Number(index)) {
-      prefetchUpcomingTtsAudio(playback.lastIndex, token, scope);
+    const pack = remembered || await fetchTtsPack(index, token, scope);
+    if (!pack || !readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
+    const startSegment = pack.segments.find((segment) => Number(segment.index) === Number(index));
+    if (!startSegment) throw new Error("播放包不包含当前句");
+
+    if (!continuous) {
+      setListenStatus(`正在准备连续播放缓冲（后续 ${ttsPrefetchPackCount()} 个播放包）`);
+      await prefetchFollowingTtsPacks(pack, token, scope);
+      if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
+    } else {
+      prefetchFollowingTtsPacks(pack, token, scope).catch(() => {});
     }
     const audio = readerState.ttsAudio || new Audio();
-    audio.pause();
+    if (!continuous) audio.pause();
     audio.onplaying = null;
     audio.onended = null;
     audio.onerror = null;
     audio.ontimeupdate = null;
     releaseActiveTtsPlaybackUrl();
-    readerState.activeTtsPlaybackUrl = playback.owned ? playback.url : "";
-    readerState.ttsPlaybackSegments = playback.segments;
+    readerState.activeTtsPackKey = pack.packKey;
+    readerState.ttsPlaybackSegments = pack.segments;
     if (readerState.sleepPausePending) readerState.sleepPauseTarget = null;
     audio.volume = 1;
     applyAudioPlaybackRate(audio);
-    audio.src = playback.url;
+    audio.autoplay = continuous;
+    audio.src = pack.url;
     audio.preload = "auto";
     readerState.ttsAudio = audio;
+
     audio.onplaying = () => {
-      if (token === readerState.ttsToken && scope === readerState.ttsScope) {
-        applyAudioPlaybackRate(audio);
-        setMediaSessionPlaybackState("playing");
-        setListenStatus(`正在朗读：第 ${Number(index) + 1} 句`);
-      }
+      if (token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
+      applyAudioPlaybackRate(audio);
+      setMediaSessionPlaybackState("playing");
+      if (readerState.sleepPausePending) scheduleSleepBoundaryPause();
+      const segment = playbackSegmentAtTime(pack.segments, audio.currentTime) || startSegment;
+      setListenStatus(`正在朗读：第 ${Number(segment.index) + 1} 句`);
     };
     audio.ontimeupdate = () => {
       if (token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
       let sleepTarget = readerState.sleepPauseTarget;
       if (readerState.sleepPausePending && sleepTarget && Number.isFinite(sleepTarget.time)
-        && audio.currentTime >= sleepTarget.time - 0.01) {
-        if (Number(sleepTarget.chapterIndex) !== Number(readerState.currentChapter)
-          && adoptPrefetchedChapterForPlayback(sleepTarget.chapterIndex)) {
-          scope = readerState.ttsScope;
-        }
+        && audio.currentTime >= sleepTarget.time - 0.03) {
         audio.pause();
         audio.volume = 1;
         finishSleepPause(sleepTarget.index);
@@ -2354,18 +2540,22 @@ async function playSentence(index, token = readerState.ttsToken) {
       startSleepFadeIfNeeded(audio, sleepTarget?.time);
     };
     audio.onended = () => {
-      if (token !== readerState.ttsToken) return;
-      if (Number(playback.lastChapterIndex) !== Number(readerState.currentChapter)
-        && adoptPrefetchedChapterForPlayback(playback.lastChapterIndex)) {
-        scope = readerState.ttsScope;
-      }
-      if (scope !== readerState.ttsScope) return;
+      if (token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
+      stopSleepFade();
       audio.volume = 1;
       if (readerState.sleepPausePending) {
-        finishSleepPause(readerState.sleepPauseTarget?.index ?? playback.lastIndex);
+        finishSleepPause(readerState.sleepPauseTarget?.index ?? pack.endSentenceIndex);
         return;
       }
-      playSentence(nextReadableSentenceIndex(Number(playback.lastIndex) + 1), token);
+      const nextIndex = nextReadableSentenceIndex(Number(pack.endSentenceIndex) + 1);
+      if (nextIndex < 0
+        && readerState.currentChapter + 1 < readerState.chapters.length
+        && adoptPrefetchedChapterForPlayback(readerState.currentChapter + 1)) {
+        scope = readerState.ttsScope;
+        playSentence(nextReadableSentenceIndex(0), token, true);
+        return;
+      }
+      playSentence(nextIndex, token, true);
     };
     audio.onerror = () => {
       if (token === readerState.ttsToken && scope === readerState.ttsScope) {
@@ -2373,11 +2563,22 @@ async function playSentence(index, token = readerState.ttsToken) {
         stopListening(false);
       }
     };
-    await waitForAudioReady(audio);
+
+    await waitForAudioReady(audio, token, scope);
     if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
+    const safeStart = Math.max(0, Math.min(Number(startSegment.start) || 0, Math.max(0, audio.duration - 0.05)));
+    if (safeStart > 0.01) audio.currentTime = safeStart;
     if (readerState.sleepPausePending && !readerState.sleepPauseTarget) setSleepPauseTargetForCurrentAudio();
     applyAudioPlaybackRate(audio);
-    await audio.play();
+    try {
+      await audio.play();
+    } catch (error) {
+      if (error?.name === "NotAllowedError") {
+        throw new Error("浏览器阻止了自动播放，请再次点击播放");
+      }
+      throw error;
+    }
+    if (readerState.sleepPausePending) scheduleSleepBoundaryPause();
   } catch (error) {
     if (token === readerState.ttsToken && scope === readerState.ttsScope) {
       setListenStatus(error.message);
@@ -2389,6 +2590,14 @@ async function playSentence(index, token = readerState.ttsToken) {
 }
 
 async function toggleListeningPause() {
+  if (readerState.ttsPreparing) {
+    stopListening(false, false);
+    readerState.paused = true;
+    updateListenButtons();
+    setMediaSessionPlaybackState("paused");
+    setListenStatus("已暂停");
+    return;
+  }
   if (!readerState.reading) {
     await startListeningFrom(readerState.currentSentence);
     return;
@@ -2398,11 +2607,16 @@ async function toggleListeningPause() {
     readerState.paused = false;
     applyAudioPlaybackRate(readerState.ttsAudio);
     await readerState.ttsAudio.play();
+    if (readerState.sleepPausePending) scheduleSleepBoundaryPause();
     setMediaSessionPlaybackState("playing");
     setListenStatus("继续朗读");
   } else {
     readerState.paused = true;
     readerState.ttsAudio.pause();
+    stopSleepFade();
+    window.clearTimeout(readerState.sleepBoundaryTimerId);
+    readerState.sleepBoundaryTimerId = null;
+    readerState.ttsAudio.autoplay = false;
     setMediaSessionPlaybackState("paused");
     setListenStatus("已暂停");
   }
@@ -2728,9 +2942,11 @@ function restoreReaderSettings() {
   const activeFont = document.querySelector(`.font-option[data-font="${fontId}"]`);
   if (activeFont) activeFont.classList.add("active");
   applyReaderTheme(window.localStorage.getItem("readerTheme") === "dark" ? "dark" : "light");
-  const savedPlaybackRate = window.localStorage.getItem("readerPlaybackRate");
-  if (savedPlaybackRate && $("playbackRateSelect")) {
-    $("playbackRateSelect").value = savedPlaybackRate;
+  const savedPlaybackRate = Number(window.localStorage.getItem("readerPlaybackRate"));
+  if ($("playbackRateSelect")) {
+    $("playbackRateSelect").value = [0.8, 1, 1.2, 1.5, 2].includes(savedPlaybackRate)
+      ? String(savedPlaybackRate)
+      : "1";
   }
   updatePlaybackRate();
   updateReaderFont();
@@ -2961,6 +3177,89 @@ function showOfflineCacheProgress(message, type = "", bookId = "") {
   updateOfflineProgressDensity();
 }
 
+function storedOfflineDownloadIntent(bookId = readerState.offlineBookId) {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(OFFLINE_DOWNLOAD_INTENT_KEY) || "null");
+    if (!value || value.bookId !== bookId || !Array.isArray(value.chapterIndexes)) return null;
+    const chapterIndexes = [...new Set(value.chapterIndexes.map(Number).filter(Number.isFinite))];
+    return chapterIndexes.length ? { bookId, chapterIndexes } : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveOfflineDownloadIntent(bookId, chapterIndexes) {
+  try {
+    window.localStorage.setItem(OFFLINE_DOWNLOAD_INTENT_KEY, JSON.stringify({
+      bookId,
+      chapterIndexes: [...new Set(chapterIndexes.map(Number).filter(Number.isFinite))],
+      savedAt: Date.now(),
+    }));
+  } catch {
+    // A denied localStorage write must not block the actual server/cache operation.
+  }
+}
+
+function clearOfflineDownloadIntent(bookId = "") {
+  try {
+    const current = JSON.parse(window.localStorage.getItem(OFFLINE_DOWNLOAD_INTENT_KEY) || "null");
+    if (bookId && current?.bookId && current.bookId !== bookId) return;
+    window.localStorage.removeItem(OFFLINE_DOWNLOAD_INTENT_KEY);
+  } catch {
+    // A denied localStorage write must not block cancellation or cleanup.
+  }
+}
+
+function offlineDownloadSummary(downloaded) {
+  const complete = offlineDownloadIsComplete(downloaded);
+  const missingServer = Math.max(0, downloaded.expectedSentences - downloaded.completedSentences);
+  if (!complete) {
+    return "本机下载结束 · 覆盖 " + downloaded.completedSentences + " 句 · 服务器缺失 " + missingServer + " 句";
+  }
+  if (downloaded.downloaded) {
+    return "本机下载完成 · 新增 " + downloaded.downloaded + " 包 · 已有 " + downloaded.existing
+      + " 包 · 覆盖 " + downloaded.completedSentences + " 句 · " + formatBytes(downloaded.downloadedBytes);
+  }
+  return "本机缓存已完整 · " + downloaded.existing + " 包 · 覆盖 " + downloaded.completedSentences + " 句";
+}
+
+function offlineDownloadIsComplete(downloaded) {
+  return Number(downloaded?.completed || 0) >= Number(downloaded?.expectedPacks || 0)
+    && Number(downloaded?.completedSentences || 0) >= Number(downloaded?.expectedSentences || 0);
+}
+
+async function continueStoredOfflineDownload(bookId, completedJob = null) {
+  const intent = storedOfflineDownloadIntent(bookId);
+  if (!intent) return false;
+  const validIndexes = new Set((readerState.offlineStatus?.chapters || []).map((item) => Number(item.index)));
+  const chapterIndexes = intent.chapterIndexes.filter((index) => validIndexes.has(index));
+  if (!chapterIndexes.length) {
+    clearOfflineDownloadIntent(bookId);
+    return false;
+  }
+  const serverJob = completedJob || await ensureServerOfflineCache(bookId, chapterIndexes);
+  if (serverJob?.status === "cancelled" || readerState.offlineCancelRequested) {
+    showOfflineCacheProgress(serverJob?.message || "任务已取消", "", bookId);
+    return false;
+  }
+  const failed = Math.max(0, Number(serverJob?.failed_sentences || 0));
+  const failedPacks = Math.max(0, Number(serverJob?.failed_packs || 0));
+  const failureText = (failed ? " · " + failed + " 句生成失败" : "")
+    + (failedPacks ? " · " + failedPacks + " 个播放包失败" : "")
+    + (failed || failedPacks ? "，可稍后重试" : "");
+  await requestPersistentBrowserStorage();
+  const downloaded = await downloadOfflineChapters(bookId, chapterIndexes);
+  const complete = offlineDownloadIsComplete(downloaded);
+  if (complete) clearOfflineDownloadIntent(bookId);
+  showOfflineCacheProgress(
+    offlineDownloadSummary(downloaded) + failureText,
+    failed || failedPacks || !complete ? "error" : "",
+    bookId,
+  );
+  await loadOfflineCacheStatus(bookId);
+  return true;
+}
+
 function setOfflineActiveJob(job = null) {
   const active = job
     && job.book_id === readerState.offlineBookId
@@ -2983,6 +3282,11 @@ function offlineJobProgressMessage(job) {
     + Number(job?.cached_sentences || 0) + " · 生成 "
     + Number(job?.generated_sentences || 0);
   if (failed) message += " · 失败 " + failed;
+  const totalPacks = Number(job?.total_packs || 0);
+  if (totalPacks) {
+    message += " · 播放包 " + Number(job?.completed_packs || 0) + " / " + totalPacks;
+    if (Number(job?.failed_packs || 0)) message += "（失败 " + Number(job.failed_packs) + "）";
+  }
   return message;
 }
 
@@ -2993,13 +3297,17 @@ async function resumeOfflineJob(job, bookId) {
   try {
     const completedJob = await waitForOfflineJob(job, bookId);
     const failed = Number(completedJob.failed_sentences || 0);
-    const hasFailures = completedJob.status === "done" && failed > 0;
+    const failedPacks = Number(completedJob.failed_packs || 0);
+    const hasFailures = completedJob.status === "done" && (failed > 0 || failedPacks > 0);
     showOfflineCacheProgress(
       completedJob.message || (completedJob.status === "cancelled" ? "任务已取消" : "服务器固定完成"),
       hasFailures ? "error" : "",
       bookId,
     );
     await loadOfflineCacheStatus(bookId);
+    if (completedJob.status === "done" && !readerState.offlineCancelRequested) {
+      await continueStoredOfflineDownload(bookId, completedJob);
+    }
   } catch (error) {
     showOfflineCacheProgress(error.message, "error", bookId);
   } finally {
@@ -3008,7 +3316,7 @@ async function resumeOfflineJob(job, bookId) {
   }
 }
 
-async function renderOfflineCacheStatus() {
+function renderOfflineCacheStatus(storage = "正在读取本机缓存") {
   const bookId = readerState.offlineBookId;
   const status = readerState.offlineStatus;
   const list = $("offlineChapterList");
@@ -3019,8 +3327,13 @@ async function renderOfflineCacheStatus() {
     setOfflineCacheBusy(readerState.offlineBusy);
     return;
   }
+  const fragment = document.createDocumentFragment();
   status.chapters.forEach((chapter) => {
-    const local = readerState.offlineLocalStats.get(Number(chapter.index)) || { entries: 0, sizeBytes: 0 };
+    const local = readerState.offlineLocalStats.get(Number(chapter.index)) || {
+      entries: 0,
+      sizeBytes: 0,
+      totalSentences: null,
+    };
     const label = document.createElement("label");
     label.className = "offline-chapter-item";
     const input = document.createElement("input");
@@ -3033,14 +3346,22 @@ async function renderOfflineCacheStatus() {
     name.textContent = (Number(chapter.index) + 1) + ". " + chapter.title;
     const state = document.createElement("span");
     state.className = "offline-chapter-state";
-    const total = Number(chapter.total_sentences || 0);
-    state.textContent = "服务器固定 " + Number(chapter.server_sentences || 0) + "/" + total + " 句 · "
+    const serverTotalNumber = Number(chapter.total_sentences);
+    const localTotalNumber = Number(local.totalSentences);
+    const total = chapter.total_sentences !== null && Number.isFinite(serverTotalNumber)
+      ? Math.max(0, serverTotalNumber)
+      : local.totalSentences !== null && local.totalSentences !== undefined
+        && Number.isInteger(localTotalNumber) && localTotalNumber >= Number(local.entries || 0)
+        ? localTotalNumber
+        : null;
+    const totalLabel = total === null ? "…" : String(total);
+    state.textContent = "服务器固定 " + Number(chapter.server_sentences || 0) + "/" + totalLabel + "句 · "
       + formatBytes(chapter.server_size_bytes || 0) + "｜本机 " + Number(local.entries || 0)
-      + "/" + total + " 句 · " + formatBytes(local.sizeBytes || 0);
+      + "/" + totalLabel + "句 · " + formatBytes(local.sizeBytes || 0);
     label.append(input, name, state);
-    list.appendChild(label);
+    fragment.appendChild(label);
   });
-  const storage = await browserStorageSummary();
+  list.appendChild(fragment);
   if (bookId !== readerState.offlineBookId) return;
   const profileLabel = status.profile_label || "默认音色";
   $("offlineCacheSummary").textContent = "《" + (readerState.offlineBook?.title || "当前书籍")
@@ -3050,12 +3371,30 @@ async function renderOfflineCacheStatus() {
 
 async function loadOfflineCacheStatus(bookId = readerState.offlineBookId) {
   if (!bookId) throw new Error("请先选择一本书，再管理离线缓存");
-  const status = await api("/api/books/" + bookId + "/tts-offline");
+  const status = await promiseWithTimeout(
+    api("/api/books/" + bookId + "/tts-offline"),
+    180000,
+    "读取服务器离线缓存状态超时",
+  );
   if (bookId !== readerState.offlineBookId) return null;
   readerState.offlineStatus = status;
-  readerState.offlineLocalStats = await localOfflineStats(bookId, status.profile_key, status.chapters);
+  readerState.offlineLocalStats = new Map();
+  const storagePromise = browserStorageSummary();
+  renderOfflineCacheStatus();
+  try {
+    readerState.offlineLocalStats = await promiseWithTimeout(
+      localOfflineStats(bookId, status.profile_key, status.chapters),
+      8000,
+      "读取本机离线缓存超时",
+    );
+    status.local_cache_error = "";
+  } catch (error) {
+    readerState.offlineLocalStats = new Map();
+    status.local_cache_error = error.message || "读取本机离线缓存失败";
+  }
   if (bookId !== readerState.offlineBookId) return null;
-  await renderOfflineCacheStatus();
+  const storage = await storagePromise;
+  renderOfflineCacheStatus(storage);
   return status;
 }
 
@@ -3080,7 +3419,20 @@ async function openOfflineCacheManager(book) {
       resumeOfflineJob(status.active_job, book.id);
     } else {
       setOfflineActiveJob(null);
-      showOfflineCacheProgress("", "", book.id);
+      if (storedOfflineDownloadIntent(book.id)) {
+        setOfflineCacheBusy(true);
+        try {
+          await continueStoredOfflineDownload(book.id);
+        } finally {
+          setOfflineCacheBusy(false);
+        }
+      } else {
+        showOfflineCacheProgress(
+          status.local_cache_error ? `服务器状态已加载；${status.local_cache_error}` : "",
+          status.local_cache_error ? "error" : "",
+          book.id,
+        );
+      }
     }
   } catch (error) {
     showOfflineCacheProgress(error.message, "error", book.id);
@@ -3113,6 +3465,7 @@ async function cancelOfflineJob() {
   const button = $("cancelOfflineJobBtn");
   button.disabled = true;
   readerState.offlineCancelRequested = true;
+  clearOfflineDownloadIntent(bookId);
 
   if (downloadController) {
     showOfflineCacheProgress("正在取消本机下载", "", bookId);
@@ -3120,7 +3473,7 @@ async function cancelOfflineJob() {
     return;
   }
 
-  showOfflineCacheProgress("正在取消，当前正在处理的句子完成后停止", "", bookId);
+  showOfflineCacheProgress("正在取消，当前处理完成后停止", "", bookId);
   const ownsWait = !readerState.offlineBusy;
   if (ownsWait) setOfflineCacheBusy(true);
 
@@ -3181,16 +3534,46 @@ async function downloadOfflineChapters(bookId, chapterIndexes) {
       );
       manifests.push(manifest);
     }
-    const total = manifests.reduce((count, manifest) => count + manifest.entries.length, 0);
+    const pending = manifests.flatMap((manifest) => (
+      manifest.entries.map((entry) => ({ manifest, entry }))
+    ));
+    const total = pending.length;
+    const expectedPacks = manifests.reduce((count, manifest) => count + Number(manifest.pack_count || 0), 0);
+    const expectedSentences = manifests.reduce((count, manifest) => count + Number(manifest.sentence_count || 0), 0);
+    const workerCount = Math.min(TTS_OFFLINE_DOWNLOAD_WORKERS, total);
+    let nextIndex = 0;
     let completed = 0;
+    let completedSentences = 0;
+    let downloaded = 0;
+    let existing = 0;
     let downloadedBytes = 0;
-    for (const manifest of manifests) {
-      for (const entry of manifest.entries) {
-        showOfflineCacheProgress(
-          "正在下载到本机 · " + completed + " / " + total + " 句 · " + formatBytes(downloadedBytes),
-          "",
-          bookId,
-        );
+
+    const showProgress = () => {
+      let message = "正在下载到本机";
+      if (workerCount > 1) message += "（" + workerCount + " 路并行）";
+      message += " · " + completedSentences + " / " + expectedSentences + " 句"
+        + " · " + completed + " / " + expectedPacks + " 包 · " + formatBytes(downloadedBytes);
+      if (existing) message += " · 已有 " + existing;
+      showOfflineCacheProgress(message, "", bookId);
+    };
+    const abortIfRequested = () => {
+      if (!controller.signal.aborted) return;
+      const error = new Error("本机下载已取消");
+      error.name = "AbortError";
+      throw error;
+    };
+    const downloadNext = async () => {
+      while (nextIndex < pending.length) {
+        abortIfRequested();
+        const { manifest, entry } = pending[nextIndex];
+        nextIndex += 1;
+        if (await hasLocalOfflinePack(manifest, entry)) {
+          existing += 1;
+          completed += 1;
+          completedSentences += Number(entry.sentence_count || 0);
+          showProgress();
+          continue;
+        }
         const response = await fetch(entry.url, {
           credentials: "same-origin",
           signal: controller.signal,
@@ -3200,12 +3583,34 @@ async function downloadOfflineChapters(bookId, chapterIndexes) {
           throw new Error(data.error || "音频下载失败：" + response.status);
         }
         const blob = await response.blob();
-        await saveLocalOfflineAudio(manifest, entry, blob);
+        if (!blob.size) throw new Error("下载的音频为空");
+        await saveLocalOfflinePack(manifest, entry, blob);
+        downloaded += 1;
         completed += 1;
+        completedSentences += Number(entry.sentence_count || 0);
         downloadedBytes += blob.size;
+        showProgress();
       }
+    };
+
+    const workers = Array.from({ length: workerCount }, () => downloadNext());
+    try {
+      await Promise.all(workers);
+    } catch (error) {
+      controller.abort();
+      await Promise.allSettled(workers);
+      throw error;
     }
-    return { completed, total, downloadedBytes };
+    return {
+      completed,
+      total,
+      expectedPacks,
+      expectedSentences,
+      completedSentences,
+      downloaded,
+      existing,
+      downloadedBytes,
+    };
   } finally {
     if (readerState.offlineDownloadController?.controller === controller) {
       readerState.offlineDownloadController = null;
@@ -3215,11 +3620,29 @@ async function downloadOfflineChapters(bookId, chapterIndexes) {
 }
 
 
-function sameOfflineChapterSelection(left, right) {
-  const selected = new Set((left || []).map(Number).filter(Number.isFinite));
-  const active = new Set((right || []).map(Number).filter(Number.isFinite));
-  return selected.size === active.size && [...selected].every((index) => active.has(index));
+async function ensureServerOfflineCache(bookId, chapterIndexes) {
+  let lastJob = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let data;
+    let joinedExisting = false;
+    try {
+      data = await api("/api/books/" + bookId + "/tts-offline", {
+        method: "POST",
+        body: JSON.stringify({ chapters: chapterIndexes }),
+      });
+    } catch (error) {
+      if (error.status !== 429 || !error.data?.job || error.data.job.book_id !== bookId) throw error;
+      data = { job: error.data.job };
+      joinedExisting = true;
+    }
+    if (data.complete) return lastJob;
+    const completed = await waitForOfflineJob(data.job, bookId);
+    lastJob = completed;
+    if (completed.status === "cancelled" || readerState.offlineCancelRequested || !joinedExisting) return completed;
+  }
+  return lastJob;
 }
+
 
 async function createOfflineCache(downloadToDevice) {
   const bookId = readerState.offlineBookId;
@@ -3228,55 +3651,48 @@ async function createOfflineCache(downloadToDevice) {
   readerState.offlineCancelRequested = false;
   setOfflineCacheBusy(true);
   try {
-    let data;
-    if (downloadToDevice) await requestPersistentBrowserStorage();
-    try {
-      data = await api("/api/books/" + bookId + "/tts-offline", {
-        method: "POST",
-        body: JSON.stringify({
-          chapters: chapterIndexes,
-        }),
-      });
-    } catch (error) {
-      if (
-        error.status !== 429
-        || !error.data?.job
-        || error.data.job.book_id !== bookId
-        || !sameOfflineChapterSelection(chapterIndexes, error.data.job.chapter_indexes)
-      ) throw error;
-      data = { job: error.data.job };
+    let completedJob = null;
+    if (downloadToDevice) {
+      saveOfflineDownloadIntent(bookId, chapterIndexes);
+      await requestPersistentBrowserStorage();
+    } else {
+      clearOfflineDownloadIntent(bookId);
     }
-    const completedJob = await waitForOfflineJob(data.job, bookId);
-    if (completedJob.status === "cancelled" || readerState.offlineCancelRequested) {
-      const message = completedJob.status === "cancelled"
+    completedJob = await ensureServerOfflineCache(bookId, chapterIndexes);
+    if (completedJob?.status === "cancelled" || readerState.offlineCancelRequested) {
+      const message = completedJob?.status === "cancelled"
         ? completedJob.message || "任务已取消"
-        : downloadToDevice ? "已停止后续本机下载" : completedJob.message;
+        : downloadToDevice ? "已停止后续本机下载" : completedJob?.message;
       showOfflineCacheProgress(message, "", bookId);
       await loadOfflineCacheStatus(bookId);
       return;
     }
-    const failed = Math.max(0, Number(completedJob.failed_sentences || 0));
-    const failedText = failed ? " · " + failed + " 句生成失败，可稍后重试" : "";
+    const failed = Math.max(0, Number(completedJob?.failed_sentences || 0));
+    const failedPacks = Math.max(0, Number(completedJob?.failed_packs || 0));
+    const failedText = (failed ? " · " + failed + " 句生成失败" : "")
+      + (failedPacks ? " · " + failedPacks + " 个播放包失败" : "")
+      + (failed || failedPacks ? "，可稍后重试" : "");
     if (!downloadToDevice) {
-      showOfflineCacheProgress(
-        "服务器固定完成 · 复用 " + Number(completedJob.cached_sentences || 0)
-          + " 句 · 生成 " + Number(completedJob.generated_sentences || 0) + " 句" + failedText,
-        failed ? "error" : "",
-        bookId,
-      );
+      const message = completedJob
+        ? "服务器固定完成 · 复用 " + Number(completedJob.cached_sentences || 0)
+          + " 句 · 生成 " + Number(completedJob.generated_sentences || 0) + " 句" + failedText
+        : "所选章节已完整固定，无需重复处理";
+      showOfflineCacheProgress(message, failed || failedPacks ? "error" : "", bookId);
       await loadOfflineCacheStatus(bookId);
       return;
     }
     const downloaded = await downloadOfflineChapters(bookId, chapterIndexes);
+    const complete = offlineDownloadIsComplete(downloaded);
+    if (complete) clearOfflineDownloadIntent(bookId);
     showOfflineCacheProgress(
-      "本地下载完成 · " + downloaded.completed + " 句 · "
-        + formatBytes(downloaded.downloadedBytes) + failedText,
-      failed ? "error" : "",
+      offlineDownloadSummary(downloaded) + failedText,
+      failed || failedPacks || !complete ? "error" : "",
       bookId,
     );
     await loadOfflineCacheStatus(bookId);
   } catch (error) {
     if (error.name === "AbortError") {
+      clearOfflineDownloadIntent(bookId);
       showOfflineCacheProgress("本机下载已取消，已下载部分已保留", "", bookId);
       await loadOfflineCacheStatus(bookId);
     } else {
@@ -3299,7 +3715,7 @@ async function deleteSelectedLocalOffline() {
   try {
     const removed = await deleteLocalOfflineChapters(bookId, profileKey, chapterIndexes);
     showOfflineCacheProgress(
-      `已删除本机缓存 ${removed.entries} 句 · ${formatBytes(removed.sizeBytes)}`,
+      `已删除本机缓存 ${removed.packs} 个播放包 · ${formatBytes(removed.sizeBytes)}`,
       "",
       bookId,
     );
@@ -3323,7 +3739,8 @@ async function unpinSelectedServerOffline() {
       body: JSON.stringify({ chapters: chapterIndexes }),
     });
     showOfflineCacheProgress(
-      `已取消服务器固定 ${removed.entries} 条 · ${formatBytes(removed.size_bytes)}`,
+      `已取消服务器固定 ${removed.entries} 条 · 清理播放包 `
+        + `${Number(removed.pack_entries || 0)} 个 / ${formatBytes(removed.removed_size_bytes || 0)}`,
       "",
       bookId,
     );
@@ -3338,18 +3755,54 @@ async function unpinSelectedServerOffline() {
 function renderTtsCacheStats(stats = {}) {
   const node = $("ttsCacheStats");
   if (!node) return;
-  const entries = Number(stats.entries || 0);
-  const expired = Number(stats.expired_entries || 0);
-  const pinned = Number(stats.pinned_entries || 0);
-  const pinnedText = pinned > 0 ? ` · 固定 ${pinned} 条 / ${formatBytes(stats.pinned_size_bytes || 0)}` : "";
-  const expiredText = expired > 0 ? `，待清理 ${expired} 条` : "";
-  node.textContent = `${entries} 条 · ${formatBytes(stats.size_bytes)} / ${formatBytes(stats.limit_bytes)} · 有效期 ${stats.ttl_days || 7} 天${pinnedText} · 最近 ${formatCacheTime(stats.newest_accessed_at)}${expiredText}`;
+  const entries = Number(stats.cache_entries ?? stats.entries ?? 0);
+  const fixed = Number(stats.fixed_entries ?? stats.pinned_entries ?? 0);
+  node.textContent = "缓存 " + entries + "句 · " + formatBytes(
+    stats.cache_disk_size_bytes ?? stats.disk_size_bytes ?? stats.size_bytes,
+  )
+    + "/" + formatBytes(stats.limit_bytes)
+    + " · 固定 " + fixed + "句/" + formatBytes(
+      stats.fixed_disk_size_bytes ?? stats.pinned_disk_size_bytes ?? stats.pinned_size_bytes ?? 0,
+    )
+    + " · 有效" + (stats.ttl_days || 7) + "天 · 更新" + formatCacheTime(stats.newest_accessed_at);
+}
+
+function scheduleTtsCacheStatsRetry(stats, attempt = 0) {
+  window.clearTimeout(ttsCacheStatsRetryTimer);
+  if (!stats?.refreshing || attempt >= 6) return;
+  ttsCacheStatsRetryTimer = window.setTimeout(async () => {
+    try {
+      const data = await api("/api/reader/tts-config");
+      const latest = data.config?.cache_stats || {};
+      if (readerState.ttsConfig) readerState.ttsConfig.cache_stats = latest;
+      renderTtsCacheStats(latest);
+      scheduleTtsCacheStatsRetry(latest, attempt + 1);
+    } catch {
+      // The regular config reload will retry later.
+    }
+  }, 400);
 }
 
 async function loadTtsConfig() {
   const data = await api("/api/reader/tts-config");
   readerState.ttsConfig = data.config;
   renderTtsConfig();
+  scheduleTtsCacheStatsRetry(data.config?.cache_stats || {});
+}
+
+function resizeTtsStylePrompt() {
+  const textarea = $("ttsStylePrompt");
+  if (!textarea) return;
+  if (!window.matchMedia("(max-width: 760px)").matches) {
+    textarea.style.height = "";
+    textarea.style.overflowY = "";
+    return;
+  }
+  textarea.style.height = "auto";
+  const maxHeight = Math.max(38, Math.min(180, Math.round(window.innerHeight * 0.28)));
+  const contentHeight = Math.max(38, textarea.scrollHeight);
+  textarea.style.height = `${Math.min(contentHeight, maxHeight)}px`;
+  textarea.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
 }
 
 function renderTtsConfig() {
@@ -3371,6 +3824,7 @@ function renderTtsConfig() {
   renderTtsVoiceOptions(config);
   $("ttsChunkChars").value = config.chunk_chars ?? 260;
   $("ttsStylePrompt").value = config.style_prompt || "";
+  window.requestAnimationFrame(resizeTtsStylePrompt);
   $("ttsCacheEnabled").checked = config.cache_enabled !== false;
   renderTtsCacheStats(config.cache_stats || {});
   renderQuickVoiceOptions(config);
@@ -3627,6 +4081,7 @@ $("saveMimoCookieBtn")?.addEventListener("click", () => saveMimoBalanceCookie())
 $("closeMimoCookieBtn")?.addEventListener("click", () => $("mimoCookieDialog").close());
 $("refreshMimoBalanceBtn")?.addEventListener("click", () => refreshMimoBalance());
 $("ttsModel").addEventListener("change", () => renderTtsVoiceOptions());
+$("ttsStylePrompt").addEventListener("input", resizeTtsStylePrompt);
 $("shelfBtn").addEventListener("click", returnToShelf);
 $("statisticsBtn").addEventListener("click", () => {
   renderStatistics();
@@ -3639,6 +4094,7 @@ $("manageBtn").addEventListener("click", () => {
 $("ttsBtn").addEventListener("click", () => {
   loadTtsConfig().catch((error) => showTtsConfigMessage(error.message, "error"));
   openReaderDialog($("ttsDialog"));
+  window.requestAnimationFrame(resizeTtsStylePrompt);
 });
 $("settingsBtn").addEventListener("click", () => {
   openReaderDialog($("settingsDialog"));
@@ -3665,6 +4121,7 @@ $("closeTtsBtn").addEventListener("click", () => $("ttsDialog").close());
 $("closeSleepTimerBtn")?.addEventListener("click", () => $("sleepTimerDialog").close());
 window.addEventListener("resize", () => {
   resizeQuickVoiceSelect();
+  resizeTtsStylePrompt();
   updateOfflineProgressDensity();
 });
 window.addEventListener("wheel", markUserScrollIntent, { passive: true });
@@ -3703,6 +4160,7 @@ window.addEventListener("pagehide", () => {
   readerState.wakeLockWanted = false;
   releaseReaderWakeLock();
   window.clearTimeout(readerState.mimoBalanceRetryTimer);
+  window.clearTimeout(ttsCacheStatsRetryTimer);
 });
 document.querySelectorAll(".reader-dialog").forEach((dialog) => {
   dialog.addEventListener("close", unlockReaderScroll);

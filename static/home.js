@@ -72,8 +72,8 @@ function renderServiceStatus(data) {
   $("metricAppCpu").textContent = `${data.process.cpu_percent}%`;
   $("metricAppMemory").textContent = `${formatBytes(data.process.rss_bytes)} | ${appMemoryPercent.toFixed(2)}%`;
   $("metricCache").textContent = `${data.cache.entries} / ${data.cache.limit}`;
-  $("metricTtsCacheEntries").textContent = `${Number(ttsCache.entries || 0)} 条`;
-  $("metricTtsCacheDetail").textContent = `${formatAudioCacheMegabytes(ttsCache.size_bytes)} / ${formatAudioCacheMegabytes(ttsCache.limit_bytes)} MB · ${ttsCache.ttl_days || 0} 天`;
+  $("metricTtsCacheEntries").textContent = `${Number(ttsCache.entries || 0)} 句`;
+  $("metricTtsCacheDetail").textContent = `缓 ${formatAudioCacheMegabytes(ttsCache.cache_disk_size_bytes ?? ttsCache.disk_size_bytes ?? ttsCache.size_bytes)}/${formatAudioCacheMegabytes(ttsCache.limit_bytes)} M · ${ttsCache.ttl_days || 0}天 | 固 ${formatAudioCacheMegabytes(ttsCache.fixed_disk_size_bytes ?? ttsCache.pinned_disk_size_bytes ?? ttsCache.pinned_size_bytes)} M`;
   $("metricSystemCpu").textContent = `${data.system.cpu_percent}%`;
   $("metricSystemMemory").textContent = `${data.system.memory_used_percent}% | ${formatBytes(data.system.memory_available_bytes)} 可用`;
   $("metricLoad").textContent = data.system.load_avg.map((item) => Number(item).toFixed(2)).join(" / ");

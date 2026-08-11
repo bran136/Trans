@@ -9,6 +9,7 @@
     <link rel="icon" type="image/svg+xml" sizes="any" href="{{ asset_url('site-icon.svg') }}">
     <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
     <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
+    <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
   </head>
   <body class="home-body">
     <main class="home-shell">
@@ -71,9 +72,9 @@
                 <strong id="metricCache">-</strong>
               </div>
               <div class="metric-card">
-                <span>音频缓存</span>
+                <span>TTS缓存</span>
                 <strong id="metricTtsCacheEntries">-</strong>
-                <small id="metricTtsCacheDetail">-</small>
+                <small id="metricTtsCacheDetail" class="tts-cache-detail">-</small>
               </div>
             </div>
           </section>
@@ -116,6 +117,7 @@
         <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
       </a>
     </div>
+    <script src="{{ asset_url('ui.js') }}"></script>
     <script src="{{ asset_url('font-cache.js') }}"></script>
     <script src="{{ asset_url('home.js') }}"></script>
   </body>

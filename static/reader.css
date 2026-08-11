@@ -9,6 +9,8 @@
   --panel: rgba(255, 255, 255, 0.86);
   --paper: #fffdf8;
   --shadow: 0 22px 60px rgba(48, 61, 118, 0.13);
+  --scrollbar-thumb: rgba(82, 99, 205, 0.46);
+  --scrollbar-thumb-hover: rgba(82, 99, 205, 0.68);
 }
 
 html {
@@ -18,6 +20,8 @@ html {
 html.reader-dark-root {
   color-scheme: dark;
   --reader-page-background: #0e1320;
+  --scrollbar-thumb: rgba(159, 176, 255, 0.5);
+  --scrollbar-thumb-hover: rgba(159, 176, 255, 0.72);
   background: #0e1320;
 }
 
@@ -62,6 +66,8 @@ body.reader-body.dialog-scroll-locked {
   --panel: rgba(18, 23, 33, 0.9);
   --paper: #11151d;
   --shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+  --scrollbar-thumb: rgba(159, 176, 255, 0.5);
+  --scrollbar-thumb-hover: rgba(159, 176, 255, 0.72);
   background: var(--reader-page-background);
 }
 
@@ -74,6 +80,21 @@ textarea {
 
 button {
   cursor: pointer;
+}
+
+button,
+a,
+.upload-drop {
+  -webkit-tap-highlight-color: transparent;
+}
+
+@media (hover: none) {
+  button:active:not(:disabled),
+  a:active,
+  .upload-drop:active {
+    translate: 0 2px;
+    scale: 0.98;
+  }
 }
 
 .reader-body {
@@ -776,7 +797,9 @@ button {
   border: 0;
   border-radius: 16px;
   padding: 0;
+  overflow: hidden;
   background: transparent;
+  box-shadow: var(--shadow);
 }
 
 .manage-dialog {
@@ -850,8 +873,18 @@ button {
   display: grid;
   gap: 8px;
   max-height: min(52vh, 460px);
+  padding: 7px 0 7px 7px;
   overflow: auto;
+  border: 1px solid rgba(107, 125, 227, 0.2);
+  border-radius: 6px;
+  background: rgba(107, 125, 227, 0.035);
   -webkit-overflow-scrolling: touch;
+}
+
+.reader-dark .manage-book-list,
+.reader-dark .offline-chapter-list {
+  border-color: rgba(127, 156, 255, 0.2);
+  background: rgba(127, 156, 255, 0.045);
 }
 
 .manage-book-row {
@@ -1249,7 +1282,7 @@ button {
 .offline-cache-dialog {
   width: min(760px, calc(100vw - 24px));
   max-height: none;
-  overflow: visible;
+  overflow: hidden;
 }
 
 .offline-cache-dialog .dialog-panel {
@@ -1408,7 +1441,10 @@ button {
   min-height: 0;
   gap: 5px;
   overflow: auto;
-  padding: 2px;
+  padding: 7px 0 7px 7px;
+  border: 1px solid rgba(107, 125, 227, 0.2);
+  border-radius: 6px;
+  background: rgba(107, 125, 227, 0.035);
 }
 
 .offline-chapter-item {
@@ -1731,12 +1767,25 @@ button {
 }
 
 .version-github-link {
+  position: relative;
+  z-index: 1;
   display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
   width: 14px;
   height: 14px;
   border-radius: 50%;
   opacity: 0.72;
+  touch-action: manipulation;
   transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.version-github-link::before {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: 50%;
 }
 
 .version-github-link img {
@@ -1930,12 +1979,40 @@ button {
 
   .tts-settings-grid {
     grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .tts-dialog .dialog-panel {
+    gap: 8px;
+    padding: 10px 12px;
+  }
+
+  .tts-config-panel {
+    gap: 6px;
+    padding-top: 5px;
+  }
+
+  .tts-settings-grid label {
+    gap: 3px;
+  }
+
+  .tts-settings-grid input,
+  .tts-settings-grid select {
+    min-height: 34px;
+  }
+
+  #ttsStylePrompt {
+    min-height: 38px;
+    padding: 7px 9px;
+    overflow-y: hidden;
+    resize: none;
   }
 
   .tts-cache-row {
     align-items: flex-start;
     flex-direction: column;
-    gap: 6px;
+    gap: 3px;
+    padding-top: 0;
   }
 
   .manage-book-row {
@@ -1963,7 +2040,7 @@ button {
     top: max(10px, env(safe-area-inset-top));
     right: max(8px, env(safe-area-inset-right));
     bottom: auto;
-    z-index: 8;
+    z-index: 30;
     width: max-content;
     padding: 4px 8px;
     font-size: 10px;
