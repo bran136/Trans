@@ -64,6 +64,7 @@ const readerState = {
   offlineActiveJobId: "",
   offlineDownloadController: null,
   offlineCancelRequested: false,
+  offlineRetry: null,
   metadataEditBookId: "",
 };
 
@@ -71,11 +72,10 @@ const $ = (id) => document.getElementById(id);
 const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || "";
 const TTS_OFFLINE_DB_NAME = "trans-reader-offline-v1";
 const TTS_OFFLINE_PACK_STORE = "packs";
-const TTS_OFFLINE_DOWNLOAD_WORKERS = 4;
+const TTS_OFFLINE_DOWNLOAD_WORKERS = 6;
 const TTS_PACK_PREFETCH_WORKERS = 4;
 const TTS_PACK_SCHEMA_VERSION = 2;
 const TTS_MAX_PACK_BYTES = 32 * 1024 * 1024;
-const OFFLINE_DOWNLOAD_INTENT_KEY = "readerOfflineDownloadIntentV1";
 let ttsOfflineDbPromise = null;
 let ttsCacheStatsRetryTimer = null;
 let mediaVolumeAdjustmentSupported = null;
@@ -3154,6 +3154,8 @@ function setOfflineCacheBusy(busy) {
   document.querySelectorAll("#offlineChapterList input[type=checkbox]").forEach((input) => {
     input.disabled = busy;
   });
+  const retryButton = $("retryOfflineJobBtn");
+  if (retryButton) retryButton.disabled = busy || !readerState.offlineRetry;
 }
 function updateOfflineProgressDensity() {
   const text = $("offlineCacheProgressText");
@@ -3165,7 +3167,23 @@ function updateOfflineProgressDensity() {
   });
 }
 
-function showOfflineCacheProgress(message, type = "", bookId = "") {
+function setOfflineRetry(retry = null) {
+  const valid = retry
+    && retry.bookId === readerState.offlineBookId
+    && Array.isArray(retry.chapterIndexes)
+    && retry.chapterIndexes.length;
+  readerState.offlineRetry = valid ? {
+    bookId: retry.bookId,
+    chapterIndexes: [...new Set(retry.chapterIndexes.map(Number).filter(Number.isFinite))],
+    downloadToDevice: !!retry.downloadToDevice,
+  } : null;
+  const button = $("retryOfflineJobBtn");
+  if (!button) return;
+  button.hidden = !readerState.offlineRetry;
+  button.disabled = readerState.offlineBusy || !readerState.offlineRetry;
+}
+
+function showOfflineCacheProgress(message, type = "", bookId = "", retry = null) {
   if (bookId && bookId !== readerState.offlineBookId) return;
   const node = $("offlineCacheProgress");
   const text = $("offlineCacheProgressText");
@@ -3174,40 +3192,8 @@ function showOfflineCacheProgress(message, type = "", bookId = "") {
   node.classList.toggle("visible", !!message);
   node.classList.toggle("error", type === "error");
   node.setAttribute("aria-hidden", message ? "false" : "true");
+  setOfflineRetry(retry);
   updateOfflineProgressDensity();
-}
-
-function storedOfflineDownloadIntent(bookId = readerState.offlineBookId) {
-  try {
-    const value = JSON.parse(window.localStorage.getItem(OFFLINE_DOWNLOAD_INTENT_KEY) || "null");
-    if (!value || value.bookId !== bookId || !Array.isArray(value.chapterIndexes)) return null;
-    const chapterIndexes = [...new Set(value.chapterIndexes.map(Number).filter(Number.isFinite))];
-    return chapterIndexes.length ? { bookId, chapterIndexes } : null;
-  } catch {
-    return null;
-  }
-}
-
-function saveOfflineDownloadIntent(bookId, chapterIndexes) {
-  try {
-    window.localStorage.setItem(OFFLINE_DOWNLOAD_INTENT_KEY, JSON.stringify({
-      bookId,
-      chapterIndexes: [...new Set(chapterIndexes.map(Number).filter(Number.isFinite))],
-      savedAt: Date.now(),
-    }));
-  } catch {
-    // A denied localStorage write must not block the actual server/cache operation.
-  }
-}
-
-function clearOfflineDownloadIntent(bookId = "") {
-  try {
-    const current = JSON.parse(window.localStorage.getItem(OFFLINE_DOWNLOAD_INTENT_KEY) || "null");
-    if (bookId && current?.bookId && current.bookId !== bookId) return;
-    window.localStorage.removeItem(OFFLINE_DOWNLOAD_INTENT_KEY);
-  } catch {
-    // A denied localStorage write must not block cancellation or cleanup.
-  }
 }
 
 function offlineDownloadSummary(downloaded) {
@@ -3228,36 +3214,23 @@ function offlineDownloadIsComplete(downloaded) {
     && Number(downloaded?.completedSentences || 0) >= Number(downloaded?.expectedSentences || 0);
 }
 
-async function continueStoredOfflineDownload(bookId, completedJob = null) {
-  const intent = storedOfflineDownloadIntent(bookId);
-  if (!intent) return false;
-  const validIndexes = new Set((readerState.offlineStatus?.chapters || []).map((item) => Number(item.index)));
-  const chapterIndexes = intent.chapterIndexes.filter((index) => validIndexes.has(index));
-  if (!chapterIndexes.length) {
-    clearOfflineDownloadIntent(bookId);
-    return false;
-  }
-  const serverJob = completedJob || await ensureServerOfflineCache(bookId, chapterIndexes);
-  if (serverJob?.status === "cancelled" || readerState.offlineCancelRequested) {
-    showOfflineCacheProgress(serverJob?.message || "任务已取消", "", bookId);
-    return false;
-  }
-  const failed = Math.max(0, Number(serverJob?.failed_sentences || 0));
-  const failedPacks = Math.max(0, Number(serverJob?.failed_packs || 0));
-  const failureText = (failed ? " · " + failed + " 句生成失败" : "")
-    + (failedPacks ? " · " + failedPacks + " 个播放包失败" : "")
-    + (failed || failedPacks ? "，可稍后重试" : "");
-  await requestPersistentBrowserStorage();
-  const downloaded = await downloadOfflineChapters(bookId, chapterIndexes);
-  const complete = offlineDownloadIsComplete(downloaded);
-  if (complete) clearOfflineDownloadIntent(bookId);
-  showOfflineCacheProgress(
-    offlineDownloadSummary(downloaded) + failureText,
-    failed || failedPacks || !complete ? "error" : "",
-    bookId,
-  );
-  await loadOfflineCacheStatus(bookId);
-  return true;
+function serverOfflineChaptersAreComplete(chapterIndexes) {
+  const chapters = new Map((readerState.offlineStatus?.chapters || []).map((chapter) => (
+    [Number(chapter.index), chapter]
+  )));
+  return chapterIndexes.every((chapterIndex) => {
+    const chapter = chapters.get(Number(chapterIndex));
+    if (!chapter) return false;
+    if (chapter.total_sentences === null || chapter.total_sentences === undefined) return false;
+    const totalSentences = Number(chapter.total_sentences);
+    const serverSentences = Number(chapter.server_sentences || 0);
+    if (!Number.isInteger(totalSentences) || !Number.isFinite(serverSentences)
+      || serverSentences < totalSentences) return false;
+    if (totalSentences === 0) return true;
+    if (chapter.total_packs === null || chapter.total_packs === undefined) return false;
+    const totalPacks = Number(chapter.total_packs);
+    return Number.isInteger(totalPacks) && Number(chapter.server_packs || 0) >= totalPacks;
+  });
 }
 
 function setOfflineActiveJob(job = null) {
@@ -3299,15 +3272,18 @@ async function resumeOfflineJob(job, bookId) {
     const failed = Number(completedJob.failed_sentences || 0);
     const failedPacks = Number(completedJob.failed_packs || 0);
     const hasFailures = completedJob.status === "done" && (failed > 0 || failedPacks > 0);
+    const retry = hasFailures ? {
+      bookId,
+      chapterIndexes: completedJob.chapter_indexes || [],
+      downloadToDevice: false,
+    } : null;
     showOfflineCacheProgress(
       completedJob.message || (completedJob.status === "cancelled" ? "任务已取消" : "服务器固定完成"),
       hasFailures ? "error" : "",
       bookId,
+      retry,
     );
     await loadOfflineCacheStatus(bookId);
-    if (completedJob.status === "done" && !readerState.offlineCancelRequested) {
-      await continueStoredOfflineDownload(bookId, completedJob);
-    }
   } catch (error) {
     showOfflineCacheProgress(error.message, "error", bookId);
   } finally {
@@ -3316,11 +3292,35 @@ async function resumeOfflineJob(job, bookId) {
   }
 }
 
+function captureOfflineChapterViewport(list) {
+  const listTop = list.getBoundingClientRect().top;
+  const anchor = [...list.querySelectorAll(".offline-chapter-item")].find((item) => (
+    item.getBoundingClientRect().bottom > listTop + 1
+  ));
+  return {
+    scrollTop: list.scrollTop,
+    chapterIndex: anchor?.dataset.chapterIndex || "",
+    offset: anchor ? anchor.getBoundingClientRect().top - listTop : 0,
+  };
+}
+
+function restoreOfflineChapterViewport(list, viewport) {
+  list.scrollTop = viewport.scrollTop;
+  if (!viewport.chapterIndex) return;
+  const anchor = [...list.querySelectorAll(".offline-chapter-item")].find((item) => (
+    item.dataset.chapterIndex === viewport.chapterIndex
+  ));
+  if (!anchor) return;
+  const currentOffset = anchor.getBoundingClientRect().top - list.getBoundingClientRect().top;
+  list.scrollTop += currentOffset - viewport.offset;
+}
+
 function renderOfflineCacheStatus(storage = "正在读取本机缓存") {
   const bookId = readerState.offlineBookId;
   const status = readerState.offlineStatus;
   const list = $("offlineChapterList");
   const checked = new Set(selectedOfflineChapterIndexes());
+  const viewport = captureOfflineChapterViewport(list);
   list.innerHTML = "";
   if (!status?.chapters?.length) {
     list.innerHTML = '<div class="offline-cache-summary">当前书籍没有可缓存章节。</div>';
@@ -3336,6 +3336,7 @@ function renderOfflineCacheStatus(storage = "正在读取本机缓存") {
     };
     const label = document.createElement("label");
     label.className = "offline-chapter-item";
+    label.dataset.chapterIndex = String(chapter.index);
     const input = document.createElement("input");
     input.type = "checkbox";
     input.value = chapter.index;
@@ -3362,6 +3363,7 @@ function renderOfflineCacheStatus(storage = "正在读取本机缓存") {
     fragment.appendChild(label);
   });
   list.appendChild(fragment);
+  restoreOfflineChapterViewport(list, viewport);
   if (bookId !== readerState.offlineBookId) return;
   const profileLabel = status.profile_label || "默认音色";
   $("offlineCacheSummary").textContent = "《" + (readerState.offlineBook?.title || "当前书籍")
@@ -3419,20 +3421,11 @@ async function openOfflineCacheManager(book) {
       resumeOfflineJob(status.active_job, book.id);
     } else {
       setOfflineActiveJob(null);
-      if (storedOfflineDownloadIntent(book.id)) {
-        setOfflineCacheBusy(true);
-        try {
-          await continueStoredOfflineDownload(book.id);
-        } finally {
-          setOfflineCacheBusy(false);
-        }
-      } else {
-        showOfflineCacheProgress(
-          status.local_cache_error ? `服务器状态已加载；${status.local_cache_error}` : "",
-          status.local_cache_error ? "error" : "",
-          book.id,
-        );
-      }
+      showOfflineCacheProgress(
+        status.local_cache_error ? `服务器状态已加载；${status.local_cache_error}` : "",
+        status.local_cache_error ? "error" : "",
+        book.id,
+      );
     }
   } catch (error) {
     showOfflineCacheProgress(error.message, "error", book.id);
@@ -3465,7 +3458,6 @@ async function cancelOfflineJob() {
   const button = $("cancelOfflineJobBtn");
   button.disabled = true;
   readerState.offlineCancelRequested = true;
-  clearOfflineDownloadIntent(bookId);
 
   if (downloadController) {
     showOfflineCacheProgress("正在取消本机下载", "", bookId);
@@ -3508,7 +3500,11 @@ async function waitForOfflineJob(job, bookId) {
   while (["queued", "running"].includes(current.status)) {
     showOfflineCacheProgress(offlineJobProgressMessage(current), "", bookId);
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
-    const data = await api("/api/reader/tts-offline/jobs/" + current.id);
+    const data = await promiseWithTimeout(
+      api("/api/reader/tts-offline/jobs/" + current.id),
+      180000,
+      "读取服务器固定进度超时",
+    );
     current = data.job;
     setOfflineActiveJob(current);
   }
@@ -3526,14 +3522,39 @@ async function downloadOfflineChapters(bookId, chapterIndexes) {
   readerState.offlineDownloadController = { controller, bookId };
   setOfflineActiveJob(null);
   try {
-    const manifests = [];
-    for (const chapterIndex of chapterIndexes) {
-      const manifest = await api(
-        "/api/books/" + bookId + "/tts-offline/chapters/" + chapterIndex,
-        { signal: controller.signal },
-      );
-      manifests.push(manifest);
-    }
+    const manifests = new Array(chapterIndexes.length);
+    let nextChapter = 0;
+    let loadedChapters = 0;
+    const loadManifest = async () => {
+      while (nextChapter < chapterIndexes.length) {
+        const position = nextChapter;
+        nextChapter += 1;
+        const chapterIndex = chapterIndexes[position];
+        manifests[position] = await promiseWithTimeout(
+          api(
+            "/api/books/" + bookId + "/tts-offline/chapters/" + chapterIndex,
+            { signal: controller.signal },
+          ),
+          180000,
+          "读取服务器播放包超时",
+        );
+        loadedChapters += 1;
+        showOfflineCacheProgress(
+          "正在读取服务器播放包 · " + loadedChapters + " / " + chapterIndexes.length + " 章",
+          "",
+          bookId,
+        );
+      }
+    };
+    showOfflineCacheProgress(
+      "正在读取服务器播放包 · 0 / " + chapterIndexes.length + " 章",
+      "",
+      bookId,
+    );
+    await Promise.all(Array.from(
+      { length: Math.min(TTS_OFFLINE_DOWNLOAD_WORKERS, chapterIndexes.length) },
+      () => loadManifest(),
+    ));
     const pending = manifests.flatMap((manifest) => (
       manifest.entries.map((entry) => ({ manifest, entry }))
     ));
@@ -3567,24 +3588,36 @@ async function downloadOfflineChapters(bookId, chapterIndexes) {
         abortIfRequested();
         const { manifest, entry } = pending[nextIndex];
         nextIndex += 1;
-        if (await hasLocalOfflinePack(manifest, entry)) {
+        if (await promiseWithTimeout(
+          hasLocalOfflinePack(manifest, entry),
+          180000,
+          "检查本机播放包超时",
+        )) {
           existing += 1;
           completed += 1;
           completedSentences += Number(entry.sentence_count || 0);
           showProgress();
           continue;
         }
-        const response = await fetch(entry.url, {
-          credentials: "same-origin",
-          signal: controller.signal,
-        });
+        const response = await promiseWithTimeout(
+          fetch(entry.url, {
+            credentials: "same-origin",
+            signal: controller.signal,
+          }),
+          180000,
+          "音频下载超时",
+        );
         if (!response.ok) {
           const data = await response.json().catch(() => ({}));
           throw new Error(data.error || "音频下载失败：" + response.status);
         }
-        const blob = await response.blob();
+        const blob = await promiseWithTimeout(response.blob(), 180000, "读取下载音频超时");
         if (!blob.size) throw new Error("下载的音频为空");
-        await saveLocalOfflinePack(manifest, entry, blob);
+        await promiseWithTimeout(
+          saveLocalOfflinePack(manifest, entry, blob),
+          180000,
+          "写入本机播放包超时",
+        );
         downloaded += 1;
         completed += 1;
         completedSentences += Number(entry.sentence_count || 0);
@@ -3611,6 +3644,9 @@ async function downloadOfflineChapters(bookId, chapterIndexes) {
       existing,
       downloadedBytes,
     };
+  } catch (error) {
+    controller.abort();
+    throw error;
   } finally {
     if (readerState.offlineDownloadController?.controller === controller) {
       readerState.offlineDownloadController = null;
@@ -3626,10 +3662,14 @@ async function ensureServerOfflineCache(bookId, chapterIndexes) {
     let data;
     let joinedExisting = false;
     try {
-      data = await api("/api/books/" + bookId + "/tts-offline", {
-        method: "POST",
-        body: JSON.stringify({ chapters: chapterIndexes }),
-      });
+      data = await promiseWithTimeout(
+        api("/api/books/" + bookId + "/tts-offline", {
+          method: "POST",
+          body: JSON.stringify({ chapters: chapterIndexes }),
+        }),
+        180000,
+        "检查服务器固定状态超时",
+      );
     } catch (error) {
       if (error.status !== 429 || !error.data?.job || error.data.job.book_id !== bookId) throw error;
       data = { job: error.data.job };
@@ -3644,21 +3684,24 @@ async function ensureServerOfflineCache(bookId, chapterIndexes) {
 }
 
 
-async function createOfflineCache(downloadToDevice) {
+async function createOfflineCache(downloadToDevice, requestedChapterIndexes = null) {
   const bookId = readerState.offlineBookId;
-  const chapterIndexes = selectedOfflineChapterIndexes();
+  const validIndexes = new Set((readerState.offlineStatus?.chapters || []).map((item) => Number(item.index)));
+  const chapterIndexes = [...new Set((requestedChapterIndexes || selectedOfflineChapterIndexes())
+    .map(Number)
+    .filter((index) => Number.isFinite(index) && validIndexes.has(index)))];
   if (!bookId || !chapterIndexes.length || readerState.offlineBusy) return;
   readerState.offlineCancelRequested = false;
   setOfflineCacheBusy(true);
   try {
     let completedJob = null;
     if (downloadToDevice) {
-      saveOfflineDownloadIntent(bookId, chapterIndexes);
       await requestPersistentBrowserStorage();
-    } else {
-      clearOfflineDownloadIntent(bookId);
     }
-    completedJob = await ensureServerOfflineCache(bookId, chapterIndexes);
+    if (!serverOfflineChaptersAreComplete(chapterIndexes)) {
+      showOfflineCacheProgress("正在检查服务器固定状态", "", bookId);
+      completedJob = await ensureServerOfflineCache(bookId, chapterIndexes);
+    }
     if (completedJob?.status === "cancelled" || readerState.offlineCancelRequested) {
       const message = completedJob?.status === "cancelled"
         ? completedJob.message || "任务已取消"
@@ -3672,36 +3715,50 @@ async function createOfflineCache(downloadToDevice) {
     const failedText = (failed ? " · " + failed + " 句生成失败" : "")
       + (failedPacks ? " · " + failedPacks + " 个播放包失败" : "")
       + (failed || failedPacks ? "，可稍后重试" : "");
+    const retry = failed || failedPacks ? { bookId, chapterIndexes, downloadToDevice } : null;
     if (!downloadToDevice) {
       const message = completedJob
         ? "服务器固定完成 · 复用 " + Number(completedJob.cached_sentences || 0)
           + " 句 · 生成 " + Number(completedJob.generated_sentences || 0) + " 句" + failedText
         : "所选章节已完整固定，无需重复处理";
-      showOfflineCacheProgress(message, failed || failedPacks ? "error" : "", bookId);
+      showOfflineCacheProgress(message, failed || failedPacks ? "error" : "", bookId, retry);
       await loadOfflineCacheStatus(bookId);
       return;
     }
     const downloaded = await downloadOfflineChapters(bookId, chapterIndexes);
     const complete = offlineDownloadIsComplete(downloaded);
-    if (complete) clearOfflineDownloadIntent(bookId);
     showOfflineCacheProgress(
       offlineDownloadSummary(downloaded) + failedText,
       failed || failedPacks || !complete ? "error" : "",
       bookId,
+      failed || failedPacks || !complete ? { bookId, chapterIndexes, downloadToDevice: true } : null,
     );
     await loadOfflineCacheStatus(bookId);
   } catch (error) {
     if (error.name === "AbortError") {
-      clearOfflineDownloadIntent(bookId);
       showOfflineCacheProgress("本机下载已取消，已下载部分已保留", "", bookId);
       await loadOfflineCacheStatus(bookId);
     } else {
-      showOfflineCacheProgress(error.message, "error", bookId);
+      showOfflineCacheProgress(
+        error.message,
+        "error",
+        bookId,
+        { bookId, chapterIndexes, downloadToDevice },
+      );
     }
   } finally {
     readerState.offlineCancelRequested = false;
     setOfflineCacheBusy(false);
   }
+}
+
+async function retryOfflineCache() {
+  const retry = readerState.offlineRetry;
+  if (!retry || retry.bookId !== readerState.offlineBookId || readerState.offlineBusy) return;
+  document.querySelectorAll("#offlineChapterList input[type=checkbox]").forEach((input) => {
+    input.checked = retry.chapterIndexes.includes(Number(input.value));
+  });
+  await createOfflineCache(retry.downloadToDevice, retry.chapterIndexes);
 }
 
 
@@ -4113,6 +4170,7 @@ $("closeOfflineCacheBtn")?.addEventListener("click", closeOfflineCacheManager);
 $("selectAllOfflineBtn")?.addEventListener("click", () => selectOfflineChapterRange("all"));
 $("clearOfflineSelectionBtn")?.addEventListener("click", () => selectOfflineChapterRange("clear"));
 $("cancelOfflineJobBtn")?.addEventListener("click", cancelOfflineJob);
+$("retryOfflineJobBtn")?.addEventListener("click", retryOfflineCache);
 $("cacheAndDownloadOfflineBtn")?.addEventListener("click", () => createOfflineCache(true));
 $("cacheServerOfflineBtn")?.addEventListener("click", () => createOfflineCache(false));
 $("deleteLocalOfflineBtn")?.addEventListener("click", () => deleteSelectedLocalOffline());

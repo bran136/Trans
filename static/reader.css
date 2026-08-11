@@ -1413,18 +1413,28 @@ a,
   line-height: 1.2;
 }
 
+.offline-cache-retry,
 .offline-cache-cancel {
   min-height: 25px;
   flex: 0 0 auto;
   padding: 0 9px;
-  border: 1px solid rgba(180, 35, 24, 0.28);
   border-radius: 8px;
   background: var(--panel);
-  color: var(--danger);
   font-size: 11px;
   font-weight: 800;
 }
 
+.offline-cache-retry {
+  border: 1px solid rgba(107, 125, 227, 0.32);
+  color: var(--accent-strong);
+}
+
+.offline-cache-cancel {
+  border: 1px solid rgba(180, 35, 24, 0.28);
+  color: var(--danger);
+}
+
+.offline-cache-retry:disabled,
 .offline-cache-cancel:disabled {
   cursor: default;
   opacity: 0.55;
@@ -1441,6 +1451,7 @@ a,
   min-height: 0;
   gap: 5px;
   overflow: auto;
+  overflow-anchor: none;
   padding: 7px 0 7px 7px;
   border: 1px solid rgba(107, 125, 227, 0.2);
   border-radius: 6px;
@@ -2071,6 +2082,7 @@ a,
     min-height: 38px;
   }
 
+  .offline-cache-retry,
   .offline-cache-cancel {
     min-height: 30px;
   }

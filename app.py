@@ -3575,8 +3575,26 @@ def process_tts_offline_job(job_id, book_id, chapter_indexes):
                     succeeded = True
                     cached_result = bool(result.get("cached"))
                 except Exception as exc:
-                    error = str(exc)
-                    remove_tts_offline_ref(book_id, chapter["index"], sentence["index"], profile_key)
+                    error = " ".join(str(exc).split())[:500]
+                    try:
+                        remove_tts_offline_ref(book_id, chapter["index"], sentence["index"], profile_key)
+                    except sqlite3.Error as cleanup_error:
+                        app.logger.warning(
+                            "tts offline failed ref cleanup error book=%s chapter=%s sentence=%s error=%s",
+                            book_id,
+                            chapter["index"],
+                            sentence["index"],
+                            cleanup_error,
+                        )
+                    app.logger.warning(
+                        "tts offline sentence failed book=%s chapter=%s sentence=%s key=%s chars=%s error=%s",
+                        book_id,
+                        chapter["index"],
+                        sentence["index"],
+                        sentence["cache_key"][:12],
+                        len(sentence["text"]),
+                        error,
+                    )
 
                 with stats_lock:
                     if succeeded:
@@ -3610,13 +3628,23 @@ def process_tts_offline_job(job_id, book_id, chapter_indexes):
                     build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=False)
                     succeeded = True
                 except Exception as exc:
-                    error = str(exc)
+                    error = " ".join(str(exc).split())[:500]
+                    app.logger.warning(
+                        "tts offline pack failed book=%s chapter=%s pack=%s sentences=%s-%s error=%s",
+                        book_id,
+                        chapter["index"],
+                        spec["pack_key"][:12],
+                        spec["start_sentence_index"],
+                        spec["end_sentence_index"],
+                        error,
+                    )
                 with stats_lock:
                     if succeeded:
                         stats["completed_packs"] += 1
                     else:
                         stats["failed_packs"] += 1
-                        stats["error"] = error
+                        if not stats["error"]:
+                            stats["error"] = error
                     update_tts_offline_job(job_id, **stats)
 
             pack_worker_count = min(TTS_OFFLINE_PACK_WORKERS, len(pack_specs))
@@ -3992,7 +4020,18 @@ def decode_mimo_audio_payload(payload):
     audio_payload = message.get("audio") or payload.get("audio") or {}
     audio = audio_payload.get("data") or audio_payload.get("audio") or audio_payload.get("audio_base64")
     if not audio:
-        raise ValueError("MiMo TTS 未返回音频")
+        error_payload = payload.get("error") or {}
+        detail = next((
+            value for value in (
+                error_payload.get("message") if isinstance(error_payload, dict) else error_payload,
+                base_resp.get("status_msg"),
+                message.get("content"),
+                choices[0].get("finish_reason") if choices else "",
+            )
+            if value
+        ), "")
+        detail = " ".join(str(detail).split())[:200]
+        raise ValueError("MiMo TTS 未返回音频" + (f"：{detail}" if detail else ""))
     audio = str(audio).strip()
     if re.fullmatch(r"[0-9a-fA-F]+", audio) and len(audio) % 2 == 0:
         if len(audio) // 2 > MAX_TTS_AUDIO_BYTES:
