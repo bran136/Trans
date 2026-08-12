@@ -42,7 +42,9 @@ const readerState = {
   sleepFadeStarted: false,
   sleepPauseTarget: null,
   wakeLock: null,
+  wakeLockRequestPending: false,
   wakeLockWanted: false,
+  offlineDownloadWakeLockWanted: false,
   mimoBalance: null,
   mimoBalanceError: "",
   mimoBalanceLoadedAt: 0,
@@ -198,19 +200,32 @@ function markUserScrollIntent() {
   readerState.lastUserScrollAt = Date.now();
 }
 
+function shouldKeepReaderAwake() {
+  return (readerState.reading && !readerState.paused)
+    || readerState.offlineDownloadWakeLockWanted;
+}
+
 async function requestReaderWakeLock() {
-  if (!("wakeLock" in navigator) || readerState.wakeLock || document.visibilityState !== "visible") return;
+  if (!("wakeLock" in navigator) || readerState.wakeLock || readerState.wakeLockRequestPending
+    || !readerState.wakeLockWanted || document.visibilityState !== "visible") return;
+  readerState.wakeLockRequestPending = true;
   try {
     const lock = await navigator.wakeLock.request("screen");
+    if (!readerState.wakeLockWanted || document.visibilityState !== "visible") {
+      lock.release().catch(() => {});
+      return;
+    }
     readerState.wakeLock = lock;
     lock.addEventListener("release", () => {
       if (readerState.wakeLock === lock) readerState.wakeLock = null;
-      if (readerState.wakeLockWanted && readerState.reading && !readerState.paused && document.visibilityState === "visible") {
+      if (readerState.wakeLockWanted && document.visibilityState === "visible") {
         window.setTimeout(() => requestReaderWakeLock(), 250);
       }
     });
   } catch {
     readerState.wakeLock = null;
+  } finally {
+    readerState.wakeLockRequestPending = false;
   }
 }
 
@@ -221,13 +236,18 @@ function releaseReaderWakeLock() {
 }
 
 function syncReaderWakeLock() {
-  const shouldKeepAwake = readerState.reading && !readerState.paused;
+  const shouldKeepAwake = shouldKeepReaderAwake();
   readerState.wakeLockWanted = shouldKeepAwake;
   if (shouldKeepAwake) {
     requestReaderWakeLock();
   } else {
     releaseReaderWakeLock();
   }
+}
+
+function setOfflineDownloadWakeLockWanted(wanted) {
+  readerState.offlineDownloadWakeLockWanted = Boolean(wanted);
+  syncReaderWakeLock();
 }
 
 function mediaSessionAvailable() {
@@ -3603,6 +3623,7 @@ async function openOfflineCacheManager(book) {
 }
 
 function closeOfflineCacheManager() {
+  setOfflineDownloadWakeLockWanted(false);
   $("offlineCacheDialog").close();
   window.setTimeout(() => {
     renderManageBooks();
@@ -3939,6 +3960,7 @@ async function createOfflineCache(downloadToDevice, requestedChapterIndexes = nu
   }
   readerState.offlineCancelRequested = false;
   setOfflineCacheBusy(true);
+  if (downloadToDevice) setOfflineDownloadWakeLockWanted(true);
   try {
     let completedJob = null;
     if (downloadToDevice) {
@@ -3993,6 +4015,7 @@ async function createOfflineCache(downloadToDevice, requestedChapterIndexes = nu
       );
     }
   } finally {
+    if (downloadToDevice) setOfflineDownloadWakeLockWanted(false);
     readerState.offlineCancelRequested = false;
     setOfflineCacheBusy(false);
   }
@@ -4426,6 +4449,9 @@ $("deleteLocalOfflineBtn")?.addEventListener("click", () => deleteSelectedLocalO
 $("unpinServerOfflineBtn")?.addEventListener("click", () => unpinSelectedServerOffline());
 $("closeTtsBtn").addEventListener("click", () => $("ttsDialog").close());
 $("closeSleepTimerBtn")?.addEventListener("click", () => $("sleepTimerDialog").close());
+$("offlineCacheDialog")?.addEventListener("close", () => {
+  setOfflineDownloadWakeLockWanted(false);
+});
 window.addEventListener("resize", () => {
   resizeQuickVoiceSelect();
   resizeTtsStylePrompt();
@@ -4465,6 +4491,7 @@ window.addEventListener("popstate", (event) => {
 });
 window.addEventListener("pagehide", () => {
   readerState.wakeLockWanted = false;
+  readerState.offlineDownloadWakeLockWanted = false;
   releaseReaderWakeLock();
   window.clearTimeout(readerState.mimoBalanceRetryTimer);
   window.clearTimeout(ttsCacheStatsRetryTimer);
@@ -4475,6 +4502,7 @@ document.querySelectorAll(".reader-dialog").forEach((dialog) => {
 });
 $("logoutBtn").addEventListener("click", async () => {
   readerState.wakeLockWanted = false;
+  readerState.offlineDownloadWakeLockWanted = false;
   releaseReaderWakeLock();
   await api("/logout", { method: "POST", body: "{}" });
   window.location.href = "/login";
