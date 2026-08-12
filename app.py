@@ -49,6 +49,7 @@ READER_INDEX_FILE = READER_DIR / "books.json"
 TTS_CACHE_DIR = READER_DIR / "tts_cache"
 TTS_PACK_CACHE_DIR = READER_DIR / "tts_pack_cache"
 TTS_OFFLINE_DB = READER_DIR / "tts_offline.sqlite3"
+TTS_CACHE_STATS_SNAPSHOT_FILE = READER_DIR / "tts_cache_stats.json"
 
 
 def load_app_version():
@@ -124,6 +125,7 @@ TTS_PACK_PAD_SECONDS = TTS_PACK_MIN_SECONDS + 0.25
 TTS_PACK_PRUNE_INTERVAL_SECONDS = 60
 TTS_CACHE_STATS_MAX_AGE_SECONDS = 60
 TTS_PACK_PREFETCH_HINT_LIMIT = 16
+TTS_OFFLINE_STATUS_SNAPSHOT_VERSION = 1
 CHAPTER_CACHE_VERSION = 5
 TTS_SENTENCE_INDEX_VERSION = 1
 OFFICIAL_DEEPSEEK_HOSTS = {"api.deepseek.com"}
@@ -140,6 +142,8 @@ RESTART_STATE = {"time": 0.0}
 PROCESS_START_TIME = time.time()
 CPU_SAMPLE = {"time": time.time(), "cpu": 0.0}
 SYSTEM_CPU_SAMPLE = {"idle": 0, "total": 0}
+SERVICE_READY_LOCK = threading.Lock()
+SERVICE_READY_STATE = {"logged": False}
 SUPPORTED_BOOK_EXTENSIONS = {".txt", ".epub", ".pdf"}
 BOOK_EXTENSION_ALIASES = {
     ".epub.zip": ".epub",
@@ -174,9 +178,11 @@ TTS_CACHE_STATS_STATE = {
     "refreshed_at": 0.0,
     "refreshing": False,
     "refresh_again": False,
+    "snapshot_loaded": False,
 }
 TTS_PACK_BUILD_SEMAPHORE = threading.BoundedSemaphore(2)
 TTS_OFFLINE_LOCK = threading.RLock()
+TTS_OFFLINE_STATUS_LOCKS = tuple(threading.Lock() for _ in range(32))
 TTS_OFFLINE_JOB_LOCK = threading.RLock()
 TTS_OFFLINE_JOBS = OrderedDict()
 TTS_OFFLINE_JOB_RETENTION_SECONDS = 3600
@@ -2890,7 +2896,63 @@ def scan_tts_cache_stats():
     }
 
 
+def valid_tts_cache_stats_snapshot(data):
+    required = {
+        "entries", "size_bytes", "disk_size_bytes", "cache_entries",
+        "cache_disk_size_bytes", "limit_bytes", "ttl_days", "oldest_accessed_at",
+        "newest_accessed_at", "expired_entries", "pinned_entries",
+        "pinned_size_bytes", "pinned_disk_size_bytes", "fixed_entries",
+        "fixed_disk_size_bytes", "pack_entries", "pack_size_bytes",
+        "pinned_pack_entries", "pinned_pack_size_bytes",
+    }
+    return isinstance(data, dict) and required.issubset(data) and all(
+        isinstance(data.get(key), int)
+        and not isinstance(data.get(key), bool)
+        and data[key] >= 0
+        for key in required
+    )
+
+
+def load_tts_cache_stats_snapshot():
+    with TTS_CACHE_STATS_LOCK:
+        if TTS_CACHE_STATS_STATE["snapshot_loaded"]:
+            return
+        TTS_CACHE_STATS_STATE["snapshot_loaded"] = True
+        try:
+            payload = json.loads(TTS_CACHE_STATS_SNAPSHOT_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        data = payload.get("data") if isinstance(payload, dict) and payload.get("schema") == 1 else None
+        if not valid_tts_cache_stats_snapshot(data):
+            return
+        TTS_CACHE_STATS_STATE["data"] = data
+        TTS_CACHE_STATS_STATE["data_revision"] = TTS_CACHE_STATS_STATE["revision"]
+        # Return the disk snapshot immediately, then reconcile it in the background.
+        TTS_CACHE_STATS_STATE["refreshed_at"] = (
+            time.monotonic() - TTS_CACHE_STATS_MAX_AGE_SECONDS
+        )
+        TTS_CACHE_STATS_READY.set()
+    app.logger.info(
+        "tts cache stats snapshot loaded entries=%s packs=%s",
+        data["entries"],
+        data["pack_entries"],
+    )
+
+
+def save_tts_cache_stats_snapshot(data):
+    try:
+        ensure_private_directory(READER_DIR)
+        write_json_atomic(TTS_CACHE_STATS_SNAPSHOT_FILE, {
+            "schema": 1,
+            "saved_at": int(time.time()),
+            "data": data,
+        })
+    except OSError as exc:
+        app.logger.warning("tts cache stats snapshot write failed error=%s", exc)
+
+
 def refresh_tts_cache_stats_snapshot(target_revision):
+    started = time.perf_counter()
     try:
         data = scan_tts_cache_stats()
     except Exception as exc:
@@ -2911,11 +2973,19 @@ def refresh_tts_cache_stats_snapshot(target_revision):
         refresh_again = TTS_CACHE_STATS_STATE["refresh_again"]
         TTS_CACHE_STATS_STATE["refresh_again"] = False
         TTS_CACHE_STATS_READY.set()
+    save_tts_cache_stats_snapshot(data)
+    app.logger.info(
+        "tts cache stats refreshed entries=%s packs=%s elapsed=%.3fs",
+        data["entries"],
+        data["pack_entries"],
+        time.perf_counter() - started,
+    )
     if refresh_again:
         schedule_tts_cache_stats_refresh(force=True)
 
 
 def schedule_tts_cache_stats_refresh(force=False):
+    load_tts_cache_stats_snapshot()
     now = time.monotonic()
     with TTS_CACHE_STATS_LOCK:
         state = TTS_CACHE_STATS_STATE
@@ -2950,6 +3020,7 @@ def invalidate_tts_cache_stats(refresh=False):
 
 
 def tts_cache_stats():
+    load_tts_cache_stats_snapshot()
     with TTS_CACHE_STATS_LOCK:
         data = TTS_CACHE_STATS_STATE["data"]
         stale = (
@@ -2975,6 +3046,7 @@ def tts_cache_stats():
         TTS_CACHE_STATS_STATE["data"] = data
         TTS_CACHE_STATS_STATE["data_revision"] = TTS_CACHE_STATS_STATE["revision"]
         TTS_CACHE_STATS_STATE["refreshed_at"] = time.monotonic()
+    save_tts_cache_stats_snapshot(data)
     result = dict(data)
     result["refreshing"] = False
     return result
@@ -3411,29 +3483,185 @@ def tts_offline_chapter_status(
     }
 
 
-def tts_offline_book_status(book, settings):
-    book, sentence_counts = ensure_tts_sentence_counts(book, settings)
-    profile_key = tts_offline_profile_key(settings)
-    refs_by_chapter = load_tts_offline_refs_by_chapter(book["id"], profile_key)
-    chapters = [
-        tts_offline_chapter_status(
-            book,
-            chapter_record,
-            index,
-            settings,
-            profile_key,
-            refs_by_chapter.get(int(chapter_record.get("index", index)), []),
-            known_sentence_count=sentence_counts[int(chapter_record.get("index", index))],
-        )
-        for index, chapter_record in enumerate(book.get("chapters", []))
+def tts_offline_status_lock(book_id):
+    return TTS_OFFLINE_STATUS_LOCKS[
+        int(book_id[:8], 16) % len(TTS_OFFLINE_STATUS_LOCKS)
     ]
-    voice_id = settings.get("voice_id") or "mimo_default"
-    voice = next((item for item in TTS_VOICE_OPTIONS if item.get("id") == voice_id), None)
-    return {
-        "profile_key": profile_key,
-        "profile_label": (voice or {}).get("name") or voice_id,
+
+
+def tts_offline_status_snapshot_path(book_id, profile_key):
+    return book_dir(book_id) / f"tts_offline_status_{profile_key}.json"
+
+
+def invalidate_tts_offline_status_snapshot(book_id, profile_key):
+    with tts_offline_status_lock(book_id):
+        try:
+            tts_offline_status_snapshot_path(book_id, profile_key).unlink()
+        except OSError:
+            pass
+
+
+def tts_offline_ref_fingerprint(book_id, profile_key):
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS entries,
+                       COALESCE(SUM(size_bytes), 0) AS size_bytes,
+                       COALESCE(MAX(created_at), 0) AS newest_created_at,
+                       COALESCE(SUM(chapter_index), 0) AS chapter_sum,
+                       COALESCE(SUM(sentence_index), 0) AS sentence_sum
+                FROM offline_tts_refs
+                WHERE book_id = ? AND profile_key = ?
+                """,
+                (book_id, profile_key),
+            ).fetchone()
+        finally:
+            connection.close()
+    return [
+        int(row["entries"]),
+        int(row["size_bytes"]),
+        float(row["newest_created_at"]),
+        int(row["chapter_sum"]),
+        int(row["sentence_sum"]),
+    ]
+
+
+def tts_offline_book_signature(book, settings):
+    sentence_index = load_tts_sentence_index(book["id"])
+    payload = {
+        "sentence_index_version": TTS_SENTENCE_INDEX_VERSION,
         "pack_schema_version": TTS_PACK_SCHEMA_VERSION,
-        "chapters": chapters,
+        "chunk_chars": int(settings.get("chunk_chars", 260)),
+        "sentence_index": sentence_index,
+        "chapter_titles": [
+            [
+                int(chapter.get("index", index)),
+                display_chapter_title(chapter, index),
+            ]
+            for index, chapter in enumerate(book.get("chapters", []))
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def load_tts_offline_status_snapshot(book_id, profile_key, book_signature, ref_fingerprint):
+    path = tts_offline_status_snapshot_path(book_id, profile_key)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != TTS_OFFLINE_STATUS_SNAPSHOT_VERSION
+        or payload.get("profile_key") != profile_key
+        or payload.get("book_signature") != book_signature
+        or payload.get("ref_fingerprint") != ref_fingerprint
+        or not isinstance(payload.get("status"), dict)
+        or not isinstance(payload["status"].get("chapters"), list)
+    ):
+        return None
+    return payload["status"]
+
+
+def save_tts_offline_status_snapshot(
+    book_id,
+    profile_key,
+    book_signature,
+    ref_fingerprint,
+    status,
+):
+    try:
+        write_json_atomic(
+            tts_offline_status_snapshot_path(book_id, profile_key),
+            {
+                "version": TTS_OFFLINE_STATUS_SNAPSHOT_VERSION,
+                "saved_at": int(time.time()),
+                "profile_key": profile_key,
+                "book_signature": book_signature,
+                "ref_fingerprint": ref_fingerprint,
+                "status": status,
+            },
+        )
+    except OSError as exc:
+        app.logger.warning("tts offline status snapshot write failed book=%s error=%s", book_id, exc)
+
+
+def tts_offline_book_status(book, settings, use_snapshot=True):
+    started = time.perf_counter()
+    book, sentence_counts = ensure_tts_sentence_counts(book, settings)
+    sentence_index_seconds = time.perf_counter() - started
+    profile_key = tts_offline_profile_key(settings)
+    book_signature = tts_offline_book_signature(book, settings)
+    lock = tts_offline_status_lock(book["id"])
+
+    with lock:
+        refs_started = time.perf_counter()
+        ref_fingerprint = tts_offline_ref_fingerprint(book["id"], profile_key)
+        refs_seconds = time.perf_counter() - refs_started
+        snapshot_started = time.perf_counter()
+        if use_snapshot:
+            cached = load_tts_offline_status_snapshot(
+                book["id"],
+                profile_key,
+                book_signature,
+                ref_fingerprint,
+            )
+            if cached is not None:
+                return cached, {
+                    "sentence_index_seconds": sentence_index_seconds,
+                    "refs_seconds": refs_seconds,
+                    "chapters_seconds": 0.0,
+                    "snapshot_seconds": time.perf_counter() - snapshot_started,
+                    "snapshot_hit": True,
+                    "total_seconds": time.perf_counter() - started,
+                }
+
+        snapshot_seconds = time.perf_counter() - snapshot_started
+        refs_started = time.perf_counter()
+        refs_by_chapter = load_tts_offline_refs_by_chapter(book["id"], profile_key)
+        refs_seconds += time.perf_counter() - refs_started
+        chapters_started = time.perf_counter()
+        chapters = [
+            tts_offline_chapter_status(
+                book,
+                chapter_record,
+                index,
+                settings,
+                profile_key,
+                refs_by_chapter.get(int(chapter_record.get("index", index)), []),
+                known_sentence_count=sentence_counts[int(chapter_record.get("index", index))],
+            )
+            for index, chapter_record in enumerate(book.get("chapters", []))
+        ]
+        chapters_seconds = time.perf_counter() - chapters_started
+
+        voice_id = settings.get("voice_id") or "mimo_default"
+        voice = next((item for item in TTS_VOICE_OPTIONS if item.get("id") == voice_id), None)
+        status = {
+            "profile_key": profile_key,
+            "profile_label": (voice or {}).get("name") or voice_id,
+            "pack_schema_version": TTS_PACK_SCHEMA_VERSION,
+            "chapters": chapters,
+        }
+        if use_snapshot and ref_fingerprint == tts_offline_ref_fingerprint(book["id"], profile_key):
+            save_tts_offline_status_snapshot(
+                book["id"],
+                profile_key,
+                book_signature,
+                ref_fingerprint,
+                status,
+            )
+
+    return status, {
+        "sentence_index_seconds": sentence_index_seconds,
+        "refs_seconds": refs_seconds,
+        "chapters_seconds": chapters_seconds,
+        "snapshot_seconds": snapshot_seconds,
+        "snapshot_hit": False,
+        "total_seconds": time.perf_counter() - started,
     }
 
 
@@ -4462,6 +4690,7 @@ def index_single_sentence_tts_pack(book_id, chapter, spec, profile_key):
         except OSError:
             pass
     invalidate_tts_cache_stats()
+    invalidate_tts_offline_status_snapshot(book_id, profile_key)
     return manifest
 
 
@@ -4507,6 +4736,7 @@ def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True):
                     candidate.unlink()
                 except OSError:
                     pass
+            invalidate_tts_offline_status_snapshot(book_id, profile_key)
         with TTS_PACK_BUILD_SEMAPHORE:
             ensure_private_directory(TTS_PACK_CACHE_DIR)
             try:
@@ -4635,6 +4865,7 @@ def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True):
                         if prune_cache:
                             maybe_prune_tts_pack_cache()
                     invalidate_tts_cache_stats()
+                    invalidate_tts_offline_status_snapshot(book_id, profile_key)
                     return manifest
             except FileNotFoundError as exc:
                 raise ValueError("服务器未安装 ffmpeg 或 ffprobe，无法生成播放包") from exc
@@ -4887,8 +5118,9 @@ def restart_process_later(delay=0.35):
         try:
             if running_under_gunicorn():
                 # Let the Gunicorn master replace this worker with the same command.
+                app.logger.info("restart worker exiting pid=%s", os.getpid())
                 os._exit(0)
-            subprocess.Popen(
+            replacement = subprocess.Popen(
                 [
                     sys.executable,
                     "-c",
@@ -4899,6 +5131,11 @@ def restart_process_later(delay=0.35):
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+            )
+            app.logger.info(
+                "restart replacement launched old_pid=%s replacement_pid=%s",
+                os.getpid(),
+                replacement.pid,
             )
             os._exit(0)
         except Exception as exc:
@@ -5559,13 +5796,64 @@ def api_book_tts_offline_status(book_id):
         return jsonify({"error": "unauthorized"}), 401
     try:
         book = read_book_record(book_id)
-        result = tts_offline_book_status(book, load_config()["reader_tts"])
-        result["active_job"] = active_tts_offline_job_for_book(book_id)
+        active_job = active_tts_offline_job_for_book(book_id)
+        result, timing = tts_offline_book_status(
+            book,
+            load_config()["reader_tts"],
+            use_snapshot=active_job is None,
+        )
+        result["active_job"] = active_job
+        app.logger.info(
+            "tts offline status ready ip=%s book=%s chapters=%s snapshot=%s "
+            "sentence_index=%.3fs refs=%.3fs validation=%.3fs snapshot_read=%.3fs total=%.3fs",
+            request.remote_addr,
+            book_id,
+            len(result["chapters"]),
+            "hit" if timing["snapshot_hit"] else "miss",
+            timing["sentence_index_seconds"],
+            timing["refs_seconds"],
+            timing["chapters_seconds"],
+            timing["snapshot_seconds"],
+            timing["total_seconds"],
+        )
         return jsonify(result)
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 404
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/books/<book_id>/tts-offline/timing", methods=["POST"])
+def api_book_tts_offline_timing(book_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    payload = request_json_object()
+
+    def milliseconds(name):
+        try:
+            return max(0.0, min(float(payload.get(name, 0)), 180_000.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    try:
+        local_packs = max(0, min(int(payload.get("local_packs", 0) or 0), 1_000_000))
+    except (TypeError, ValueError):
+        local_packs = 0
+    app.logger.info(
+        "tts offline client timing ip=%s book=%s server=%.1fms local=%.1fms "
+        "db_open=%.1fms index=%.1fms metadata=%.1fms storage=%.1fms total=%.1fms local_packs=%s",
+        request.remote_addr,
+        clean_display_text(book_id, 64),
+        milliseconds("server_ms"),
+        milliseconds("local_ms"),
+        milliseconds("db_open_ms"),
+        milliseconds("index_ms"),
+        milliseconds("metadata_ms"),
+        milliseconds("storage_ms"),
+        milliseconds("total_ms"),
+        local_packs,
+    )
+    return jsonify({"ok": True})
 
 
 @app.route("/api/books/<book_id>/tts-offline", methods=["POST"])
@@ -6299,7 +6587,20 @@ def api_password():
 def api_status():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    return jsonify(system_status())
+    started = time.perf_counter()
+    result = system_status()
+    with SERVICE_READY_LOCK:
+        first_ready = not SERVICE_READY_STATE["logged"]
+        if first_ready:
+            SERVICE_READY_STATE["logged"] = True
+    if first_ready:
+        app.logger.info(
+            "service ready pid=%s uptime=%.3fs status_elapsed=%.3fs",
+            os.getpid(),
+            time.time() - PROCESS_START_TIME,
+            time.perf_counter() - started,
+        )
+    return jsonify(result)
 
 
 @app.route("/api/cache", methods=["GET", "DELETE"])
@@ -6383,5 +6684,10 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "31000"))
     if port < 1 or port > 65535:
         raise RuntimeError("PORT 必须在 1 到 65535 之间")
-    validate_runtime_security()
-    app.run(host=host, port=port)
+    app.logger.info("service process starting pid=%s host=%s port=%s", os.getpid(), host, port)
+    try:
+        validate_runtime_security()
+        app.run(host=host, port=port)
+    except Exception:
+        app.logger.exception("service process startup failed pid=%s", os.getpid())
+        raise

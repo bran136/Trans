@@ -71,7 +71,9 @@ const readerState = {
 const $ = (id) => document.getElementById(id);
 const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || "";
 const TTS_OFFLINE_DB_NAME = "trans-reader-offline-v1";
+const TTS_OFFLINE_DB_VERSION = 8;
 const TTS_OFFLINE_PACK_STORE = "packs";
+const TTS_OFFLINE_PACK_META_STORE = "pack-meta";
 const TTS_OFFLINE_DOWNLOAD_WORKERS = 6;
 const TTS_OFFLINE_MAX_CHAPTERS = 300;
 const TTS_PACK_PREFETCH_WORKERS = 4;
@@ -341,7 +343,7 @@ function openTtsOfflineDb() {
   if (ttsOfflineDbPromise) return ttsOfflineDbPromise;
   let openPromise;
   openPromise = new Promise((resolve, reject) => {
-    const request = window.indexedDB.open(TTS_OFFLINE_DB_NAME, 6);
+    const request = window.indexedDB.open(TTS_OFFLINE_DB_NAME, TTS_OFFLINE_DB_VERSION);
     let settled = false;
     const timeoutId = window.setTimeout(() => {
       fail(new Error("读取本机离线缓存超时，请关闭其他读书页面后重试"));
@@ -373,6 +375,18 @@ function openTtsOfflineDb() {
       if (!packStore.indexNames.contains("bookProfileChapter")) {
         packStore.createIndex("bookProfileChapter", ["bookId", "profileKey", "chapterIndex"], { unique: false });
       }
+      const metaStore = database.objectStoreNames.contains(TTS_OFFLINE_PACK_META_STORE)
+        ? request.transaction.objectStore(TTS_OFFLINE_PACK_META_STORE)
+        : database.createObjectStore(TTS_OFFLINE_PACK_META_STORE, { keyPath: "id" });
+      if (!metaStore.indexNames.contains("book")) {
+        metaStore.createIndex("book", "bookId", { unique: false });
+      }
+      if (!metaStore.indexNames.contains("bookProfile")) {
+        metaStore.createIndex("bookProfile", ["bookId", "profileKey"], { unique: false });
+      }
+      if (metaStore.indexNames.contains("bookProfileChapter")) {
+        metaStore.deleteIndex("bookProfileChapter");
+      }
     };
     request.onsuccess = () => {
       const database = request.result;
@@ -402,6 +416,67 @@ function normalizedOfflineTtsText(value) {
 
 function offlinePackRecordId(bookId, profileKey, chapterIndex, packKey) {
   return `${bookId}:${profileKey}:${Number(chapterIndex)}:${packKey}`;
+}
+
+function localOfflinePackMetadata(record) {
+  return {
+    id: record.id,
+    bookId: record.bookId,
+    profileKey: record.profileKey,
+    chapterIndex: Number(record.chapterIndex),
+    chapterHash: record.chapterHash,
+    chapterSentenceCount: Number(record.chapterSentenceCount),
+    schemaVersion: Number(record.schemaVersion),
+    packKey: record.packKey,
+    startSentenceIndex: Number(record.startSentenceIndex),
+    endSentenceIndex: Number(record.endSentenceIndex),
+    sentenceCount: Number(record.sentenceCount),
+    segments: Array.isArray(record.segments) ? record.segments : [],
+    duration: Number(record.duration),
+    format: record.format,
+    nextStartSentenceIndexes: Array.isArray(record.nextStartSentenceIndexes)
+      ? record.nextStartSentenceIndexes
+      : [],
+    remainingPackCount: Number(record.remainingPackCount),
+    size: record.blob instanceof Blob ? Number(record.blob.size) : 0,
+    savedAt: Number(record.savedAt) || 0,
+  };
+}
+
+async function rebuildLocalOfflinePackMetadata(database, bookId, profileKey) {
+  const range = IDBKeyRange.only([bookId, profileKey]);
+  await new Promise((resolve, reject) => {
+    const transaction = database.transaction(
+      [TTS_OFFLINE_PACK_STORE, TTS_OFFLINE_PACK_META_STORE],
+      "readwrite",
+    );
+    const metadataStore = transaction.objectStore(TTS_OFFLINE_PACK_META_STORE);
+    const copyPacks = () => {
+      const packRequest = transaction.objectStore(TTS_OFFLINE_PACK_STORE)
+        .index("bookProfile").openCursor(range);
+      packRequest.onsuccess = () => {
+        const cursor = packRequest.result;
+        if (!cursor) return;
+        metadataStore.put(localOfflinePackMetadata(cursor.value));
+        cursor.continue();
+      };
+      packRequest.onerror = () => reject(packRequest.error || new Error("重建本机缓存索引失败"));
+    };
+    const metadataRequest = metadataStore.index("bookProfile").openCursor(range);
+    metadataRequest.onsuccess = () => {
+      const cursor = metadataRequest.result;
+      if (!cursor) {
+        copyPacks();
+        return;
+      }
+      cursor.delete();
+      cursor.continue();
+    };
+    metadataRequest.onerror = () => reject(metadataRequest.error || new Error("重建本机缓存索引失败"));
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error("重建本机缓存索引失败"));
+    transaction.onabort = () => reject(transaction.error || new Error("重建本机缓存索引失败"));
+  });
 }
 
 function validPackSegments(segments) {
@@ -573,15 +648,19 @@ async function saveLocalOfflinePack(manifest, entry, blob) {
     blob,
   };
   await new Promise((resolve, reject) => {
-    const transaction = database.transaction(TTS_OFFLINE_PACK_STORE, "readwrite");
+    const transaction = database.transaction(
+      [TTS_OFFLINE_PACK_STORE, TTS_OFFLINE_PACK_META_STORE],
+      "readwrite",
+    );
     transaction.objectStore(TTS_OFFLINE_PACK_STORE).put(record);
+    transaction.objectStore(TTS_OFFLINE_PACK_META_STORE).put(localOfflinePackMetadata(record));
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error || new Error("写入本机播放包失败"));
     transaction.onabort = () => reject(transaction.error || new Error("本机缓存空间不足"));
   });
 }
 
-async function localOfflineStats(bookId, profileKey, chapters = []) {
+async function localOfflineStats(bookId, profileKey, chapters = [], timing = null, repair = true) {
   const stats = new Map();
   if (!bookId || !profileKey) return stats;
   const chapterHashes = new Map(chapters
@@ -591,15 +670,40 @@ async function localOfflineStats(bookId, profileKey, chapters = []) {
     .filter((chapter) => chapter.total_sentences !== null && Number.isInteger(Number(chapter.total_sentences)))
     .map((chapter) => [Number(chapter.index), Number(chapter.total_sentences)]));
   try {
+    const databaseStarted = performance.now();
     const database = await openTtsOfflineDb();
+    if (timing) timing.dbOpenMs = performance.now() - databaseStarted;
+    const readStarted = performance.now();
+    let packKeys = [];
+    let metadataKeys = [];
+    let packKeysFinished = readStarted;
+    let metadataKeysFinished = readStarted;
+    let metadataFinished = readStarted;
+    // Keep the exact key comparison: it repairs legacy or interrupted metadata
+    // without loading the audio blobs, while the metadata scan runs in parallel.
     await new Promise((resolve, reject) => {
-      const request = database.transaction(TTS_OFFLINE_PACK_STORE, "readonly")
-        .objectStore(TTS_OFFLINE_PACK_STORE).index("bookProfile")
-        .openCursor(IDBKeyRange.only([bookId, profileKey]));
+      const transaction = database.transaction(
+        [TTS_OFFLINE_PACK_STORE, TTS_OFFLINE_PACK_META_STORE],
+        "readonly",
+      );
+      const range = IDBKeyRange.only([bookId, profileKey]);
+      const packKeysRequest = transaction.objectStore(TTS_OFFLINE_PACK_STORE)
+        .index("bookProfile").getAllKeys(range);
+      const metadataStore = transaction.objectStore(TTS_OFFLINE_PACK_META_STORE);
+      const metadataKeysRequest = metadataStore.index("bookProfile").getAllKeys(range);
+      const request = metadataStore.index("bookProfile").openCursor(range);
+      packKeysRequest.onsuccess = () => {
+        packKeys = packKeysRequest.result;
+        packKeysFinished = performance.now();
+      };
+      metadataKeysRequest.onsuccess = () => {
+        metadataKeys = metadataKeysRequest.result;
+        metadataKeysFinished = performance.now();
+      };
       request.onsuccess = () => {
         const cursor = request.result;
         if (!cursor) {
-          resolve();
+          metadataFinished = performance.now();
           return;
         }
         const record = cursor.value;
@@ -617,9 +721,8 @@ async function localOfflineStats(bookId, profileKey, chapters = []) {
           && Number.isInteger(Number(record.chapterSentenceCount))
           && Number(record.chapterSentenceCount) >= recordSegments.length
           && Math.abs(Number(lastSegment?.end) - Number(record.duration)) <= 0.15
-          && record.blob instanceof Blob
-          && record.blob.size > 0
-          && record.blob.size <= TTS_MAX_PACK_BYTES
+          && Number(record.size) > 0
+          && Number(record.size) <= TTS_MAX_PACK_BYTES
           && validPackSegments(recordSegments)) {
           const current = stats.get(chapterIndex) || {
             entries: 0,
@@ -631,32 +734,54 @@ async function localOfflineStats(bookId, profileKey, chapters = []) {
           recordSegments.forEach((segment) => current.indexes.add(Number(segment.index)));
           current.entries = current.indexes.size;
           current.packs += 1;
-          current.sizeBytes += Number(record.size) || Number(record.blob.size) || 0;
+          current.sizeBytes += Number(record.size) || 0;
           current.totalSentences = Math.max(current.totalSentences, Number(record.chapterSentenceCount));
           stats.set(chapterIndex, current);
         }
         cursor.continue();
       };
-      request.onerror = () => reject(request.error);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error || new Error("读取本机缓存失败"));
+      transaction.onabort = () => reject(transaction.error || new Error("读取本机缓存失败"));
     });
+    if (timing) {
+      timing.indexMs = (timing.indexMs || 0)
+        + Math.max(packKeysFinished, metadataKeysFinished) - readStarted;
+      timing.metadataMs = (timing.metadataMs || 0) + metadataFinished - readStarted;
+    }
+    const metadataMatches = packKeys.length === metadataKeys.length
+      && packKeys.every((key, index) => key === metadataKeys[index]);
+    if (!metadataMatches) {
+      if (!repair) throw new Error("本机缓存索引校准失败，请重试");
+      showOfflineCacheProgress("正在校准本机缓存索引", "", bookId);
+      const rebuildStarted = performance.now();
+      await rebuildLocalOfflinePackMetadata(database, bookId, profileKey);
+      if (timing) timing.indexMs += performance.now() - rebuildStarted;
+      return localOfflineStats(bookId, profileKey, chapters, timing, false);
+    }
   } catch (error) {
     throw error;
   }
   return stats;
 }
 
-async function deleteLocalOfflineStoreRecords(database, storeName, bookId, profileKey = "", chapterIndexes = null) {
+async function deleteLocalOfflinePackRecords(database, bookId, profileKey = "", chapterIndexes = null) {
   const selected = chapterIndexes ? new Set(chapterIndexes.map(Number)) : null;
   let entries = 0;
   let sizeBytes = 0;
   await new Promise((resolve, reject) => {
-    const transaction = database.transaction(storeName, "readwrite");
-    const store = transaction.objectStore(storeName);
+    const transaction = database.transaction(
+      [TTS_OFFLINE_PACK_STORE, TTS_OFFLINE_PACK_META_STORE],
+      "readwrite",
+    );
+    const store = transaction.objectStore(TTS_OFFLINE_PACK_STORE);
+    const metadataStore = transaction.objectStore(TTS_OFFLINE_PACK_META_STORE);
     const indexName = profileKey ? "bookProfile" : "book";
     const key = profileKey ? [bookId, profileKey] : bookId;
-    const request = store.index(indexName).openCursor(IDBKeyRange.only(key));
-    request.onsuccess = () => {
-      const cursor = request.result;
+    const range = IDBKeyRange.only(key);
+    const packRequest = store.index(indexName).openCursor(range);
+    packRequest.onsuccess = () => {
+      const cursor = packRequest.result;
       if (!cursor) return;
       if (!selected || selected.has(Number(cursor.value.chapterIndex))) {
         entries += 1;
@@ -665,7 +790,15 @@ async function deleteLocalOfflineStoreRecords(database, storeName, bookId, profi
       }
       cursor.continue();
     };
-    request.onerror = () => reject(request.error || new Error("读取本机缓存失败"));
+    packRequest.onerror = () => reject(packRequest.error || new Error("读取本机缓存失败"));
+    const metadataRequest = metadataStore.index(indexName).openCursor(range);
+    metadataRequest.onsuccess = () => {
+      const cursor = metadataRequest.result;
+      if (!cursor) return;
+      if (!selected || selected.has(Number(cursor.value.chapterIndex))) cursor.delete();
+      cursor.continue();
+    };
+    metadataRequest.onerror = () => reject(metadataRequest.error || new Error("读取本机缓存索引失败"));
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error || new Error("删除本机缓存失败"));
     transaction.onabort = () => reject(transaction.error || new Error("删除本机缓存失败"));
@@ -676,14 +809,14 @@ async function deleteLocalOfflineStoreRecords(database, storeName, bookId, profi
 async function deleteLocalOfflineChapters(bookId, profileKey, chapterIndexes) {
   if (!bookId || !profileKey || !chapterIndexes.length) return { entries: 0, packs: 0, sizeBytes: 0 };
   const database = await openTtsOfflineDb();
-  const packs = await deleteLocalOfflineStoreRecords(database, TTS_OFFLINE_PACK_STORE, bookId, profileKey, chapterIndexes);
+  const packs = await deleteLocalOfflinePackRecords(database, bookId, profileKey, chapterIndexes);
   return { entries: packs.entries, packs: packs.entries, sizeBytes: packs.sizeBytes };
 }
 
 async function deleteLocalOfflineBook(bookId) {
   if (!bookId) return { entries: 0, packs: 0, sizeBytes: 0 };
   const database = await openTtsOfflineDb();
-  const packs = await deleteLocalOfflineStoreRecords(database, TTS_OFFLINE_PACK_STORE, bookId);
+  const packs = await deleteLocalOfflinePackRecords(database, bookId);
   return { entries: packs.entries, packs: packs.entries, sizeBytes: packs.sizeBytes };
 }
 
@@ -3378,20 +3511,31 @@ function renderOfflineCacheStatus(storage = "正在读取本机缓存") {
 
 async function loadOfflineCacheStatus(bookId = readerState.offlineBookId) {
   if (!bookId) throw new Error("请先选择一本书，再管理离线缓存");
+  const totalStarted = performance.now();
+  const serverStarted = performance.now();
   const status = await promiseWithTimeout(
     api("/api/books/" + bookId + "/tts-offline"),
     180000,
     "读取服务器离线缓存状态超时",
   );
+  const serverMs = performance.now() - serverStarted;
   if (bookId !== readerState.offlineBookId) return null;
   readerState.offlineStatus = status;
   readerState.offlineLocalStats = new Map();
-  const storagePromise = browserStorageSummary();
+  let storageMs = 0;
+  const storagePromise = (async () => {
+    const started = performance.now();
+    const storage = await browserStorageSummary();
+    storageMs = performance.now() - started;
+    return storage;
+  })();
   renderOfflineCacheStatus();
+  const localTiming = {};
+  const localStarted = performance.now();
   try {
     readerState.offlineLocalStats = await promiseWithTimeout(
-      localOfflineStats(bookId, status.profile_key, status.chapters),
-      8000,
+      localOfflineStats(bookId, status.profile_key, status.chapters, localTiming),
+      180000,
       "读取本机离线缓存超时",
     );
     status.local_cache_error = "";
@@ -3399,9 +3543,27 @@ async function loadOfflineCacheStatus(bookId = readerState.offlineBookId) {
     readerState.offlineLocalStats = new Map();
     status.local_cache_error = error.message || "读取本机离线缓存失败";
   }
+  const localMs = performance.now() - localStarted;
   if (bookId !== readerState.offlineBookId) return null;
   const storage = await storagePromise;
   renderOfflineCacheStatus(storage);
+  const localPacks = [...readerState.offlineLocalStats.values()].reduce(
+    (total, chapter) => total + (Number(chapter.packs) || 0),
+    0,
+  );
+  api("/api/books/" + bookId + "/tts-offline/timing", {
+    method: "POST",
+    body: JSON.stringify({
+      server_ms: serverMs,
+      local_ms: localMs,
+      db_open_ms: localTiming.dbOpenMs || 0,
+      index_ms: localTiming.indexMs || 0,
+      metadata_ms: localTiming.metadataMs || 0,
+      storage_ms: storageMs,
+      total_ms: performance.now() - totalStarted,
+      local_packs: localPacks,
+    }),
+  }).catch(() => {});
   return status;
 }
 
