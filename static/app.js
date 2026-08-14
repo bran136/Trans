@@ -22,6 +22,7 @@ const state = {
   targetAutoMode: true,
   resultPanelCollapsed: {},
   activeSentence: null,
+  clearCacheConfirmFocus: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -243,7 +244,6 @@ async function loadDeepSeekCacheStatus() {
 }
 
 async function clearDeepSeekCache() {
-  if (!window.confirm("确定清空 DeepSeek 本地翻译缓存？清空后相同内容会重新请求 API。")) return;
   $("clearCacheBtn").disabled = true;
   try {
     const data = await api("/api/cache", { method: "DELETE" });
@@ -254,6 +254,28 @@ async function clearDeepSeekCache() {
   } finally {
     $("clearCacheBtn").disabled = false;
   }
+}
+
+function openClearCacheConfirmation() {
+  const overlay = $("clearCacheConfirmDialog");
+  if (!overlay.hidden) return;
+  const settings = $("settingsDialog");
+  const form = settings.querySelector(":scope > .settings");
+  state.clearCacheConfirmFocus = document.activeElement;
+  form.inert = true;
+  settings.appendChild(overlay);
+  overlay.hidden = false;
+  window.setTimeout(() => $("confirmClearCacheBtn").focus(), 0);
+}
+
+function closeClearCacheConfirmation() {
+  const overlay = $("clearCacheConfirmDialog");
+  const previousFocus = state.clearCacheConfirmFocus;
+  state.clearCacheConfirmFocus = null;
+  $("settingsDialog").querySelector(":scope > .settings").inert = false;
+  overlay.hidden = true;
+  document.body.appendChild(overlay);
+  if (previousFocus?.isConnected) window.setTimeout(() => previousFocus.focus(), 0);
 }
 
 async function loadDeepSeekBalance() {
@@ -857,7 +879,17 @@ function placeHelpBox(help) {
   body.style.setProperty("--help-shift-x", Math.round(shift) + "px");
 }
 $("saveConfigBtn").addEventListener("click", saveConfig);
-$("clearCacheBtn").addEventListener("click", clearDeepSeekCache);
+$("clearCacheBtn").addEventListener("click", openClearCacheConfirmation);
+$("cancelClearCacheBtn").addEventListener("click", closeClearCacheConfirmation);
+$("confirmClearCacheBtn").addEventListener("click", () => {
+  closeClearCacheConfirmation();
+  clearDeepSeekCache();
+});
+$("settingsDialog").addEventListener("cancel", (event) => {
+  if ($("clearCacheConfirmDialog").hidden) return;
+  event.preventDefault();
+  closeClearCacheConfirmation();
+});
 $("logoutBtn").addEventListener("click", async () => {
   await api("/logout", { method: "POST", body: "{}" });
   window.location.href = "/login";

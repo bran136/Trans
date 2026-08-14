@@ -960,6 +960,20 @@ def display_chapter_title(chapter, index):
     return title or f"第 {index + 1} 章"
 
 
+def book_chapter_summaries(book):
+    return [
+        {
+            "index": chapter.get("index", index),
+            "title": display_chapter_title(chapter, index),
+            "level": max(1, min(int(chapter.get("level") or 1), 4)),
+            "kind": chapter.get("kind", "chapter"),
+            "char_count": int(chapter.get("char_count") or len(chapter.get("text", ""))),
+            "cached": bool(chapter.get("cached") or chapter.get("text")),
+        }
+        for index, chapter in enumerate(book.get("chapters", []))
+    ]
+
+
 def rebuild_book_index():
     ensure_reader_dirs()
     with READER_IO_LOCK:
@@ -1045,18 +1059,18 @@ def normalize_book_text(text, max_chars=MAX_BOOK_TEXT_CHARS):
 NOISY_CHAPTER_TITLES = {"", "未知", "cover", "contents", "目录", "table of contents"}
 CHAPTER_NUM_CHARS = "一二三四五六七八九十百千万零〇两0123456789０１２３４５６７８９"
 CHAPTER_TITLE_PATTERNS = [
-    re.compile(r"^(第[一二三四五六七八九十百千万零〇两\d]{1,8}[章节回部篇集卷]\s*[^，。！？!?]{0,60})$"),
-    re.compile(r"^([上中下前后][卷部篇集]\s*[^，。！？!?]{0,60})$"),
-    re.compile(r"^((?:序章|楔子|引子|前言|后记|尾声|终章|番外|外传|附录|版权信息)\s*[^，。！？!?]{0,60})$"),
-    re.compile(r"^([0-9０-９]{1,4}\s*[.．、]\s*[^，。！？!?]{1,70})$"),
+    re.compile(r"^(第[一二三四五六七八九十百千万零〇两\d]{1,8}[章节回部篇集卷]\s*[^，。]{0,60})$"),
+    re.compile(r"^([上中下前后][卷部篇集]\s*[^，。]{0,60})$"),
+    re.compile(r"^((?:序章|楔子|引子|前言|后记|尾声|终章|番外|外传|附录|版权信息)\s*[^，。]{0,60})$"),
+    re.compile(r"^([0-9０-９]{1,4}\s*[.．、]\s*[^，。]{1,70})$"),
     re.compile(r"^(Chapter\s+[0-9IVXLCDM]+[\s:：.-]*.{0,70})$", re.IGNORECASE),
 ]
 PLAIN_CHAPTER_TITLE_PATTERNS = [
-    re.compile(rf"^第[{CHAPTER_NUM_CHARS}]{{1,18}}[章节回部篇集卷]\s*[^。！？!?]{{0,90}}$", re.IGNORECASE),
-    re.compile(rf"^第[{CHAPTER_NUM_CHARS}]{{1,18}}卷[^。！？!?]{{0,50}}第[{CHAPTER_NUM_CHARS}]{{1,18}}章[^。！？!?]{{0,90}}$", re.IGNORECASE),
-    re.compile(r"^[上中下前后][卷部篇集]\s*[^。！？!?]{0,80}$", re.IGNORECASE),
-    re.compile(r"^(?:序章|楔子|引子|前言|后记|尾声|终章|番外|外传|附录|版权信息)\s*[^。！？!?]{0,80}$", re.IGNORECASE),
-    re.compile(r"^(?:[（(]\s*\d+\s*鲜币\s*[）)]\s*)?[0-9０-９]{1,5}\s*[.．、]\s*[^，。！？!?]{1,90}$", re.IGNORECASE),
+    re.compile(rf"^第[{CHAPTER_NUM_CHARS}]{{1,18}}[章节回部篇集卷]\s*[^。]{{0,90}}$", re.IGNORECASE),
+    re.compile(rf"^第[{CHAPTER_NUM_CHARS}]{{1,18}}卷[^。]{{0,50}}第[{CHAPTER_NUM_CHARS}]{{1,18}}章[^。]{{0,90}}$", re.IGNORECASE),
+    re.compile(r"^[上中下前后][卷部篇集]\s*[^。]{0,80}$", re.IGNORECASE),
+    re.compile(r"^(?:序章|楔子|引子|前言|后记|尾声|终章|番外|外传|附录|版权信息)\s*[^。]{0,80}$", re.IGNORECASE),
+    re.compile(r"^(?:[（(]\s*\d+\s*鲜币\s*[）)]\s*)?[0-9０-９]{1,5}\s*[.．、]\s*[^，。]{1,90}$", re.IGNORECASE),
     re.compile(r"^Chapter\s+[0-9IVXLCDM]+[\s:：.-]*.{0,90}$", re.IGNORECASE),
 ]
 
@@ -1128,8 +1142,6 @@ def is_plain_chapter_title(value):
     if re.search(r"(?:https?://|www\.|\.com|\.net|\.org|下载|书包网|更多精彩|点击|最新网址)", title, re.IGNORECASE):
         return False
     if title.count("。") + title.count("，") + title.count(",") >= 2:
-        return False
-    if re.search(r"[。！？!?]$", title) and not re.match(r"^(?:[（(]\s*\d+\s*鲜币\s*[）)]\s*)?[0-9０-９]{1,5}\s*[.．、]", title):
         return False
     if re.fullmatch(r"\d{1,5}\.[A-Za-z0-9_ -]{1,12}", title):
         return False
@@ -3976,8 +3988,13 @@ def delete_tts_offline_refs(book_id, chapter_indexes=None, profile_key=None, del
         finally:
             connection.close()
     affected_size = sum(max(0, int(row["size_bytes"] or 0)) for row in rows)
+    # Every reference for this book is gone, so its own manifests cannot still
+    # be pinned. Partial removals still protect packs used by other chapters.
+    preserve_pinned_packs = chapter_indexes is not None or bool(profile_key)
     with TTS_PACK_CACHE_LOCK:
-        removed_packs = delete_unpinned_tts_pack_files(book_id, chapter_indexes, profile_key)
+        removed_packs = delete_unpinned_tts_pack_files(
+            book_id, chapter_indexes, profile_key, preserve_pinned_packs,
+        )
     removed_size = int(removed_packs["size_bytes"])
     if not delete_files:
         result = {
@@ -4053,13 +4070,18 @@ def pinned_tts_pack_keys():
     return pinned
 
 
-def delete_unpinned_tts_pack_files(book_id, chapter_indexes=None, profile_key=None):
+def delete_unpinned_tts_pack_files(
+    book_id,
+    chapter_indexes=None,
+    profile_key=None,
+    preserve_pinned=True,
+):
     selected = None if chapter_indexes is None else {int(index) for index in chapter_indexes}
     entries = 0
     size_bytes = 0
     if not TTS_PACK_CACHE_DIR.is_dir():
         return {"entries": 0, "size_bytes": 0}
-    pinned_keys = pinned_tts_pack_keys()
+    pinned_keys = pinned_tts_pack_keys() if preserve_pinned else set()
     for manifest_path in TTS_PACK_CACHE_DIR.glob("*.json"):
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -6235,18 +6257,7 @@ def api_book_detail(book_id):
             book["updated_at"] = max(int(book.get("updated_at") or 0), now)
             write_book_record(book)
             upsert_book_index(book)
-        chapters = [
-            {
-                "index": chapter.get("index", index),
-                "title": display_chapter_title(chapter, index),
-                "level": max(1, min(int(chapter.get("level") or 1), 4)),
-                "kind": chapter.get("kind", "chapter"),
-                "char_count": int(chapter.get("char_count") or len(chapter.get("text", ""))),
-                "cached": bool(chapter.get("cached") or chapter.get("text")),
-            }
-            for index, chapter in enumerate(book.get("chapters", []))
-        ]
-        return jsonify({"book": book_summary(book), "chapters": chapters})
+        return jsonify({"book": book_summary(book), "chapters": book_chapter_summaries(book)})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 404
 
@@ -6415,6 +6426,7 @@ def api_txt_chapter_title_update(book_id, chapter_index):
 def api_txt_chapter_title_delete(book_id, chapter_index):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
+    started = time.perf_counter()
     try:
         with TTS_OFFLINE_JOB_LOCK:
             active = active_tts_offline_job_for_book(book_id)
@@ -6424,8 +6436,22 @@ def api_txt_chapter_title_delete(book_id, chapter_index):
                     "job": active,
                 }), 409
             book = delete_txt_chapter_title(book_id, chapter_index)
+            cleanup_started = time.perf_counter()
             delete_tts_offline_refs(book_id)
-        return jsonify({"ok": True, "book": book_summary(book)})
+            cleanup_seconds = time.perf_counter() - cleanup_started
+        app.logger.info(
+            "txt chapter title deleted ip=%s book=%s chapter=%s cleanup=%.3fs total=%.3fs",
+            request.remote_addr,
+            book_id,
+            chapter_index,
+            cleanup_seconds,
+            time.perf_counter() - started,
+        )
+        return jsonify({
+            "ok": True,
+            "book": book_summary(book),
+            "chapters": book_chapter_summaries(book),
+        })
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 404
     except Exception as exc:
@@ -6450,6 +6476,7 @@ def api_txt_chapter_split(book_id, chapter_index):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     payload = request_json_object()
+    started = time.perf_counter()
     try:
         line_index = int(payload.get("line_index", -1))
         with TTS_OFFLINE_JOB_LOCK:
@@ -6460,8 +6487,23 @@ def api_txt_chapter_split(book_id, chapter_index):
                     "job": active,
                 }), 409
             book = split_txt_chapter_at_line(book_id, chapter_index, line_index, payload.get("title", ""))
+            cleanup_started = time.perf_counter()
             delete_tts_offline_refs(book_id)
-        return jsonify({"ok": True, "book": book_summary(book)})
+            cleanup_seconds = time.perf_counter() - cleanup_started
+        app.logger.info(
+            "txt chapter title added ip=%s book=%s chapter=%s line=%s cleanup=%.3fs total=%.3fs",
+            request.remote_addr,
+            book_id,
+            chapter_index,
+            line_index,
+            cleanup_seconds,
+            time.perf_counter() - started,
+        )
+        return jsonify({
+            "ok": True,
+            "book": book_summary(book),
+            "chapters": book_chapter_summaries(book),
+        })
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 404
     except Exception as exc:
@@ -6499,6 +6541,7 @@ def api_book_delete(book_id):
         target_dir = book_dir(book_id)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    started = time.perf_counter()
     with TTS_OFFLINE_JOB_LOCK:
         active = active_tts_offline_job_for_book(book_id)
         if active:
@@ -6507,12 +6550,22 @@ def api_book_delete(book_id):
                 "job": active,
             }), 409
         with READER_IO_LOCK:
-            delete_tts_offline_refs(book_id, delete_files=True)
             if not target_dir.exists():
                 return jsonify({"error": "书籍不存在"}), 404
+            cleanup_started = time.perf_counter()
+            removed = delete_tts_offline_refs(book_id, delete_files=True)
+            cleanup_seconds = time.perf_counter() - cleanup_started
             shutil.rmtree(target_dir)
             remove_from_book_index(book_id)
-    app.logger.info("book deleted ip=%s id=%s", request.remote_addr, book_id)
+    app.logger.info(
+        "book deleted ip=%s id=%s refs=%s packs=%s cleanup=%.3fs total=%.3fs",
+        request.remote_addr,
+        book_id,
+        removed["entries"],
+        removed["pack_entries"],
+        cleanup_seconds,
+        time.perf_counter() - started,
+    )
     return jsonify({"ok": True})
 
 

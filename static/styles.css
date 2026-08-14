@@ -766,7 +766,24 @@ label {
   box-shadow: var(--shadow);
 }
 
-.restart-confirm-panel {
+.action-confirm-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 14px;
+  background: rgba(20, 29, 39, 0.32);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+
+.action-confirm-overlay[hidden] {
+  display: none;
+}
+
+.restart-confirm-panel,
+.action-confirm-panel {
   display: grid;
   grid-template-columns: 46px minmax(0, 1fr);
   align-items: center;
@@ -777,7 +794,12 @@ label {
   background: rgba(255, 255, 255, 0.96);
 }
 
-.restart-confirm-icon {
+.action-confirm-overlay .action-confirm-panel {
+  width: min(420px, 100%);
+}
+
+.restart-confirm-icon,
+.action-confirm-icon {
   display: grid;
   width: 46px;
   height: 46px;
@@ -789,20 +811,23 @@ label {
   font-weight: 900;
 }
 
-.restart-confirm-copy h2 {
+.restart-confirm-copy h2,
+.action-confirm-copy h2 {
   margin: 0;
   color: var(--ink);
   font-size: 18px;
 }
 
-.restart-confirm-copy p {
+.restart-confirm-copy p,
+.action-confirm-copy p {
   margin: 6px 0 0;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.55;
 }
 
-.restart-confirm-actions {
+.restart-confirm-actions,
+.action-confirm-actions {
   display: flex;
   grid-column: 1 / -1;
   justify-content: flex-end;
@@ -810,7 +835,8 @@ label {
   margin-top: 4px;
 }
 
-.restart-confirm-actions button {
+.restart-confirm-actions button,
+.action-confirm-actions button {
   min-width: 104px;
   height: 40px;
 }

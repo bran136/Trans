@@ -178,6 +178,20 @@
       </form>
     </dialog>
 
+    <div id="clearCacheConfirmDialog" class="action-confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="clearCacheConfirmTitle" aria-describedby="clearCacheConfirmMessage" hidden>
+      <section class="action-confirm-panel">
+        <div class="action-confirm-icon" aria-hidden="true">!</div>
+        <div class="action-confirm-copy">
+          <h2 id="clearCacheConfirmTitle">清空翻译缓存？</h2>
+          <p id="clearCacheConfirmMessage">清空后，相同内容会重新请求 DeepSeek API。</p>
+        </div>
+        <div class="action-confirm-actions">
+          <button class="ghost" id="cancelClearCacheBtn" type="button">取消</button>
+          <button class="danger-btn" id="confirmClearCacheBtn" type="button">确认清空</button>
+        </div>
+      </section>
+    </div>
+
     <div class="version-badge">
       <span>v{{ app_version() }}</span>
       <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">

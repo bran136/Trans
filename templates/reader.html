@@ -94,6 +94,19 @@
       </section>
     </dialog>
 
+    <div id="deleteBookConfirmDialog" class="action-confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="deleteBookConfirmTitle" aria-describedby="deleteBookConfirmMessage" hidden>
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2 id="deleteBookConfirmTitle">删除书籍</h2>
+          <div class="dialog-actions">
+            <button id="cancelDeleteBookBtn" type="button">取消</button>
+            <button id="confirmDeleteBookBtn" class="dialog-confirm-btn danger" type="button">确认删除</button>
+          </div>
+        </div>
+        <p id="deleteBookConfirmMessage" class="reader-config-message compact-confirm-message"></p>
+      </section>
+    </div>
+
     <dialog id="statisticsDialog" class="reader-dialog statistics-dialog">
       <section class="dialog-panel">
         <div class="dialog-head">
@@ -142,9 +155,23 @@
           <button id="closeTocLineBtn" type="button">关闭</button>
         </div>
         <input id="tocLineSearch" class="toc-line-search" type="search" placeholder="搜索这一章里的行">
+        <div id="tocLineMessage" class="reader-config-message" hidden></div>
         <div id="tocLineList" class="toc-line-list"></div>
       </section>
     </dialog>
+
+    <div id="actionConfirmDialog" class="action-confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="actionConfirmTitle" aria-describedby="actionConfirmMessage" hidden>
+      <section class="dialog-panel">
+        <div class="dialog-head">
+          <h2 id="actionConfirmTitle">确认操作</h2>
+          <div class="dialog-actions">
+            <button id="cancelActionConfirmBtn" type="button">取消</button>
+            <button id="confirmActionConfirmBtn" class="dialog-confirm-btn" type="button">确认</button>
+          </div>
+        </div>
+        <p id="actionConfirmMessage" class="reader-config-message compact-confirm-message"></p>
+      </section>
+    </div>
 
     <dialog id="settingsDialog" class="reader-dialog settings-dialog">
       <section class="dialog-panel">

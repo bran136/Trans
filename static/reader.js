@@ -56,8 +56,14 @@ const readerState = {
   tocEditBookId: "",
   tocEditBook: null,
   tocEditChapters: [],
+  tocEditRequestId: 0,
   tocLineChapter: null,
   tocLineRows: [],
+  tocMutationBusy: false,
+  actionConfirmResolve: null,
+  actionConfirmFocus: null,
+  actionConfirmParentDialog: null,
+  actionConfirmParentPanel: null,
   offlineBookId: "",
   offlineBook: null,
   offlineStatus: null,
@@ -68,6 +74,10 @@ const readerState = {
   offlineCancelRequested: false,
   offlineRetry: null,
   metadataEditBookId: "",
+  deleteBookTarget: null,
+  deleteBookBusy: false,
+  deleteBookFocus: null,
+  deleteBookParentPanel: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -834,10 +844,45 @@ async function deleteLocalOfflineChapters(bookId, profileKey, chapterIndexes) {
 }
 
 async function deleteLocalOfflineBook(bookId) {
-  if (!bookId) return { entries: 0, packs: 0, sizeBytes: 0 };
+  if (!bookId) return { entries: 0, packs: 0 };
   const database = await openTtsOfflineDb();
-  const packs = await deleteLocalOfflinePackRecords(database, bookId);
-  return { entries: packs.entries, packs: packs.entries, sizeBytes: packs.sizeBytes };
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(
+      [TTS_OFFLINE_PACK_STORE, TTS_OFFLINE_PACK_META_STORE],
+      "readwrite",
+    );
+    const packStore = transaction.objectStore(TTS_OFFLINE_PACK_STORE);
+    const metadataStore = transaction.objectStore(TTS_OFFLINE_PACK_META_STORE);
+    const range = IDBKeyRange.only(bookId);
+    const packRequest = packStore.index("book").getAllKeys(range);
+    const metadataRequest = metadataStore.index("book").getAllKeys(range);
+    let packKeys = null;
+    let metadataKeys = null;
+    let deleting = false;
+    const deleteKeys = () => {
+      if (deleting || !packKeys || !metadataKeys) return;
+      deleting = true;
+      const keys = new Set([...packKeys, ...metadataKeys]);
+      keys.forEach((key) => {
+        packStore.delete(key);
+        metadataStore.delete(key);
+      });
+    };
+    packRequest.onsuccess = () => {
+      packKeys = packRequest.result;
+      deleteKeys();
+    };
+    metadataRequest.onsuccess = () => {
+      metadataKeys = metadataRequest.result;
+      deleteKeys();
+    };
+    transaction.oncomplete = () => resolve({
+      entries: packKeys?.length || 0,
+      packs: packKeys?.length || 0,
+    });
+    transaction.onerror = () => reject(transaction.error || new Error("删除本机缓存失败"));
+    transaction.onabort = () => reject(transaction.error || new Error("删除本机缓存失败"));
+  });
 }
 
 async function discardLocalOfflineBook(bookId) {
@@ -1149,7 +1194,7 @@ function renderManageBooks() {
     row.querySelector('[data-action="reparse"]').addEventListener("click", () => reparseBook(book));
     row.querySelector('[data-action="clear-toc"]')?.addEventListener("click", () => clearBookToc(book));
     row.querySelector('[data-action="offline-cache"]').addEventListener("click", () => openOfflineCacheManager(book));
-    row.querySelector('[data-action="delete"]').addEventListener("click", () => deleteBook(book));
+    row.querySelector('[data-action="delete"]').addEventListener("click", () => openDeleteBookConfirm(book));
     list.appendChild(row);
   });
 }
@@ -1161,25 +1206,109 @@ function showTocEditMessage(text, type = "") {
   node.hidden = !text;
 }
 
+function showTocLineMessage(text, type = "") {
+  const node = $("tocLineMessage");
+  node.textContent = text || "";
+  node.className = `reader-config-message ${type}`.trim();
+  node.hidden = !text;
+}
+
+function closeActionConfirmation(confirmed) {
+  const resolve = readerState.actionConfirmResolve;
+  if (!resolve) return;
+  const overlay = $("actionConfirmDialog");
+  const previousFocus = readerState.actionConfirmFocus;
+  const parentPanel = readerState.actionConfirmParentPanel;
+  readerState.actionConfirmResolve = null;
+  readerState.actionConfirmFocus = null;
+  readerState.actionConfirmParentDialog = null;
+  readerState.actionConfirmParentPanel = null;
+  if (parentPanel) parentPanel.inert = false;
+  overlay.hidden = true;
+  document.body.appendChild(overlay);
+  resolve(!!confirmed);
+  if (previousFocus?.isConnected) {
+    window.setTimeout(() => previousFocus.focus({ preventScroll: true }), 0);
+  }
+}
+
+function requestActionConfirmation({
+  title,
+  message,
+  confirmLabel,
+  danger = false,
+}) {
+  if (readerState.actionConfirmResolve) return Promise.resolve(false);
+  $("actionConfirmTitle").textContent = title;
+  $("actionConfirmMessage").textContent = message;
+  const confirmButton = $("confirmActionConfirmBtn");
+  confirmButton.textContent = confirmLabel;
+  confirmButton.classList.toggle("danger", danger);
+  return new Promise((resolve) => {
+    const overlay = $("actionConfirmDialog");
+    const openDialogs = [...document.querySelectorAll(".reader-dialog[open]")];
+    const parentDialog = document.activeElement?.closest?.(".reader-dialog[open]")
+      || openDialogs[openDialogs.length - 1];
+    const parentPanel = parentDialog?.querySelector(":scope > .dialog-panel") || null;
+    readerState.actionConfirmResolve = resolve;
+    readerState.actionConfirmFocus = document.activeElement;
+    readerState.actionConfirmParentDialog = parentDialog || null;
+    readerState.actionConfirmParentPanel = parentPanel;
+    if (parentPanel) parentPanel.inert = true;
+    (parentDialog || document.body).appendChild(overlay);
+    overlay.hidden = false;
+    window.setTimeout(() => confirmButton.focus({ preventScroll: true }), 0);
+  });
+}
+
+function setTocMutationBusy(busy) {
+  readerState.tocMutationBusy = !!busy;
+  $("closeTocEditBtn").disabled = !!busy;
+  $("closeTocLineBtn").disabled = !!busy;
+  $("tocLineSearch").disabled = !!busy;
+  document.querySelectorAll("#tocEditList button, #tocLineList button").forEach((button) => {
+    button.disabled = !!busy;
+  });
+}
+
+function applyTocEditorData(data) {
+  if (!data?.book) return;
+  readerState.tocEditBook = data.book;
+  readerState.tocEditChapters = data.chapters || [];
+  readerState.books = readerState.books.map((book) => (
+    book.id === data.book.id ? data.book : book
+  ));
+  renderBooks();
+  renderTocEditor();
+  if (readerState.tocMutationBusy) setTocMutationBusy(true);
+}
+
 async function openTocEditor(book) {
   if (!["txt", "epub"].includes(book.format)) return;
+  const requestId = ++readerState.tocEditRequestId;
   readerState.tocEditBookId = book.id;
   readerState.tocEditBook = book;
   readerState.tocEditChapters = [];
   $("tocEditTitle").textContent = book.format === "epub" ? "EPUB 目录" : "TXT 目录编辑";
-  showTocEditMessage("正在加载目录");
+  showTocEditMessage("");
+  try {
+    const data = await api(`/api/books/${book.id}?inspect=1`);
+    if (requestId !== readerState.tocEditRequestId || !$("manageDialog").open) return;
+    applyTocEditorData(data);
+    showTocEditMessage(
+      data.book.format === "epub" ? "EPUB 目录由书籍文件定义，此处仅供查看" : ""
+    );
+  } catch (error) {
+    if (requestId !== readerState.tocEditRequestId || !$("manageDialog").open) return;
+    $("tocEditList").innerHTML = `<div class="manage-empty">${escapeHtml(error.message)}</div>`;
+  }
   openReaderDialog($("tocEditDialog"));
-  await refreshTocEditor(book.id);
 }
 
 async function refreshTocEditor(bookId = readerState.tocEditBookId) {
   if (!bookId) return;
   const data = await api(`/api/books/${bookId}?inspect=1`);
-  readerState.tocEditBook = data.book;
-  readerState.tocEditChapters = data.chapters || [];
-  readerState.books = readerState.books.map((book) => (book.id === data.book.id ? data.book : book));
-  renderBooks();
-  renderTocEditor();
+  applyTocEditorData(data);
   showTocEditMessage(
     data.book.format === "epub" ? "EPUB 目录由书籍文件定义，此处仅供查看" : ""
   );
@@ -1237,15 +1366,31 @@ async function renameTxtChapter(chapter) {
 }
 
 async function deleteTxtChapterTitle(chapter) {
-  if (!window.confirm(`确定删除标题“${chapter.title}”吗？正文会合并到相邻章节。`)) return;
+  if (readerState.tocMutationBusy) return;
+  const confirmed = await requestActionConfirmation({
+    title: "删除章节标题",
+    message: `确定删除“${chapter.title}”吗？正文会合并到相邻章节。`,
+    confirmLabel: "确认删除",
+    danger: true,
+  });
+  if (!confirmed) return;
+  const bookId = readerState.tocEditBookId;
+  setTocMutationBusy(true);
+  showTocEditMessage(`正在删除章节标题“${chapter.title}”…`);
   try {
-    await api(`/api/books/${readerState.tocEditBookId}/chapters/${chapter.index}/title`, { method: "DELETE" });
-    await discardLocalOfflineBook(readerState.tocEditBookId);
-    await refreshTocEditor();
-    if (readerState.currentBookId === readerState.tocEditBookId) await openBook(readerState.currentBookId, Math.max(0, Math.min(readerState.currentChapter, readerState.tocEditChapters.length - 1)), 0);
+    const data = await api(`/api/books/${bookId}/chapters/${chapter.index}/title`, { method: "DELETE" });
+    applyTocEditorData(data);
+    showTocEditMessage("标题已删除，正在清理本机离线缓存…");
+    await discardLocalOfflineBook(bookId);
+    if (readerState.currentBookId === bookId) {
+      showTocEditMessage("正在刷新当前阅读内容…");
+      await openBook(bookId, Math.max(0, Math.min(readerState.currentChapter, readerState.tocEditChapters.length - 1)), 0);
+    }
     showTocEditMessage("标题已删除", "success");
   } catch (error) {
     showTocEditMessage(error.message, "error");
+  } finally {
+    setTocMutationBusy(false);
   }
 }
 
@@ -1253,6 +1398,7 @@ async function openTocLineChooser(chapter) {
   readerState.tocLineChapter = chapter;
   readerState.tocLineRows = [];
   $("tocLineSearch").value = "";
+  showTocLineMessage("");
   $("tocLineList").innerHTML = '<div class="manage-empty">正在加载章节内容</div>';
   openReaderDialog($("tocLineDialog"));
   try {
@@ -1293,20 +1439,35 @@ function renderTocLineRows() {
 
 async function splitTxtChapterAtLine(line) {
   const chapter = readerState.tocLineChapter;
-  if (!chapter) return;
-  if (!window.confirm(`把这一行作为新标题吗？\n\n${line.text}`)) return;
+  if (!chapter || readerState.tocMutationBusy) return;
+  const confirmed = await requestActionConfirmation({
+    title: "添加章节标题",
+    message: `确定将“${line.text}”设为章节标题吗？章节结构可能随之调整。`,
+    confirmLabel: "确认添加",
+  });
+  if (!confirmed) return;
+  const bookId = readerState.tocEditBookId;
+  setTocMutationBusy(true);
+  showTocLineMessage(`正在添加章节标题“${line.text}”…`);
   try {
-    await api(`/api/books/${readerState.tocEditBookId}/chapters/${chapter.index}/split`, {
+    const data = await api(`/api/books/${bookId}/chapters/${chapter.index}/split`, {
       method: "POST",
       body: JSON.stringify({ line_index: line.index, title: line.text }),
     });
-    await discardLocalOfflineBook(readerState.tocEditBookId);
+    applyTocEditorData(data);
     $("tocLineDialog").close();
-    await refreshTocEditor();
-    if (readerState.currentBookId === readerState.tocEditBookId) await openBook(readerState.currentBookId, chapter.index, 0);
+    showTocEditMessage("标题已添加，正在清理本机离线缓存…");
+    await discardLocalOfflineBook(bookId);
+    if (readerState.currentBookId === bookId) {
+      showTocEditMessage("正在刷新当前阅读内容…");
+      await openBook(bookId, chapter.index, 0);
+    }
     showTocEditMessage("标题已添加", "success");
   } catch (error) {
-    $("tocLineList").insertAdjacentHTML("afterbegin", `<div class="reader-config-message error">${escapeHtml(error.message)}</div>`);
+    if ($("tocLineDialog").open) showTocLineMessage(error.message, "error");
+    else showTocEditMessage(error.message, "error");
+  } finally {
+    setTocMutationBusy(false);
   }
 }
 
@@ -1360,32 +1521,117 @@ async function saveBookMetadata(event) {
   }
 }
 
-async function deleteBook(book) {
-  const confirmed = window.confirm(`确定删除《${book.title || "未命名书籍"}》吗？`);
-  if (!confirmed) return;
+function showDeleteBookConfirmMessage(message, type = "") {
+  const node = $("deleteBookConfirmMessage");
+  node.textContent = message || "";
+  node.className = `reader-config-message compact-confirm-message ${type}`.trim();
+}
+
+function openDeleteBookConfirm(book) {
+  const overlay = $("deleteBookConfirmDialog");
+  if (!book?.id || readerState.deleteBookBusy || !overlay.hidden) return;
+  const manageDialog = $("manageDialog");
+  const parentPanel = manageDialog.querySelector(":scope > .dialog-panel");
+  readerState.deleteBookTarget = book;
+  readerState.deleteBookFocus = document.activeElement;
+  readerState.deleteBookParentPanel = parentPanel;
+  const confirmButton = $("confirmDeleteBookBtn");
+  const cancelButton = $("cancelDeleteBookBtn");
+  confirmButton.hidden = false;
+  confirmButton.disabled = false;
+  confirmButton.textContent = "确认删除";
+  cancelButton.disabled = false;
+  cancelButton.textContent = "取消";
+  showDeleteBookConfirmMessage(
+    `确定删除《${book.title || "未命名书籍"}》吗？服务器书籍、固定缓存和当前浏览器缓存都会删除，且无法恢复。`,
+  );
+  parentPanel.inert = true;
+  manageDialog.appendChild(overlay);
+  overlay.hidden = false;
+  window.setTimeout(() => confirmButton.focus({ preventScroll: true }), 0);
+}
+
+function closeDeleteBookConfirm() {
+  if (readerState.deleteBookBusy) return;
+  const overlay = $("deleteBookConfirmDialog");
+  const previousFocus = readerState.deleteBookFocus;
+  if (readerState.deleteBookParentPanel) readerState.deleteBookParentPanel.inert = false;
+  readerState.deleteBookTarget = null;
+  readerState.deleteBookFocus = null;
+  readerState.deleteBookParentPanel = null;
+  overlay.hidden = true;
+  document.body.appendChild(overlay);
+  if (previousFocus?.isConnected) {
+    window.setTimeout(() => previousFocus.focus({ preventScroll: true }), 0);
+  }
+}
+
+async function confirmDeleteBook() {
+  const book = readerState.deleteBookTarget;
+  if (!book?.id || readerState.deleteBookBusy) return;
+  const confirmButton = $("confirmDeleteBookBtn");
+  const cancelButton = $("cancelDeleteBookBtn");
+  readerState.deleteBookBusy = true;
+  confirmButton.disabled = true;
+  confirmButton.textContent = "删除中…";
+  cancelButton.disabled = true;
+  showDeleteBookConfirmMessage(`正在删除《${book.title || "未命名书籍"}》及服务器缓存…`);
   try {
     await api(`/api/books/${book.id}`, { method: "DELETE" });
-    await discardLocalOfflineBook(book.id);
-    if (readerState.currentBookId === book.id) {
+    const deletedCurrentBook = readerState.currentBookId === book.id;
+    readerState.books = readerState.books.filter((item) => item.id !== book.id);
+    renderBooks();
+    if (deletedCurrentBook) {
+      stopListening(false);
       window.clearTimeout(readerState.saveTimer);
       readerState.saveTimer = null;
       readerState.currentBookId = "";
       readerState.currentBook = null;
-      if (window.history.state?.readerView === "book") {
-        window.history.back();
-      } else {
-        showShelfView();
-      }
     }
-    await loadBooks();
-    setUploadMessage("已删除书籍", "success");
+    showDeleteBookConfirmMessage("服务器书籍已删除，正在清理本机缓存…");
+    try {
+      await deleteLocalOfflineBook(book.id);
+    } catch (error) {
+      readerState.deleteBookBusy = false;
+      confirmButton.hidden = true;
+      cancelButton.disabled = false;
+      cancelButton.textContent = "关闭";
+      showDeleteBookConfirmMessage(
+        `书籍已删除，但本机缓存清理失败：${error.message}`,
+        "error",
+      );
+      setUploadMessage("书籍已删除，本机缓存清理失败", "error");
+      if (deletedCurrentBook) {
+        if (window.history.state?.readerView === "book") window.history.back();
+        else showShelfView();
+      }
+      return;
+    }
+    readerState.deleteBookBusy = false;
+    showDeleteBookConfirmMessage("删除成功", "success");
+    closeDeleteBookConfirm();
+    setUploadMessage(`已删除：《${book.title || "未命名书籍"}》`, "success");
+    if (deletedCurrentBook) {
+      if (window.history.state?.readerView === "book") window.history.back();
+      else showShelfView();
+    }
   } catch (error) {
+    readerState.deleteBookBusy = false;
+    confirmButton.disabled = false;
+    confirmButton.textContent = "重新删除";
+    cancelButton.disabled = false;
+    showDeleteBookConfirmMessage(error.message, "error");
     setUploadMessage(error.message, "error");
   }
 }
 
 async function reparseBook(book) {
-  const confirmed = window.confirm(`确定重新解析《${book.title || "未命名书籍"}》吗？旧章节缓存会被清除。`);
+  const confirmed = await requestActionConfirmation({
+    title: "重新解析书籍",
+    message: `确定重新解析《${book.title || "未命名书籍"}》吗？旧章节缓存会被清除。`,
+    confirmLabel: "确认解析",
+    danger: true,
+  });
   if (!confirmed) return;
   try {
     setUploadMessage("正在重新解析书籍");
@@ -1404,7 +1650,12 @@ async function reparseBook(book) {
 }
 
 async function clearBookToc(book) {
-  const confirmed = window.confirm(`确定清除《${book.title || "未命名书籍"}》的 TXT 目录信息吗？清除后会作为一整章显示。`);
+  const confirmed = await requestActionConfirmation({
+    title: "清除 TXT 目录",
+    message: `确定清除《${book.title || "未命名书籍"}》的目录信息吗？清除后会作为一整章显示。`,
+    confirmLabel: "确认清除",
+    danger: true,
+  });
   if (!confirmed) return;
   try {
     setUploadMessage("正在清除目录信息");
@@ -4036,7 +4287,13 @@ async function deleteSelectedLocalOffline() {
   const chapterIndexes = selectedOfflineChapterIndexes();
   const profileKey = readerState.offlineStatus?.profile_key;
   if (!bookId || !profileKey || !chapterIndexes.length || readerState.offlineBusy) return;
-  if (!window.confirm(`确定删除当前浏览器中选定的 ${chapterIndexes.length} 章音频吗？`)) return;
+  const confirmed = await requestActionConfirmation({
+    title: "删除本机缓存",
+    message: `确定删除当前浏览器中选定的 ${chapterIndexes.length} 章音频吗？`,
+    confirmLabel: "确认删除",
+    danger: true,
+  });
+  if (!confirmed) return;
   setOfflineCacheBusy(true);
   try {
     const removed = await deleteLocalOfflineChapters(bookId, profileKey, chapterIndexes);
@@ -4057,7 +4314,13 @@ async function unpinSelectedServerOffline() {
   const bookId = readerState.offlineBookId;
   const chapterIndexes = selectedOfflineChapterIndexes();
   if (!bookId || !chapterIndexes.length || readerState.offlineBusy) return;
-  if (!window.confirm(`确定取消选定的 ${chapterIndexes.length} 章服务器固定吗？各设备的本机缓存不会删除。`)) return;
+  const confirmed = await requestActionConfirmation({
+    title: "取消服务器固定",
+    message: `确定取消选定的 ${chapterIndexes.length} 章服务器固定吗？各设备的本机缓存不会删除。`,
+    confirmLabel: "确认取消",
+    danger: true,
+  });
+  if (!confirmed) return;
   setOfflineCacheBusy(true);
   try {
     const removed = await api(`/api/books/${bookId}/tts-offline`, {
@@ -4427,6 +4690,13 @@ $("settingsBtn").addEventListener("click", () => {
   activateCachedReaderFonts();
 });
 $("closeManageBtn").addEventListener("click", () => $("manageDialog").close());
+$("manageDialog").addEventListener("close", () => {
+  readerState.tocEditRequestId += 1;
+});
+$("cancelDeleteBookBtn")?.addEventListener("click", closeDeleteBookConfirm);
+$("confirmDeleteBookBtn")?.addEventListener("click", confirmDeleteBook);
+$("cancelActionConfirmBtn")?.addEventListener("click", () => closeActionConfirmation(false));
+$("confirmActionConfirmBtn")?.addEventListener("click", () => closeActionConfirmation(true));
 $("closeStatisticsBtn").addEventListener("click", () => $("statisticsDialog").close());
 $("bookMetadataForm").addEventListener("submit", saveBookMetadata);
 $("closeBookMetadataBtn").addEventListener("click", () => $("bookMetadataDialog").close());
@@ -4498,7 +4768,19 @@ window.addEventListener("pagehide", () => {
 });
 document.querySelectorAll(".reader-dialog").forEach((dialog) => {
   dialog.addEventListener("close", unlockReaderScroll);
-  dialog.addEventListener("cancel", () => window.setTimeout(unlockReaderScroll, 0));
+  dialog.addEventListener("cancel", (event) => {
+    if (dialog === readerState.actionConfirmParentDialog && readerState.actionConfirmResolve) {
+      event.preventDefault();
+      closeActionConfirmation(false);
+      return;
+    }
+    if (dialog === $("manageDialog") && !$("deleteBookConfirmDialog").hidden) {
+      event.preventDefault();
+      if (!readerState.deleteBookBusy) closeDeleteBookConfirm();
+      return;
+    }
+    window.setTimeout(unlockReaderScroll, 0);
+  });
 });
 $("logoutBtn").addEventListener("click", async () => {
   readerState.wakeLockWanted = false;
