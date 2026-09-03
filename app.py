@@ -41,6 +41,8 @@ BASE_DIR = Path(__file__).resolve().parent
 VERSION_FILE = BASE_DIR / "VERSION"
 CONFIG_DIR = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "app_config.json"
+SERVICE_CONFIG_FILE = CONFIG_DIR / "service_config.json"
+SERVICE_CONFIG_EXAMPLE_FILE = CONFIG_DIR / "service_config.example.json"
 MIMO_BALANCE_STATE_FILE = CONFIG_DIR / "mimo_balance_state.json"
 LOG_DIR = BASE_DIR / "logs"
 READER_DIR = BASE_DIR / "reader_data"
@@ -218,6 +220,37 @@ TTS_VOICE_OPTIONS = [
 ]
 
 
+def load_service_config():
+    source = SERVICE_CONFIG_FILE if SERVICE_CONFIG_FILE.exists() else SERVICE_CONFIG_EXAMPLE_FILE
+    try:
+        config = json.loads(source.read_text(encoding="utf-8"))
+        google = config["google"]
+        endpoint = google["endpoint"]
+        endpoint_options = google["endpoint_options"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise RuntimeError(f"无法读取服务配置: {source}") from error
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise RuntimeError("服务配置中的谷歌翻译接口地址无效")
+    if not isinstance(endpoint_options, list) or not all(
+        isinstance(item, str) and item.strip() for item in endpoint_options
+    ):
+        raise RuntimeError("服务配置中的谷歌翻译接口备选列表无效")
+    if source == SERVICE_CONFIG_EXAMPLE_FILE:
+        CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(SERVICE_CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(config, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+    return config
+
+
+SERVICE_CONFIG = load_service_config()
+
+
 DEFAULT_CONFIG = {
     "app_password": "changeme",
     "deepseek": {
@@ -233,7 +266,7 @@ DEFAULT_CONFIG = {
     },
     "google": {
         "enabled": True,
-        "endpoint": "https://translate.googleapis.com/translate_a/single",
+        "endpoint": SERVICE_CONFIG["google"]["endpoint"],
         "timeout": 25,
     },
     "reader_tts": {
@@ -514,6 +547,31 @@ def validate_server_api_url(value, fallback):
     return candidate
 
 
+def validate_google_translate_url(value, fallback, strict=False):
+    candidate = clean_single_line_value(value)[:2048].rstrip("/")
+    parsed = urlparse(candidate)
+    try:
+        port = parsed.port
+    except ValueError:
+        valid = False
+    else:
+        valid = bool(
+            parsed.scheme == "https"
+            and parsed.hostname
+            and parsed.path not in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+            and not parsed.username
+            and not parsed.password
+            and (port is None or port > 0)
+        )
+    if valid:
+        return candidate
+    if strict:
+        raise ValueError("谷歌翻译接口必须是不含查询参数的 HTTPS 地址")
+    return fallback
+
+
 def validate_mimo_tts_url(value, fallback):
     candidate = clean_single_line_value(value).rstrip("/")
     parsed = urlparse(candidate)
@@ -608,7 +666,10 @@ def apply_env(config):
     reader_tts["voice_id"] = os.getenv("MIMO_TTS_VOICE", reader_tts["voice_id"])
     reader_tts["style_prompt"] = os.getenv("MIMO_TTS_STYLE_PROMPT", reader_tts.get("style_prompt", ""))
     reader_tts.pop("optimize_text_preview", None)
-    config["google"]["endpoint"] = DEFAULT_CONFIG["google"]["endpoint"]
+    config["google"]["endpoint"] = validate_google_translate_url(
+        config["google"].get("endpoint", DEFAULT_CONFIG["google"]["endpoint"]),
+        DEFAULT_CONFIG["google"]["endpoint"],
+    )
     return config
 
 
@@ -2460,7 +2521,7 @@ def add_security_headers(response):
         "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; "
         "object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
         "font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
-        "connect-src 'self' https://translate.googleapis.com",
+        "connect-src 'self' https:",
     )
     response.headers.setdefault(
         "Permissions-Policy",
@@ -2514,6 +2575,7 @@ def public_config(config):
     # Server-side upstreams may be configured in .env, but a browser session
     # must never be able to redirect requests carrying server credentials.
     safe["deepseek"]["allow_custom_base_url"] = False
+    safe["google"]["endpoint_options"] = SERVICE_CONFIG["google"]["endpoint_options"]
     safe.pop("app_password", None)
     safe.pop("reader_tts", None)
     safe["deepseek_styles"] = [
@@ -2622,7 +2684,11 @@ def update_nested_config(config, payload):
     if google:
         target = config["google"]
         target["enabled"] = bool(google.get("enabled"))
-        target["endpoint"] = DEFAULT_CONFIG["google"]["endpoint"]
+        target["endpoint"] = validate_google_translate_url(
+            google.get("endpoint", target["endpoint"]),
+            target["endpoint"],
+            strict=True,
+        )
         target["timeout"] = int(parse_number(google.get("timeout"), target["timeout"], 5, 120))
 
     if env_updates:
@@ -5614,6 +5680,58 @@ def translate_deepseek(text, source, target, config):
     return "".join(output_parts), all_cached
 
 
+def google_language_code(code):
+    return "zh-CN" if code == "zh" else code
+
+
+def translate_google(text, source, target, config):
+    settings = config["google"]
+    try:
+        response = requests.get(
+            settings["endpoint"],
+            params={
+                "client": "dict-chrome-ex",
+                "sl": google_language_code(source),
+                "tl": google_language_code(target),
+                "q": text,
+            },
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "User-Agent": f"Mozilla/5.0 TransTools/{APP_VERSION}",
+            },
+            timeout=max(5, min(int(settings.get("timeout", 25)), 120)),
+            allow_redirects=False,
+        )
+    except requests.Timeout as exc:
+        raise RuntimeError("服务器请求谷歌翻译超时") from exc
+    except requests.RequestException as exc:
+        raise RuntimeError("服务器无法连接谷歌翻译") from exc
+    if response.status_code == 429:
+        raise RuntimeError("服务器访问谷歌翻译受到限流")
+    if not response.ok:
+        raise RuntimeError(f"谷歌翻译返回状态 {response.status_code}")
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("谷歌翻译返回内容不是 JSON") from exc
+    translated = ""
+    detected_source = ""
+    if isinstance(data, list) and data and isinstance(data[0], list):
+        first = data[0]
+        if first and isinstance(first[0], str):
+            translated = first[0].strip()
+            detected_source = first[1] if len(first) > 1 and isinstance(first[1], str) else ""
+        else:
+            translated = "".join(
+                str(part[0]) for part in first
+                if isinstance(part, list) and part and part[0] is not None
+            ).strip()
+            detected_source = data[2] if len(data) > 2 and isinstance(data[2], str) else ""
+    if not translated:
+        raise RuntimeError("谷歌翻译未返回结果")
+    return translated, detected_source
+
+
 ENGINES = {
     "deepseek": "DeepSeek",
     "google": "谷歌翻译",
@@ -6706,8 +6824,8 @@ def api_translate():
     source = payload.get("source") or "auto"
     target = payload.get("target") or "en"
     engine = payload.get("engine")
-    if engine != "deepseek":
-        return jsonify({"error": "只有 DeepSeek 通过服务器代理"}), 400
+    if engine not in ENGINES:
+        return jsonify({"error": "翻译引擎无效"}), 400
     if not text:
         return jsonify({"error": "请输入要翻译的文本"}), 400
     if len(text) > MAX_TRANSLATE_CHARS:
@@ -6715,9 +6833,18 @@ def api_translate():
     if source not in LANGUAGE_CODES or target not in LANGUAGE_CODES or target == "auto":
         return jsonify({"error": "语言参数无效"}), 400
     config = load_config()
-    if not config["deepseek"].get("enabled"):
-        return jsonify({"error": "DeepSeek 未启用"}), 400
+    if not config[engine].get("enabled"):
+        return jsonify({"error": f"{ENGINES[engine]} 未启用"}), 400
     try:
+        if engine == "google":
+            translated, detected_source = translate_google(text, source, target, config)
+            app.logger.info(
+                "google translate ok ip=%s chars=%s target=%s",
+                request.remote_addr,
+                len(text),
+                target,
+            )
+            return jsonify({"text": translated, "detectedSource": detected_source})
         translated, cached = translate_deepseek(text, source, target, config)
         app.logger.info(
             "deepseek translate ok ip=%s chars=%s target=%s cached=%s",
@@ -6728,7 +6855,7 @@ def api_translate():
         )
         return jsonify({"text": translated, "cached": cached})
     except Exception as exc:
-        app.logger.warning("deepseek translate failed ip=%s error=%s", request.remote_addr, exc)
+        app.logger.warning("%s translate failed ip=%s error=%s", engine, request.remote_addr, exc)
         return jsonify({"error": str(exc)}), 502
 
 

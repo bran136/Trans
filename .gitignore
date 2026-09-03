@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .env
 config/app_config.json
+config/service_config.json
 config/secret_key
 config/mimo_balance_state.json
 config/deepseek_cache.sqlite3

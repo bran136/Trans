@@ -544,7 +544,14 @@ a,
 
 .listen-toolbar select {
   width: 76px;
-  appearance: auto;
+  padding-right: 24px;
+  appearance: none;
+}
+
+@media (min-width: 761px) {
+  #playbackRateSelect {
+    width: 88px;
+  }
 }
 
 #quickVoiceSelect {
@@ -702,18 +709,75 @@ a,
   white-space: nowrap;
 }
 
-.reader-toolbar select {
+.chapter-select-btn {
   width: 100%;
   height: 34px;
-  padding: 0 10px;
-  border: 1px solid var(--line);
-  border-radius: 11px;
-  background: #fff;
-  color: var(--ink);
-  font-weight: 800;
+  min-width: 0;
+  padding-right: 28px;
+  overflow: hidden;
 }
 
-.reader-dark .reader-toolbar select,
+.chapter-select-btn span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.reader-dialog.chapter-select-dialog .dialog-panel {
+  max-height: none;
+  overflow: hidden;
+}
+
+.chapter-select-list {
+  max-height: min(42vh, 360px);
+  max-height: min(42dvh, 360px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.chapter-select-option {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  font-weight: 800;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  text-align: left;
+  white-space: normal;
+}
+
+.chapter-select-option:last-child {
+  border-bottom: 0;
+}
+
+.chapter-select-option.active {
+  background: rgba(107, 125, 227, 0.14);
+  color: var(--accent-strong);
+}
+
+@media (min-width: 761px) {
+  .reader-dialog.chapter-select-dialog {
+    width: min(1240px, calc(100vw - 48px));
+  }
+
+  .chapter-select-list {
+    max-height: min(56vh, 480px);
+    max-height: min(56dvh, 480px);
+  }
+}
+
 .reader-dark .reader-actions a,
 .reader-dark .reader-actions button,
 .reader-dark .reader-toolbar button,
@@ -722,6 +786,18 @@ a,
   border-color: var(--line);
   background: rgba(25, 32, 45, 0.92);
   color: var(--ink);
+}
+
+.chapter-select-btn,
+.listen-toolbar select {
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position:
+    calc(100% - 12px) calc(50% - 1px),
+    calc(100% - 8px) calc(50% - 1px);
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
 }
 
 .book-content {
@@ -2083,6 +2159,7 @@ body > .action-confirm-overlay {
   }
 
   .listen-toolbar select {
+    padding-right: 20px;
     width: 64px;
   }
 
@@ -2116,9 +2193,9 @@ body > .action-confirm-overlay {
     white-space: nowrap;
   }
 
-  .reader-toolbar select {
+  .chapter-select-btn {
     height: 34px;
-    padding: 0 8px;
+    padding: 0 28px 0 8px;
     font-size: 14px;
   }
 
@@ -2255,7 +2332,6 @@ body > .action-confirm-overlay {
     .reader-dialog input,
     .reader-dialog select,
     .reader-dialog textarea,
-    .reader-toolbar select,
     .listen-toolbar select {
       font-size: 16px;
     }

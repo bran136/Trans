@@ -1,0 +1,10 @@
+{
+  "google": {
+    "endpoint": "https://translate.googleapis.com/translate_a/t",
+    "endpoint_options": [
+      "https://translate.googleapis.com/translate_a/t",
+      "https://clients5.google.com/translate_a/t",
+      "https://translate.google.com/translate_a/t"
+    ]
+  }
+}

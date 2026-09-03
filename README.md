@@ -70,6 +70,8 @@ http://127.0.0.1:31000
 ```text
 ./path_dir/.env                    真实运行配置，包含密码和 API Key
 ./path_dir/.env.example            示例配置，不放真实密钥
+./path_dir/config/service_config.example.json  服务接口示例配置，首次运行时用于生成实际配置
+./path_dir/config/service_config.json  服务接口默认值和备选列表，缺失时自动生成
 ./path_dir/config/app_config.json  普通页面配置，缺失时自动生成，不保存真实 API Key
 ./path_dir/config/deepseek_cache.sqlite3  DeepSeek 翻译持久化缓存
 ./path_dir/config/mimo_balance_state.json  MiMo 余额、过期状态和白名单 Cookie（私有）
@@ -124,7 +126,7 @@ TTS_CACHE_TTL_DAYS=90
 支持引擎：
 
 - `DeepSeek`：由服务器代理请求官方 API，保护 API Key。
-- `谷歌翻译`：由浏览器直接请求 `translate.googleapis.com`，走用户当前浏览器网络，不占用服务器外网请求。
+- `谷歌翻译`：优先使用服务器网络，失败后回退到浏览器网络；接口地址可以从服务配置提供的列表选择，也可以自行填写公网 HTTPS 地址。
 
 主要行为：
 

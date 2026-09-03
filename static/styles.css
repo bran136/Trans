@@ -481,6 +481,36 @@ label {
   padding-left: 10px;
 }
 
+.select-chevron {
+  position: relative;
+  display: block;
+}
+
+.select-chevron select {
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.select-chevron svg {
+  position: absolute;
+  top: 50%;
+  right: 11px;
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition: stroke 0.18s ease;
+}
+
+.select-chevron:focus-within svg {
+  stroke: var(--accent-strong);
+}
+
 .swap {
   height: 36px;
   border: 1px solid var(--line);
@@ -565,24 +595,38 @@ label {
   background: #fff;
 }
 
-.result-toggle {
+.result-title {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  gap: 10px;
   flex: 1 1 auto;
   min-width: 0;
   padding: 8px 11px;
-  border: 0;
-  background: #fff;
   color: var(--ink);
   font-weight: 800;
   text-align: left;
 }
 
+.result-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 38px;
+  width: 38px;
+  padding: 0;
+  border: 0;
+  background: #fff;
+  color: var(--muted);
+  transition: color 0.18s ease, background 0.18s ease;
+}
+
+.result-toggle:hover {
+  background: rgba(107, 125, 227, 0.08);
+  color: var(--accent-strong);
+}
+
 .result-copy {
   flex: 0 0 auto;
-  margin: 5px 7px 5px 0;
+  margin: 5px 4px 5px 0;
   padding: 0 10px;
   border: 1px solid rgba(107, 125, 227, 0.22);
   border-radius: 10px;
@@ -599,18 +643,23 @@ label {
   cursor: default;
 }
 
-.result-toggle::after {
-  content: "⌃";
-  color: var(--muted);
-  font-size: 14px;
+.result-toggle svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.18s ease;
 }
 
 .result-card.collapsed .result-head {
   border-bottom: 0;
 }
 
-.result-card.collapsed .result-toggle::after {
-  content: "⌄";
+.result-card.collapsed .result-toggle svg {
+  transform: rotate(180deg);
 }
 
 .result-card.collapsed pre {
@@ -1049,6 +1098,19 @@ dialog::backdrop {
   margin: 0;
 }
 
+.google-endpoint-field {
+  grid-column: span 3;
+}
+
+.google-endpoint-control {
+  display: grid;
+  gap: 7px;
+}
+
+.google-endpoint-control input[hidden] {
+  display: none;
+}
+
 .settings-note {
   align-self: end;
   margin: 0;
@@ -1293,6 +1355,10 @@ dialog::backdrop {
 
   .settings-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .google-endpoint-field {
+    grid-column: 1 / -1;
   }
 
   .metric-grid {

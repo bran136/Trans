@@ -30,12 +30,22 @@
           <div class="toolbar">
             <label>
               源语言
-              <select id="sourceLang"></select>
+              <span class="select-chevron">
+                <select id="sourceLang"></select>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6.5 9.5 12 15l5.5-5.5"></path>
+                </svg>
+              </span>
             </label>
             <button class="swap" id="swapBtn" type="button" title="交换语言">⇄</button>
             <label>
               目标语言
-              <select id="targetLang"></select>
+              <span class="select-chevron">
+                <select id="targetLang"></select>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6.5 9.5 12 15l5.5-5.5"></path>
+                </svg>
+              </span>
             </label>
           </div>
 
@@ -100,16 +110,22 @@
               </label>
               <label>
                 模型
-                <select id="deepseekModel">
-                  <option value="deepseek-v4-flash">deepseek-v4-flash</option>
-                  <option value="deepseek-v4-pro">deepseek-v4-pro</option>
-                  <option value="deepseek-chat">deepseek-chat</option>
-                  <option value="deepseek-reasoner">deepseek-reasoner</option>
-                </select>
+                <span class="select-chevron">
+                  <select id="deepseekModel">
+                    <option value="deepseek-v4-flash">deepseek-v4-flash</option>
+                    <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+                    <option value="deepseek-chat">deepseek-chat</option>
+                    <option value="deepseek-reasoner">deepseek-reasoner</option>
+                  </select>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 9.5 12 15l5.5-5.5"></path></svg>
+                </span>
               </label>
               <label>
                 翻译风格
-                <select id="deepseekStyle"></select>
+                <span class="select-chevron">
+                  <select id="deepseekStyle"></select>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 9.5 12 15l5.5-5.5"></path></svg>
+                </span>
               </label>
               <label>
                 <span class="label-row">Temperature
@@ -127,10 +143,13 @@
                     <div>推理模式。普通翻译推荐 disabled，更快且结果更直接；复杂改写或术语判断再考虑 enabled。</div>
                   </details>
                 </span>
-                <select id="deepseekThinking">
-                  <option value="disabled">disabled</option>
-                  <option value="enabled">enabled</option>
-                </select>
+                <span class="select-chevron">
+                  <select id="deepseekThinking">
+                    <option value="disabled">disabled</option>
+                    <option value="enabled">enabled</option>
+                  </select>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 9.5 12 15l5.5-5.5"></path></svg>
+                </span>
               </label>
               <label>
                 <span class="label-row">Reasoning Effort
@@ -139,11 +158,14 @@
                     <div>推理投入强度。翻译通常保持 medium 即可；追求速度可选 low，复杂长文可选 high。</div>
                   </details>
                 </span>
-                <select id="deepseekReasoning">
-                  <option value="low">low</option>
-                  <option value="medium">medium</option>
-                  <option value="high">high</option>
-                </select>
+                <span class="select-chevron">
+                  <select id="deepseekReasoning">
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                  </select>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 9.5 12 15l5.5-5.5"></path></svg>
+                </span>
               </label>
               <label>
                 超时秒数
@@ -161,9 +183,15 @@
           <section class="settings-group">
             <h3>谷歌翻译</h3>
             <div class="settings-grid">
-              <label>
+              <label class="google-endpoint-field">
                 接口地址
-                <input id="googleEndpoint" type="url">
+                <span class="google-endpoint-control">
+                  <span class="select-chevron">
+                    <select id="googleEndpointPreset" aria-label="谷歌翻译接口"></select>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 9.5 12 15l5.5-5.5"></path></svg>
+                  </span>
+                  <input id="googleEndpoint" type="url" autocomplete="off" placeholder="输入自定义 HTTPS 接口地址">
+                </span>
               </label>
               <label>
                 超时秒数

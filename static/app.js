@@ -185,9 +185,17 @@ function renderConfig() {
   $("deepseekReasoning").value = c.deepseek.reasoning_effort;
   $("deepseekTimeout").value = c.deepseek.timeout;
   $("googleEnabled").checked = c.google.enabled;
+  const googleEndpoints = c.google.endpoint_options || [];
+  const endpointIsPreset = googleEndpoints.includes(c.google.endpoint);
+  $("googleEndpointPreset").innerHTML = "";
+  googleEndpoints.forEach((endpoint) => {
+    $("googleEndpointPreset").appendChild(option(endpoint, endpoint));
+  });
+  $("googleEndpointPreset").appendChild(option("自定义地址…", "", !endpointIsPreset));
+  $("googleEndpointPreset").value = endpointIsPreset ? c.google.endpoint : "";
   $("googleEndpoint").value = c.google.endpoint;
-  $("googleEndpoint").disabled = true;
-  $("googleEndpoint").title = "谷歌翻译由浏览器直连固定官方接口";
+  $("googleEndpoint").hidden = endpointIsPreset;
+  $("googleEndpoint").title = "可以选择推荐接口，也可以填写自定义 HTTPS 地址";
   $("googleTimeout").value = c.google.timeout;
 }
 
@@ -492,10 +500,13 @@ function fillResultCard(card, result, index) {
   if (isResultPanelCollapsed(result.engine, index)) card.classList.add("collapsed");
   const header = document.createElement("div");
   header.className = "result-head";
-  header.appendChild(createResultToggle(result.name, result.ok === false ? "失败" : "", card, result.engine));
+  header.appendChild(createResultTitle(result.name));
   if (result.ok) {
     header.appendChild(createCopyButton(result.text));
+  } else if (result.ok === false) {
+    header.appendChild(createRetryButton(result.engine, index));
   }
+  header.appendChild(createResultToggle(card, result.engine));
   const pre = document.createElement("pre");
   if (result.ok === false) {
     pre.textContent = result.error;
@@ -514,16 +525,25 @@ function updateResultCard(result, index) {
   if (card) fillResultCard(card, result, index);
 }
 
-function createResultToggle(name, meta, card, engineId) {
+function createResultTitle(name) {
+  const title = document.createElement("div");
+  title.className = "result-title";
+  title.textContent = name;
+  return title;
+}
+
+function createResultToggle(card, engineId) {
   const button = document.createElement("button");
   button.className = "result-toggle";
   button.type = "button";
-  const nameNode = document.createElement("span");
-  const metaNode = document.createElement("span");
-  nameNode.textContent = name;
-  metaNode.textContent = meta;
-  button.append(nameNode, metaNode);
-  button.addEventListener("click", () => toggleResultPanel(card, engineId));
+  button.innerHTML = `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M6.5 14.5 12 9l5.5 5.5"></path>
+    </svg>
+  `;
+  button.setAttribute("aria-label", card.classList.contains("collapsed") ? "展开翻译结果" : "折叠翻译结果");
+  button.setAttribute("aria-expanded", String(!card.classList.contains("collapsed")));
+  button.addEventListener("click", () => toggleResultPanel(card, engineId, button));
   return button;
 }
 
@@ -537,6 +557,55 @@ function createCopyButton(text) {
     showCopyFeedback(button);
   });
   return button;
+}
+
+function createRetryButton(engineId, index) {
+  const button = document.createElement("button");
+  button.className = "result-copy";
+  button.type = "button";
+  button.textContent = "重试";
+  button.addEventListener("click", () => retryTranslationEngine(engineId, index, button));
+  return button;
+}
+
+async function retryTranslationEngine(engineId, index, button) {
+  if (button.dataset.busy === "true") return;
+  const text = $("sourceText").value.trim();
+  if (!text) return;
+  const requestId = state.requestId;
+  const source = sourceForRequest();
+  const target = $("targetLang").value;
+  button.dataset.busy = "true";
+  button.setAttribute("aria-disabled", "true");
+  button.textContent = "重试中";
+  let result;
+  try {
+    const translated = await translateWithEngine(engineId, text, source, target);
+    result = {
+      engine: engineId,
+      name: engineName(engineId),
+      ok: true,
+      text: translated.text,
+      detectedSource: translated.detectedSource,
+    };
+  } catch (error) {
+    const hint = error.name === "AbortError" ? "请求超时" : error.message;
+    result = { engine: engineId, name: engineName(engineId), ok: false, error: hint };
+  }
+  const requestIsCurrent = requestId === state.requestId
+    && text === $("sourceText").value.trim()
+    && source === sourceForRequest()
+    && target === $("targetLang").value;
+  if (!requestIsCurrent) {
+    if (button.isConnected) {
+      button.dataset.busy = "false";
+      button.removeAttribute("aria-disabled");
+      button.textContent = "重试";
+    }
+    return;
+  }
+  if (result.ok) updateDetectedSource([result], text);
+  updateResultCard(result, index);
 }
 
 async function copyText(text) {
@@ -572,9 +641,11 @@ function isResultPanelCollapsed(engineId, index) {
   return index > 1;
 }
 
-function toggleResultPanel(card, engineId) {
+function toggleResultPanel(card, engineId, button) {
   const collapsed = card.classList.toggle("collapsed");
   state.resultPanelCollapsed[engineId] = collapsed;
+  button.setAttribute("aria-label", collapsed ? "展开翻译结果" : "折叠翻译结果");
+  button.setAttribute("aria-expanded", String(!collapsed));
 }
 
 function renderEngineShells() {
@@ -613,20 +684,52 @@ function engineName(engineId) {
   return state.engines.find((engine) => engine.id === engineId)?.name || engineId;
 }
 
-async function translateGoogle(text, source, target) {
+async function translateGoogleFromClient(text, source, target) {
   const settings = state.config.google;
   const url = new URL(settings.endpoint);
-  url.searchParams.set("client", "gtx");
+  url.searchParams.set("client", "dict-chrome-ex");
   url.searchParams.set("sl", googleLang(source));
   url.searchParams.set("tl", googleLang(target));
-  url.searchParams.set("dt", "t");
   url.searchParams.set("q", text);
   const response = await fetch(url, { signal: timeoutSignal(settings.timeout) });
   if (!response.ok) throw new Error(`谷歌翻译请求失败：${response.status}`);
   const data = await response.json();
-  const translated = (data[0] || []).map((part) => part[0]).join("").trim();
+  let translated = "";
+  let detectedSource = "";
+  if (Array.isArray(data) && Array.isArray(data[0])) {
+    if (typeof data[0][0] === "string") {
+      translated = data[0][0].trim();
+      detectedSource = typeof data[0][1] === "string" ? data[0][1] : "";
+    } else {
+      translated = data[0]
+        .filter((part) => Array.isArray(part) && part[0] != null)
+        .map((part) => part[0])
+        .join("")
+        .trim();
+      detectedSource = typeof data[2] === "string" ? data[2] : "";
+    }
+  }
   if (!translated) throw new Error("谷歌翻译未返回结果");
-  return { text: translated, detectedSource: data[2] };
+  return { text: translated, detectedSource };
+}
+
+async function translateGoogle(text, source, target) {
+  let serverError;
+  try {
+    const data = await api("/api/translate", {
+      method: "POST",
+      body: JSON.stringify({ engine: "google", text, source, target }),
+    });
+    return { text: data.text, detectedSource: data.detectedSource };
+  } catch (error) {
+    serverError = error;
+  }
+  try {
+    return await translateGoogleFromClient(text, source, target);
+  } catch (error) {
+    const clientError = error.name === "AbortError" ? "请求超时" : error.message;
+    throw new Error(`谷歌翻译失败：服务器网络：${serverError.message}；客户端网络：${clientError}`);
+  }
 }
 
 async function translateDeepSeek(text, source, target) {
@@ -826,6 +929,15 @@ $("sourceLang").addEventListener("change", () => {
 $("targetLang").addEventListener("change", () => scheduleTranslate(0));
 $("targetLang").addEventListener("change", () => {
   state.targetAutoMode = false;
+});
+$("googleEndpointPreset").addEventListener("change", () => {
+  const endpoint = $("googleEndpointPreset").value;
+  $("googleEndpoint").hidden = Boolean(endpoint);
+  if (endpoint) {
+    $("googleEndpoint").value = endpoint;
+  } else {
+    $("googleEndpoint").focus();
+  }
 });
 $("sourceText").addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {

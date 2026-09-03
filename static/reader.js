@@ -1838,14 +1838,52 @@ function returnToShelf() {
 }
 
 function renderChapterSelect() {
-  const select = $("chapterSelect");
-  select.innerHTML = "";
+  const list = $("chapterSelectList");
+  list.innerHTML = "";
   readerState.chapters.forEach((chapter) => {
-    const option = document.createElement("option");
-    option.value = chapter.index;
-    option.textContent = `${"　".repeat(Math.max(0, Number(chapter.level || 1) - 1))}${chapter.title}`;
-    select.appendChild(option);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "chapter-select-option";
+    button.dataset.chapterIndex = chapter.index;
+    button.setAttribute("role", "option");
+    button.textContent = `${"　".repeat(Math.max(0, Number(chapter.level || 1) - 1))}${chapter.title}`;
+    list.appendChild(button);
   });
+  syncChapterSelection();
+}
+
+function syncChapterSelection() {
+  const currentIndex = Number(readerState.currentChapter);
+  const current = readerState.chapters.find((chapter) => Number(chapter.index) === currentIndex);
+  $("chapterSelectLabel").textContent = current?.title || "选择章节";
+  $("chapterSelectList").querySelectorAll(".chapter-select-option").forEach((button) => {
+    const selected = Number(button.dataset.chapterIndex) === currentIndex;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+  });
+}
+
+function openChapterSelect() {
+  syncChapterSelection();
+  openReaderDialog($("chapterSelectDialog"));
+  window.requestAnimationFrame(() => {
+    $("chapterSelectList").querySelector(".chapter-select-option.active")
+      ?.scrollIntoView({ block: "center" });
+  });
+}
+
+function selectChapter(chapterIndex) {
+  $("chapterSelectDialog").close();
+  const normalizedChapterIndex = Number(chapterIndex);
+  if (normalizedChapterIndex === Number(readerState.currentChapter)) return;
+  const shouldResume = readerState.reading && !readerState.paused;
+  stopListening(false, false);
+  loadChapter(normalizedChapterIndex, 0)
+    .then(() => {
+      if (shouldResume) return startListeningFrom(0);
+      return null;
+    })
+    .catch((error) => setListenStatus(error.message));
 }
 
 async function loadChapter(chapterIndex, sentenceIndex = 0) {
@@ -1867,7 +1905,7 @@ async function loadChapter(chapterIndex, sentenceIndex = 0) {
   readerState.currentBook = data.book;
   readerState.currentChapter = data.chapter.index;
   readerState.currentSentence = sentenceIndex;
-  $("chapterSelect").value = String(readerState.currentChapter);
+  syncChapterSelection();
   renderChapter(data.chapter, prepared?.packs || []);
   highlightSentence(sentenceIndex, true);
   saveProgressSoon();
@@ -2568,7 +2606,7 @@ function adoptPrefetchedChapterForPlayback(chapterIndex) {
   readerState.currentBook = data.book;
   readerState.currentChapter = data.chapter.index;
   readerState.currentSentence = 0;
-  $("chapterSelect").value = String(readerState.currentChapter);
+  syncChapterSelection();
   renderChapter(data.chapter, [...(prepared.packs || [])]);
   saveProgressSoon();
   setStatus(readerState.currentBook.title);
@@ -4633,15 +4671,11 @@ $("bookFile").addEventListener("change", () => {
   setUploadMessage(file ? "已选择文件，正在导入" : "选择文件后导入到本地书架");
   if (file) $("uploadForm").requestSubmit();
 });
-$("chapterSelect").addEventListener("change", () => {
-  const shouldResume = readerState.reading && !readerState.paused;
-  stopListening(false, false);
-  loadChapter(Number($("chapterSelect").value), 0)
-    .then(() => {
-      if (shouldResume) return startListeningFrom(0);
-      return null;
-    })
-    .catch((error) => setListenStatus(error.message));
+$("chapterSelectBtn").addEventListener("click", openChapterSelect);
+$("closeChapterSelectBtn").addEventListener("click", () => $("chapterSelectDialog").close());
+$("chapterSelectList").addEventListener("click", (event) => {
+  const button = event.target.closest(".chapter-select-option");
+  if (button) selectChapter(button.dataset.chapterIndex);
 });
 $("prevChapterBtn").addEventListener("click", () => moveChapter(-1));
 $("nextChapterBtn").addEventListener("click", () => moveChapter(1));
