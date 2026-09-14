@@ -1,10 +1,29 @@
-# Trans
+<p align="center">
+  <img src="static/site-icon.svg" width="112" height="112" alt="Trans 图标">
+</p>
 
-一个本地工具网站，共用一个密码登录入口，当前包含“在线翻译”和“在线读书”两个独立模块。
+<h1 align="center">Trans</h1>
 
-在线翻译支持 DeepSeek 服务端代理、谷歌翻译浏览器直连、多引擎对比、历史记录、服务监控、DeepSeek 余额显示和持久化缓存。在线读书支持本地书架、TXT/EPUB/PDF 导入、章节阅读、进度保存、字体切换、黑暗模式和 Xiaomi MiMo 听书。
+<p align="center">一个集在线翻译与在线读书于一体的本地工具网站</p>
 
-快速导航：[快速开始](#快速开始) · [环境配置](#环境配置) · [在线翻译](#在线翻译) · [在线读书](#在线读书) · [听书](#听书) · [安全说明](#安全说明)
+<p align="center">
+  <a href="https://github.com/bran136/Trans/releases/latest"><img src="https://img.shields.io/github/v/release/bran136/Trans?display_name=tag&amp;sort=semver&amp;label=%E7%89%88%E6%9C%AC" alt="最新版本"></a>
+  <a href="https://github.com/bran136/Trans/actions/workflows/ci.yml"><img src="https://github.com/bran136/Trans/actions/workflows/ci.yml/badge.svg" alt="CI 状态"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/bran136/Trans" alt="许可证"></a>
+</p>
+
+在线翻译支持 DeepSeek 服务端代理、谷歌翻译服务器优先与浏览器回退、多引擎对比、历史记录、服务监控、DeepSeek 余额显示和持久化缓存。
+
+在线读书支持本地书架、TXT/EPUB/PDF 导入、章节阅读、进度保存、字体切换、黑暗模式和 Xiaomi MiMo 听书。
+
+<p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#环境配置">环境配置</a> ·
+  <a href="#在线翻译">在线翻译</a> ·
+  <a href="#在线读书">在线读书</a> ·
+  <a href="#听书">听书</a> ·
+  <a href="#安全说明">安全说明</a>
+</p>
 
 ## 功能概览
 
