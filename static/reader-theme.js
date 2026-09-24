@@ -1,5 +1,5 @@
 (() => {
-  const colors = { light: "#dfe4fb", dark: "#0e1320" };
+  const colors = { light: "#f6f5f2", dark: "#191a1c" };
 
   function applyReaderDocumentTheme(dark) {
     document.documentElement.classList.toggle("reader-dark-root", dark);

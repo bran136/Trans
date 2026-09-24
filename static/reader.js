@@ -1,5 +1,6 @@
 const readerState = {
   books: [],
+  reparseBusy: false,
   currentBookId: "",
   currentBook: null,
   chapters: [],
@@ -1037,10 +1038,12 @@ function renderImportJobs() {
   if (expiries.length) {
     readerState.importDisplayTimer = window.setTimeout(renderImportJobs, Math.min(...expiries) * 1000);
   }
-  if (limited) {
-    setUploadMessage("已有 2 本书正在导入，请等待至少一本完成");
-  } else if (!$("bookFile").files[0]) {
-    setUploadMessage("选择文件后导入到本地书架");
+  if (!readerState.reparseBusy) {
+    if (limited) {
+      setUploadMessage("已有 2 本书正在导入，请等待至少一本完成");
+    } else if (!$("bookFile").files[0]) {
+      setUploadMessage("选择文件后导入到本地书架");
+    }
   }
 }
 
@@ -1184,7 +1187,7 @@ function renderManageBooks() {
         ${book.format === "txt" ? '<button type="button" data-action="clear-toc">清除目录</button>' : '<span class="manage-action-spacer"></span>'}
         ${hasToc ? '<button type="button" data-action="toc-edit">目录</button>' : '<span class="manage-action-spacer"></span>'}
         <button type="button" data-action="edit">编辑</button>
-        <button type="button" data-action="reparse">重新解析</button>
+        <button type="button" data-action="reparse" ${readerState.reparseBusy ? "disabled" : ""}>重新解析</button>
         <button type="button" data-action="offline-cache">离线缓存</button>
         <button type="button" data-action="delete">删除</button>
       </div>
@@ -1345,7 +1348,7 @@ function renderTocEditor() {
 }
 
 async function renameTxtChapter(chapter) {
-  const title = window.prompt("请输入新的章节标题", chapter.title || "");
+  const title = await window.TransUI.prompt("修改章节标题", chapter.title || "");
   if (title === null) return;
   const trimmed = title.trim();
   if (!trimmed) {
@@ -1484,7 +1487,6 @@ function openBookMetadataEditor(book) {
   $("bookAuthorInput").value = book.author || "";
   showBookMetadataMessage("");
   openReaderDialog($("bookMetadataDialog"));
-  $("bookTitleInput").focus();
 }
 
 async function saveBookMetadata(event) {
@@ -1625,14 +1627,24 @@ async function confirmDeleteBook() {
   }
 }
 
+function setReparseBusy(busy) {
+  readerState.reparseBusy = busy;
+  $("reparseProgress").hidden = !busy;
+  document.querySelectorAll('[data-action="reparse"]').forEach((button) => {
+    button.disabled = busy;
+  });
+}
+
 async function reparseBook(book) {
+  if (readerState.reparseBusy) return;
   const confirmed = await requestActionConfirmation({
     title: "重新解析书籍",
     message: `确定重新解析《${book.title || "未命名书籍"}》吗？旧章节缓存会被清除。`,
     confirmLabel: "确认解析",
     danger: true,
   });
-  if (!confirmed) return;
+  if (!confirmed || readerState.reparseBusy) return;
+  setReparseBusy(true);
   try {
     setUploadMessage("正在重新解析书籍");
     const data = await api(`/api/books/${book.id}/reparse`, { method: "POST", body: "{}" });
@@ -1646,6 +1658,8 @@ async function reparseBook(book) {
     setUploadMessage("重新解析完成", "success");
   } catch (error) {
     setUploadMessage(error.message, "error");
+  } finally {
+    setReparseBusy(false);
   }
 }
 
@@ -3305,7 +3319,7 @@ function applyReaderTheme(value) {
   } else {
     document.documentElement.classList.toggle("reader-dark-root", dark);
     const themeColor = document.querySelector('meta[name="theme-color"]');
-    if (themeColor) themeColor.content = dark ? "#0e1320" : "#dfe4fb";
+    if (themeColor) themeColor.content = dark ? "#191a1c" : "#f6f5f2";
   }
   const button = $("darkModeBtn");
   if (button) {

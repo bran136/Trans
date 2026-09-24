@@ -3,12 +3,13 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <meta name="theme-color" content="#dfe4fb">
+    <meta name="theme-color" content="#f6f5f2">
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>在线读书</title>
     <link rel="icon" type="image/svg+xml" sizes="any" href="{{ asset_url('site-icon.svg') }}">
     <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
     <script src="{{ asset_url('reader-theme.js') }}"></script>
+    <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
     <link rel="stylesheet" href="{{ asset_url('reader.css') }}">
     <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
   </head>
@@ -17,7 +18,7 @@
       <header class="reader-topbar">
         <div>
           <h1>在线读书</h1>
-          <span id="readerStatus">本地书架</span>
+          <span id="readerStatus" hidden>本地书架</span>
         </div>
         <nav class="reader-actions">
           <a href="/">主页</a>
@@ -95,6 +96,9 @@
               <div id="uploadProgress" class="upload-progress" hidden>
                 <div id="uploadProgressBar"></div>
               </div>
+              <div id="reparseProgress" class="upload-progress parsing reparse-progress" role="progressbar" aria-label="正在重新解析书籍" hidden>
+                <div></div>
+              </div>
               <div id="uploadMessage" class="upload-message">选择文件后导入到本地书架</div>
               <div id="importJobs" class="import-jobs" hidden></div>
             </form>
@@ -131,7 +135,7 @@
     </dialog>
 
     <dialog id="bookMetadataDialog" class="reader-dialog book-metadata-dialog">
-      <form id="bookMetadataForm" class="dialog-panel">
+      <form id="bookMetadataForm" class="dialog-panel" tabindex="-1" autofocus>
         <div class="dialog-head">
           <h2>编辑书籍</h2>
           <div class="dialog-actions">
@@ -349,7 +353,7 @@
       </section>
     </dialog>
 
-    <div class="reader-version">
+    <div class="reader-version app-version">
       <span>v{{ app_version() }}</span>
       <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">
         <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">

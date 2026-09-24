@@ -3,11 +3,12 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <meta name="theme-color" content="#ffffff">
+    <meta name="theme-color" content="#f6f5f2">
     <meta name="csrf-token" content="{{ csrf_token() }}">
-    <title>Trans工具</title>
+    <title>Trans</title>
     <link rel="icon" type="image/svg+xml" sizes="any" href="{{ asset_url('site-icon.svg') }}">
     <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
+    <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
     <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
     <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
   </head>
@@ -15,27 +16,31 @@
     <main class="login-shell">
       <section class="login-panel">
         <img class="brand-mark" src="{{ asset_url('site-icon.svg') }}" alt="" aria-hidden="true">
-        <h1>Trans工具</h1>
-        <p>输入访问密码并选择功能</p>
+        <h1>Trans</h1>
         <form method="post" class="login-form">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <input type="password" name="password" placeholder="访问密码" autocomplete="current-password" autofocus required>
-          <div class="login-targets">
-            <button type="submit" name="target" value="translate">在线翻译</button>
-            <button type="submit" name="target" value="reader">在线读书</button>
+          <input type="hidden" name="target" value="home">
+          <div class="login-password-field">
+            <input class="login-password" type="password" name="password" placeholder="访问密码" aria-label="访问密码" autocomplete="current-password" autofocus required>
+            <button class="login-submit" type="submit" aria-label="登录" title="登录">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12h8m-4-4 4 4-4 4"/></svg>
+            </button>
           </div>
         </form>
         {% if error %}
-        <div class="form-error">{{ error }}</div>
+        <div class="form-error" role="alert">{{ error }}</div>
         {% endif %}
       </section>
     </main>
-    <div class="version-badge">
-      <span>v{{ app_version() }}</span>
-      <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">
-        <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
-      </a>
-    </div>
+    <footer class="login-footer">
+      <a class="project-credit" href="https://github.com/bran136/Trans/blob/master/LICENSE" target="_blank" rel="noopener noreferrer">Trans · AGPL-3.0</a>
+      <div class="version-badge app-version">
+        <span>v{{ app_version() }}</span>
+        <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">
+          <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
+        </a>
+      </div>
+    </footer>
     <script src="{{ asset_url('ui.js') }}"></script>
   </body>
 </html>

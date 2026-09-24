@@ -51,6 +51,7 @@ READER_INDEX_FILE = READER_DIR / "books.json"
 TTS_CACHE_DIR = READER_DIR / "tts_cache"
 TTS_PACK_CACHE_DIR = READER_DIR / "tts_pack_cache"
 TTS_OFFLINE_DB = READER_DIR / "tts_offline.sqlite3"
+TTS_PACK_INDEX_DB = READER_DIR / "tts_pack_index.sqlite3"
 TTS_CACHE_STATS_SNAPSHOT_FILE = READER_DIR / "tts_cache_stats.json"
 
 
@@ -90,6 +91,8 @@ BUILD_VERSION_FILES = (
     BASE_DIR / "templates" / "index.html",
     BASE_DIR / "templates" / "login.html",
     BASE_DIR / "templates" / "reader.html",
+    BASE_DIR / "static" / "theme.css",
+    BASE_DIR / "static" / "home.css",
     BASE_DIR / "static" / "styles.css",
     BASE_DIR / "static" / "ui.css",
     BASE_DIR / "static" / "ui.js",
@@ -1202,11 +1205,18 @@ def is_plain_chapter_title(value):
         return False
     if re.search(r"(?:https?://|www\.|\.com|\.net|\.org|下载|书包网|更多精彩|点击|最新网址)", title, re.IGNORECASE):
         return False
-    if title.count("。") + title.count("，") + title.count(",") >= 2:
+    # Parenthetical updates such as “（第二更）” are part of a
+    # heading, not prose. Keep the display title, relax only enclosed commas.
+    matching_title = re.sub(
+        r"（[^（）\r\n]*）|\([^()\r\n]*\)",
+        lambda match: match.group(0).replace("，", " ").replace(",", " "),
+        title,
+    )
+    if matching_title.count("。") + matching_title.count("，") + matching_title.count(",") >= 2:
         return False
     if re.fullmatch(r"\d{1,5}\.[A-Za-z0-9_ -]{1,12}", title):
         return False
-    return any(pattern.fullmatch(title) for pattern in PLAIN_CHAPTER_TITLE_PATTERNS)
+    return any(pattern.fullmatch(matching_title) for pattern in PLAIN_CHAPTER_TITLE_PATTERNS)
 
 
 def infer_plain_prefix_title(text):
@@ -1268,8 +1278,30 @@ def split_plain_chapters(text):
         stripped = line.strip()
         title = normalize_plain_chapter_title(stripped)
         if stripped and is_plain_chapter_title(title):
-            matches.append({"start": cursor, "title": title})
+            matches.append({"start": cursor, "title": title, "numeric_only": False})
+        elif re.fullmatch(r"[0-9０-９]{1,5}[.．][0-9０-９]{1,5}", stripped):
+            matches.append({"start": cursor, "title": title, "numeric_only": True})
         cursor += len(line)
+    # A number-only dotted line is ambiguous. Its leading number must be
+    # bracketed by recognized headings numbered n-1 and n+1; other decimals
+    # and unanchored number lists retain their original paragraph placement.
+    confirmed = []
+    for index, match in enumerate(matches):
+        if match["numeric_only"]:
+            if index == 0 or index + 1 == len(matches):
+                continue
+            before, after = matches[index - 1], matches[index + 1]
+            if before["numeric_only"] or after["numeric_only"]:
+                continue
+            previous_number = re.match(r"^([0-9０-９]{1,5})[.．、]", before["title"])
+            next_number = re.match(r"^([0-9０-９]{1,5})[.．、]", after["title"])
+            number = int(re.split(r"[.．]", match["title"], maxsplit=1)[0])
+            if not previous_number or not next_number:
+                continue
+            if int(previous_number.group(1)) != number - 1 or int(next_number.group(1)) != number + 1:
+                continue
+        confirmed.append(match)
+    matches = confirmed
     chapters = []
     if matches:
         prefix = text[:matches[0]["start"]].strip()
@@ -4090,7 +4122,65 @@ def delete_tts_offline_refs(book_id, chapter_indexes=None, profile_key=None, del
     return result
 
 
-def pinned_tts_pack_keys():
+def tts_pack_manifests_for_book(book_id):
+    # Pack keys include book identity and are immutable. Reconcile filenames
+    # so older caches, new packs and external removals need no write-path hooks.
+    # Only previously unseen manifests need to be read in full.
+    with TTS_PACK_CACHE_LOCK:
+        paths = {
+            path.stem: path for path in TTS_PACK_CACHE_DIR.glob("*.json")
+            if re.fullmatch(r"[0-9a-f]{64}", path.stem)
+        }
+        connection = None
+        try:
+            ensure_private_directory(TTS_PACK_INDEX_DB.parent)
+            connection = sqlite3.connect(TTS_PACK_INDEX_DB, timeout=5)
+            os.chmod(TTS_PACK_INDEX_DB, 0o600)
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS pack_owners ("
+                "pack_key TEXT PRIMARY KEY, book_id TEXT NOT NULL) WITHOUT ROWID"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS pack_owners_book ON pack_owners(book_id)"
+            )
+            known = {row[0] for row in connection.execute("SELECT pack_key FROM pack_owners")}
+            missing = known - paths.keys()
+            additions = []
+            for pack_key in paths.keys() - known:
+                try:
+                    manifest = json.loads(paths[pack_key].read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    continue
+                if not isinstance(manifest, dict) or manifest.get("pack_key") != pack_key:
+                    continue
+                owner = manifest.get("book_id")
+                if not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner):
+                    continue
+                additions.append((pack_key, owner))
+            if missing or additions:
+                with connection:
+                    connection.executemany(
+                        "DELETE FROM pack_owners WHERE pack_key = ?",
+                        ((key,) for key in missing),
+                    )
+                    connection.executemany(
+                        "INSERT OR REPLACE INTO pack_owners(pack_key, book_id) VALUES (?, ?)",
+                        additions,
+                    )
+            return [
+                paths[row[0]] for row in connection.execute(
+                    "SELECT pack_key FROM pack_owners WHERE book_id = ?", (book_id,),
+                ) if row[0] in paths
+            ]
+        except (OSError, sqlite3.Error) as exc:
+            app.logger.warning("tts pack ownership index unavailable; scanning manifests error=%s", exc)
+            return list(paths.values())
+        finally:
+            if connection is not None:
+                connection.close()
+
+
+def pinned_tts_pack_keys(book_id=None, manifest_paths=None):
     if not TTS_PACK_CACHE_DIR.is_dir():
         return set()
     with TTS_OFFLINE_LOCK:
@@ -4101,7 +4191,8 @@ def pinned_tts_pack_keys():
                 SELECT book_id, chapter_index, chapter_hash, profile_key, sentence_index,
                        cache_key, audio_format
                 FROM offline_tts_refs WHERE size_bytes > 0
-                """
+                """ + (" AND book_id = ?" if book_id is not None else ""),
+                (book_id,) if book_id is not None else (),
             ).fetchall()
         finally:
             connection.close()
@@ -4118,10 +4209,15 @@ def pinned_tts_pack_keys():
             row["profile_key"], int(row["sentence_index"]),
         ))
     pinned = set()
-    for manifest_path in TTS_PACK_CACHE_DIR.glob("*.json"):
+    if manifest_paths is None:
+        manifest_paths = (
+            tts_pack_manifests_for_book(book_id) if book_id is not None
+            else TTS_PACK_CACHE_DIR.glob("*.json")
+        )
+    for manifest_path in manifest_paths:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest.get("kind", "chapter") != "chapter":
+            if not isinstance(manifest, dict) or manifest.get("kind", "chapter") != "chapter":
                 continue
             identity = (
                 manifest["book_id"], int(manifest["chapter_index"]),
@@ -4147,19 +4243,26 @@ def delete_unpinned_tts_pack_files(
     size_bytes = 0
     if not TTS_PACK_CACHE_DIR.is_dir():
         return {"entries": 0, "size_bytes": 0}
-    pinned_keys = pinned_tts_pack_keys() if preserve_pinned else set()
-    for manifest_path in TTS_PACK_CACHE_DIR.glob("*.json"):
+    manifest_paths = tts_pack_manifests_for_book(book_id)
+    pinned_keys = pinned_tts_pack_keys(book_id, manifest_paths) if preserve_pinned else set()
+    for manifest_path in manifest_paths:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(manifest, dict):
             continue
         pack_key = manifest_path.stem
         if not re.fullmatch(r"[0-9a-f]{64}", pack_key) or manifest.get("pack_key") != pack_key:
             continue
         if manifest.get("book_id") != book_id:
             continue
-        if selected is not None and int(manifest.get("chapter_index", -1)) not in selected:
-            continue
+        if selected is not None:
+            try:
+                if int(manifest.get("chapter_index", -1)) not in selected:
+                    continue
+            except (TypeError, ValueError):
+                continue
         if profile_key and manifest.get("profile_key") != profile_key:
             continue
         if pack_key in pinned_keys:
@@ -5738,6 +5841,7 @@ ENGINES = {
 }
 
 LOGIN_TARGETS = {
+    "home": "index",
     "translate": "translate_page",
     "reader": "reader_page",
 }

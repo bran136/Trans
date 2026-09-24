@@ -197,6 +197,6 @@ $("logoutBtn").addEventListener("click", async () => {
     await api("/logout", { method: "POST", body: "{}" });
     window.location.href = "/login";
   } catch (error) {
-    window.alert(`退出失败：${error.message}`);
+    await window.TransUI.message("退出失败", error.message);
   }
 });

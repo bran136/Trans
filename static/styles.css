@@ -1,19 +1,3 @@
-:root {
-  color-scheme: light;
-  --bg: #eef2f5;
-  --panel: #ffffff;
-  --ink: #18212b;
-  --muted: #637083;
-  --line: #dbe2ea;
-  --accent: rgb(107, 125, 227);
-  --accent-strong: rgb(82, 99, 205);
-  --warm: #d39b45;
-  --danger: #b42318;
-  --shadow: 0 24px 70px rgba(44, 57, 120, 0.14);
-  --scrollbar-thumb: rgba(82, 99, 205, 0.46);
-  --scrollbar-thumb-hover: rgba(82, 99, 205, 0.68);
-}
-
 * {
   box-sizing: border-box;
 }
@@ -21,11 +5,9 @@
 body {
   margin: 0;
   min-height: 100vh;
-  background:
-    radial-gradient(circle at 10% 0%, rgba(107, 125, 227, 0.18), transparent 30%),
-    linear-gradient(135deg, #eef2ff 0%, #f8faff 45%, #eef3ff 100%);
+  background: var(--bg);
   color: var(--ink);
-  font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
 .app-body {
@@ -33,7 +15,7 @@ body {
   min-height: 100dvh;
   padding-bottom: 30px;
   overflow: hidden;
-  background: #dfe4fb;
+  background: var(--bg);
 }
 
 button,
@@ -93,8 +75,8 @@ a {
 
 .login-panel {
   padding: 42px;
-  background: rgba(255, 255, 255, 0.88);
-  border: 1px solid rgba(255, 255, 255, 0.78);
+  background: rgba(var(--surface-rgb), 0.88);
+  border: 1px solid rgba(var(--surface-rgb), 0.78);
   border-radius: 16px;
   box-shadow: var(--shadow);
   backdrop-filter: blur(18px);
@@ -106,7 +88,7 @@ a {
   height: 58px;
   margin-bottom: 26px;
   border-radius: 13px;
-  filter: drop-shadow(0 10px 20px rgba(55, 70, 189, 0.2));
+  filter: drop-shadow(0 10px 20px rgba(var(--shadow-rgb), 0.2));
 }
 
 .login-panel h1,
@@ -138,7 +120,7 @@ textarea {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: #fff;
+  background: var(--control);
   color: var(--ink);
   outline: none;
   transition: border-color 0.18s ease, box-shadow 0.18s ease;
@@ -164,7 +146,7 @@ textarea {
   border-radius: 0;
   line-height: 1.7;
   background: transparent;
-  font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   overflow: auto;
   -webkit-overflow-scrolling: touch;
 }
@@ -173,12 +155,12 @@ input:focus,
 select:focus,
 textarea:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 4px rgba(107, 125, 227, 0.16);
+  box-shadow: 0 0 0 4px rgba(var(--accent-rgb), 0.16);
 }
 
 input[type="checkbox"] {
   padding: 0;
-  accent-color: #1677ff;
+  accent-color: var(--accent);
 }
 
 input[type="checkbox"]:focus {
@@ -193,9 +175,9 @@ textarea:focus {
 input:disabled,
 select:disabled,
 textarea:disabled {
-  border-color: #e2e7ef;
-  background: #f2f4f8;
-  color: #8a94a6;
+  border-color: var(--line);
+  background: var(--disabled-bg);
+  color: var(--disabled-ink);
   cursor: not-allowed;
 }
 
@@ -228,8 +210,8 @@ textarea:disabled {
   background: var(--accent);
   color: #fff;
   border-radius: 14px;
-  box-shadow: 0 10px 24px rgba(107, 125, 227, 0.28);
-  font-weight: 800;
+  box-shadow: 0 10px 24px rgba(var(--accent-rgb), 0.28);
+  font-weight: 600;
   text-decoration: none;
 }
 
@@ -240,19 +222,19 @@ textarea:disabled {
 }
 
 .ghost {
-  background: rgba(255, 255, 255, 0.68);
+  background: rgba(var(--surface-rgb), 0.68);
   border-color: var(--line);
   color: var(--ink);
 }
 
 .danger-btn {
   height: 42px;
-  border: 1px solid rgba(180, 35, 24, 0.24);
+  border: 1px solid rgba(var(--danger-rgb), 0.24);
   border-radius: 14px;
   padding: 0 18px;
-  background: rgba(180, 35, 24, 0.08);
+  background: rgba(var(--danger-rgb), 0.08);
   color: var(--danger);
-  font-weight: 800;
+  font-weight: 600;
 }
 
 .form-error {
@@ -306,19 +288,19 @@ textarea:disabled {
   width: 62px;
   height: 62px;
   border-radius: 14px;
-  filter: drop-shadow(0 10px 20px rgba(55, 70, 189, 0.2));
+  filter: drop-shadow(0 10px 20px rgba(var(--shadow-rgb), 0.2));
 }
 
 .home-head h1 {
   margin: 0;
-  color: #3848bd;
+  color: var(--ink);
   font-size: clamp(30px, 5vw, 46px);
 }
 
 .home-head p {
   margin: 6px 0 0;
   color: var(--muted);
-  font-weight: 800;
+  font-weight: 600;
 }
 
 .home-actions {
@@ -338,9 +320,9 @@ textarea:disabled {
   min-height: 180px;
   align-content: end;
   padding: 22px;
-  border: 1px solid rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(var(--surface-rgb), 0.78);
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.86);
+  background: rgba(var(--surface-rgb), 0.86);
   color: var(--ink);
   text-decoration: none;
   box-shadow: var(--shadow);
@@ -350,7 +332,7 @@ textarea:disabled {
 
 .tool-card:hover {
   transform: translateY(-2px);
-  border-color: rgba(107, 125, 227, 0.42);
+  border-color: rgba(var(--accent-rgb), 0.42);
 }
 
 .tool-card strong {
@@ -384,7 +366,7 @@ textarea:disabled {
 
 .eyebrow {
   color: var(--accent);
-  font-weight: 800;
+  font-weight: 600;
   letter-spacing: 0;
   text-transform: uppercase;
   font-size: 12px;
@@ -398,10 +380,10 @@ textarea:disabled {
 
 .brand-title {
   display: inline-block;
-  color: #3848bd;
+  color: var(--ink);
   font-family: "AppYShiWritten", "Microsoft YaHei", "微软雅黑", sans-serif;
   font-weight: 700;
-  text-shadow: 0 2px 0 rgba(255, 255, 255, 0.94), 0 12px 28px rgba(107, 125, 227, 0.24);
+  text-shadow: 0 2px 0 rgba(var(--surface-rgb), 0.94), 0 12px 28px rgba(var(--accent-rgb), 0.24);
 }
 
 .brand-title::after {
@@ -411,7 +393,7 @@ textarea:disabled {
   height: 4px;
   margin-top: 2px;
   border-radius: 999px;
-  background: linear-gradient(90deg, rgba(107, 125, 227, 0.9), rgba(40, 183, 175, 0.58));
+  background: var(--accent);
 }
 
 .top-actions {
@@ -438,8 +420,8 @@ textarea:disabled {
 .translator,
 .side-panel,
 dialog {
-  border: 1px solid rgba(255, 255, 255, 0.8);
-  background: rgba(255, 255, 255, 0.84);
+  border: 1px solid rgba(var(--surface-rgb), 0.8);
+  background: rgba(var(--surface-rgb), 0.84);
   box-shadow: var(--shadow);
   backdrop-filter: blur(18px);
 }
@@ -515,7 +497,7 @@ label {
   height: 36px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: #fff;
+  background: var(--control);
   color: var(--accent);
   font-size: 20px;
 }
@@ -540,10 +522,6 @@ label {
   border-right: 1px solid var(--line);
 }
 
-.input-pane:focus-within {
-  box-shadow: inset 0 0 0 2px rgba(107, 125, 227, 0.22);
-}
-
 .pane-head {
   display: flex;
   align-items: center;
@@ -553,14 +531,14 @@ label {
   border-bottom: 1px solid var(--line);
   color: var(--muted);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 600;
 }
 
 .results {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 9px 14px;
+  gap: 0;
+  padding: 0;
   flex: 1;
   height: auto;
   min-height: 0;
@@ -569,6 +547,7 @@ label {
 }
 
 .results.empty {
+  padding: 18px;
   min-height: 0;
   color: var(--muted);
 }
@@ -577,11 +556,15 @@ label {
   display: flex;
   flex: 1 1 0;
   flex-direction: column;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: #fff;
+  border: 0;
+  border-radius: 0;
+  background: var(--control);
   overflow: hidden;
   min-height: 0;
+}
+
+.result-card + .result-card {
+  border-top: 1px solid var(--line);
 }
 
 .result-card.collapsed {
@@ -592,7 +575,7 @@ label {
   display: flex;
   align-items: stretch;
   border-bottom: 1px solid var(--line);
-  background: #fff;
+  background: var(--control);
 }
 
 .result-title {
@@ -602,7 +585,7 @@ label {
   min-width: 0;
   padding: 8px 11px;
   color: var(--ink);
-  font-weight: 800;
+  font-weight: 600;
   text-align: left;
 }
 
@@ -610,36 +593,37 @@ label {
   display: flex;
   align-items: center;
   justify-content: center;
-  flex: 0 0 38px;
-  width: 38px;
+  flex: 0 0 40px;
+  width: 40px;
+  min-height: 40px;
   padding: 0;
   border: 0;
-  background: #fff;
+  background: var(--subtle);
   color: var(--muted);
   transition: color 0.18s ease, background 0.18s ease;
 }
 
 .result-toggle:hover {
-  background: rgba(107, 125, 227, 0.08);
-  color: var(--accent-strong);
+  background: var(--line);
+  color: var(--ink);
 }
 
 .result-copy {
   flex: 0 0 auto;
   margin: 5px 4px 5px 0;
   padding: 0 10px;
-  border: 1px solid rgba(107, 125, 227, 0.22);
+  border: 1px solid rgba(var(--accent-rgb), 0.22);
   border-radius: 10px;
-  background: rgba(107, 125, 227, 0.08);
+  background: rgba(var(--accent-rgb), 0.08);
   color: var(--accent-strong);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 600;
 }
 
 .result-copy:disabled {
-  color: #13814f;
-  border-color: rgba(19, 129, 79, 0.22);
-  background: rgba(19, 129, 79, 0.1);
+  color: var(--success);
+  border-color: rgba(var(--success-rgb), 0.22);
+  background: rgba(var(--success-rgb), 0.1);
   cursor: default;
 }
 
@@ -677,7 +661,7 @@ label {
   white-space: pre-wrap;
   word-break: break-word;
   line-height: 1.7;
-  font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
 .visual-sentence {
@@ -687,12 +671,12 @@ label {
 }
 
 .visual-sentence:hover {
-  background: rgba(107, 125, 227, 0.08);
+  background: rgba(var(--accent-rgb), 0.08);
 }
 
 .visual-sentence.active {
-  background: rgba(107, 125, 227, 0.18);
-  box-shadow: 0 0 0 2px rgba(107, 125, 227, 0.12);
+  background: rgba(var(--accent-rgb), 0.18);
+  box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.12);
 }
 
 .result-card.error pre {
@@ -712,7 +696,7 @@ label {
 .field-title {
   color: var(--muted);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 600;
   margin-bottom: 5px;
 }
 
@@ -730,9 +714,9 @@ label {
   padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: #fff;
+  background: var(--control);
   color: var(--ink);
-  font-weight: 800;
+  font-weight: 600;
   user-select: none;
 }
 
@@ -744,7 +728,7 @@ label {
 .engine-balance {
   color: var(--muted);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 600;
 }
 
 .engine-empty {
@@ -781,7 +765,7 @@ label {
   text-align: left;
   border: 1px solid var(--line);
   border-radius: 14px;
-  background: #fff;
+  background: var(--control);
   padding: 12px;
   color: var(--ink);
 }
@@ -822,7 +806,7 @@ label {
   display: grid;
   place-items: center;
   padding: 14px;
-  background: rgba(20, 29, 39, 0.32);
+  background: rgba(var(--shadow-rgb), 0.32);
   -webkit-backdrop-filter: blur(2px);
   backdrop-filter: blur(2px);
 }
@@ -838,9 +822,9 @@ label {
   align-items: center;
   gap: 14px;
   padding: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(var(--surface-rgb), 0.78);
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.96);
+  background: rgba(var(--surface-rgb), 0.96);
 }
 
 .action-confirm-overlay .action-confirm-panel {
@@ -854,7 +838,7 @@ label {
   height: 46px;
   place-items: center;
   border-radius: 50%;
-  background: rgba(180, 35, 24, 0.1);
+  background: rgba(var(--danger-rgb), 0.1);
   color: var(--danger);
   font-size: 24px;
   font-weight: 900;
@@ -914,14 +898,14 @@ label {
   padding: 13px 14px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(var(--surface-rgb), 0.72);
 }
 
 .metric-card span {
   display: block;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 600;
 }
 
 .metric-card strong {
@@ -1004,7 +988,7 @@ dialog {
 .cache-setting-inline span {
   color: var(--muted);
   font-size: 11px;
-  font-weight: 800;
+  font-weight: 600;
   white-space: nowrap;
 }
 
@@ -1026,7 +1010,7 @@ dialog {
 }
 
 dialog::backdrop {
-  background: rgba(20, 29, 39, 0.42);
+  background: rgba(var(--shadow-rgb), 0.42);
   backdrop-filter: blur(4px);
 }
 
@@ -1067,7 +1051,7 @@ dialog::backdrop {
   height: 38px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: #fff;
+  background: var(--control);
   font-size: 24px;
   line-height: 1;
 }
@@ -1082,7 +1066,7 @@ dialog::backdrop {
   padding: 7px 9px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.62);
+  background: rgba(var(--surface-rgb), 0.62);
 }
 
 .settings-group h3 {
@@ -1115,9 +1099,9 @@ dialog::backdrop {
   align-self: end;
   margin: 0;
   padding: 10px 12px;
-  border: 1px solid rgba(107, 125, 227, 0.22);
+  border: 1px solid rgba(var(--accent-rgb), 0.22);
   border-radius: 12px;
-  background: rgba(107, 125, 227, 0.08);
+  background: rgba(var(--accent-rgb), 0.08);
   color: var(--muted);
   font-size: 12px;
   line-height: 1.6;
@@ -1185,7 +1169,7 @@ dialog::backdrop {
 }
 
 .status-icon.loading {
-  border: 2px solid rgba(107, 125, 227, 0.22);
+  border: 2px solid rgba(var(--accent-rgb), 0.22);
   border-top-color: var(--accent);
   animation: spin 0.8s linear infinite;
 }
@@ -1220,9 +1204,9 @@ dialog::backdrop {
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  border: 1px solid #20252d;
+  border: 1px solid var(--ink);
   background: transparent;
-  color: #20252d;
+  color: var(--ink);
   font-size: 11px;
   font-weight: 900;
   list-style: none;
@@ -1241,10 +1225,10 @@ dialog::backdrop {
   left: 0;
   width: min(260px, calc(100vw - 56px));
   padding: 10px 12px;
-  border: 1px solid rgba(107, 125, 227, 0.24);
+  border: 1px solid rgba(var(--accent-rgb), 0.24);
   border-radius: 12px;
-  background: #fff;
-  box-shadow: 0 16px 36px rgba(44, 57, 120, 0.18);
+  background: var(--control);
+  box-shadow: 0 16px 36px rgba(var(--shadow-rgb), 0.18);
   color: var(--ink);
   font-size: 12px;
   font-weight: 500;
@@ -1255,14 +1239,14 @@ dialog::backdrop {
 }
 
 .config-message.success {
-  border: 1px solid rgba(19, 129, 79, 0.22);
-  background: rgba(19, 129, 79, 0.1);
-  color: #12724a;
+  border: 1px solid rgba(var(--success-rgb), 0.22);
+  background: rgba(var(--success-rgb), 0.1);
+  color: var(--success);
 }
 
 .config-message.error {
-  border: 1px solid rgba(180, 35, 24, 0.2);
-  background: rgba(180, 35, 24, 0.09);
+  border: 1px solid rgba(var(--danger-rgb), 0.2);
+  background: rgba(var(--danger-rgb), 0.09);
   color: var(--danger);
 }
 
@@ -1275,14 +1259,14 @@ dialog::backdrop {
   bottom: 7px;
   z-index: 20;
   padding: 5px 9px;
-  border: 1px solid rgba(107, 125, 227, 0.18);
+  border: 1px solid rgba(var(--accent-rgb), 0.18);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.78);
-  color: #647084;
+  background: rgba(var(--surface-rgb), 0.78);
+  color: var(--muted);
   font-size: 11px;
   font-weight: 700;
   line-height: 1;
-  box-shadow: 0 8px 22px rgba(21, 32, 64, 0.08);
+  box-shadow: 0 8px 22px rgba(var(--shadow-rgb), 0.08);
   backdrop-filter: blur(8px);
   pointer-events: auto;
 }
@@ -1321,7 +1305,7 @@ dialog::backdrop {
 }
 
 .version-github-link:focus-visible {
-  outline: 2px solid var(--primary);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -1559,8 +1543,12 @@ dialog::backdrop {
   }
 
   .results {
-    gap: 7px;
-    padding: 8px 10px;
+    gap: 0;
+    padding: 0;
+  }
+
+  .results.empty {
+    padding: 12px;
   }
 
   .result-card {

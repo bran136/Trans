@@ -1,0 +1,64 @@
+/* Shared palette: page, nested panels and controls use the same theme. */
+:root {
+  color-scheme: light;
+  --bg: #f6f5f2;
+  --reader-page-background: var(--bg);
+  --panel: #ffffff;
+  --control: #ffffff;
+  --subtle: #f3f2ee;
+  --paper: #fffdf8;
+  --ink: #292b2e;
+  --muted: #686b70;
+  --line: #e2e1db;
+  --line-strong: #c5c6bf;
+  --accent: #555fc0;
+  --accent-strong: #454ea7;
+  --accent-rgb: 85, 95, 192;
+  --selected: #eeeff9;
+  --surface-rgb: 255, 255, 255;
+  --neutral-rgb: 115, 116, 113;
+  --shadow-rgb: 27, 28, 30;
+  --disabled-bg: #eeede9;
+  --disabled-ink: #777a7d;
+  --danger: #b42318;
+  --danger-rgb: 180, 35, 24;
+  --success: #26734c;
+  --success-rgb: 38, 115, 76;
+  --warning: #85641b;
+  --warm: #aa8347;
+  --shadow: 0 4px 20px rgba(27, 28, 30, 0.045);
+  --dialog-shadow: 0 20px 70px rgba(27, 28, 30, 0.16);
+  --scrollbar-thumb: rgba(115, 116, 113, 0.4);
+  --scrollbar-thumb-hover: rgba(115, 116, 113, 0.65);
+}
+
+html.reader-dark-root,
+.reader-body.reader-dark {
+  color-scheme: dark;
+  --bg: #191a1c;
+  --panel: #222325;
+  --control: #2a2b2e;
+  --subtle: #2a2b2d;
+  --paper: #1e1f21;
+  --ink: #e7e6e2;
+  --muted: #aaa9a4;
+  --line: #3a3b3d;
+  --line-strong: #606163;
+  --accent: #a5abe7;
+  --accent-strong: #c0c4f3;
+  --accent-rgb: 165, 171, 231;
+  --selected: #30313d;
+  --surface-rgb: 34, 35, 37;
+  --neutral-rgb: 150, 150, 146;
+  --disabled-bg: #242527;
+  --disabled-ink: #999995;
+  --danger: #f5a39a;
+  --danger-rgb: 245, 163, 154;
+  --success: #91c9aa;
+  --success-rgb: 145, 201, 170;
+  --warning: #d5b978;
+  --shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+  --dialog-shadow: 0 20px 70px rgba(0, 0, 0, 0.35);
+  --scrollbar-thumb: rgba(170, 169, 164, 0.4);
+  --scrollbar-thumb-hover: rgba(170, 169, 164, 0.65);
+}

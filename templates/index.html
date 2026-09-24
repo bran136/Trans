@@ -3,11 +3,12 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#dfe4fb">
+    <meta name="theme-color" content="#f6f5f2">
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>在线翻译</title>
     <link rel="icon" type="image/svg+xml" sizes="any" href="{{ asset_url('site-icon.svg') }}">
     <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
+    <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
     <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
     <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
   </head>
@@ -67,7 +68,7 @@
           </div>
 
           <div class="engine-row">
-            <div>
+            <div class="engine-controls">
               <div class="field-title">翻译引擎</div>
               <div id="engineList" class="engine-list"></div>
             </div>
@@ -79,7 +80,7 @@
     <dialog id="historyDialog">
       <section class="history-panel">
         <div class="dialog-head">
-          <h2>本地历史</h2>
+          <h2 tabindex="-1" autofocus>本地历史</h2>
           <button class="icon-btn" id="closeHistoryBtn" type="button">×</button>
         </div>
         <div id="historyList" class="history-list"></div>
@@ -89,10 +90,10 @@
     <dialog id="settingsDialog">
       <form method="dialog" class="settings">
         <div class="dialog-head">
-          <h2>服务配置</h2>
+          <h2 tabindex="-1" autofocus>服务配置</h2>
           <div class="dialog-actions compact-actions">
             <button class="ghost" value="cancel" type="submit">取消</button>
-            <button class="primary" id="saveConfigBtn" type="button">保存配置</button>
+            <button class="ghost" id="saveConfigBtn" type="button">保存配置</button>
           </div>
         </div>
         <div id="configMessage" class="config-message" hidden></div>
@@ -220,7 +221,7 @@
       </section>
     </div>
 
-    <div class="version-badge">
+    <div class="version-badge app-version">
       <span>v{{ app_version() }}</span>
       <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">
         <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
