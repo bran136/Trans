@@ -536,16 +536,17 @@ html:not(.keyboard-navigation) :is(.app-body, .reader-body) :is(button, a):focus
 }
 
 
-/* Selected font is marked separately from pointer hover. */
+/* The selected font keeps a persistent tinted fill as well as its checkmark. */
 .reader-body .font-option.active,
+.reader-body .font-option.active:hover,
 .reader-body .font-option.active:focus,
 .reader-body .font-option.active:focus-visible {
   position: relative;
   padding-inline: 26px;
-  background: var(--subtle);
-  border-color: var(--line-strong);
-  color: var(--ink);
-  box-shadow: none;
+  background: rgba(var(--accent-rgb), .16);
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 .reader-body .font-option.active::after {
   content: "✓";
@@ -553,7 +554,7 @@ html:not(.keyboard-navigation) :is(.app-body, .reader-body) :is(button, a):focus
   right: 9px;
   top: 50%;
   transform: translateY(-50%);
-  color: var(--muted);
+  color: var(--accent-strong);
   font-size: 13px;
 }
 .mimo-balance-actions a { transition: border-color 140ms ease, color 140ms ease; }
@@ -631,36 +632,367 @@ html:not(.keyboard-navigation) .home-body :is(button, a):focus { outline: none; 
 
 /* Compact mobile configuration and monitoring dialogs. */
 @media (max-width: 640px) {
-  #settingsDialog .settings,
+  .app-body #settingsDialog .settings,
   #monitorDialog .monitor-panel { padding: 12px; }
-  #settingsDialog .dialog-head,
+  .app-body #settingsDialog .dialog-head,
   #monitorDialog .dialog-head { flex-direction: row; align-items: center; gap: 8px; padding-bottom: 0; }
-  #settingsDialog .dialog-head h2,
+  .app-body #settingsDialog .dialog-head h2,
   #monitorDialog .dialog-head h2 { margin: 0; font-size: 17px; white-space: nowrap; }
-  #settingsDialog .compact-actions,
+  .app-body #settingsDialog .compact-actions,
   #monitorDialog .compact-actions { flex-direction: row; align-items: center; gap: 6px; flex-wrap: nowrap; }
-  #settingsDialog .compact-actions button,
-  #monitorDialog .compact-actions button { min-height: 32px; padding: 6px 8px; font-size: 12px; line-height: 1.3; white-space: nowrap; }
-  #settingsDialog .settings-groups { margin-top: 10px; gap: 10px; }
-  #settingsDialog .settings-group { padding: 10px; }
-  #settingsDialog .settings-group h3 { margin-bottom: 8px; font-size: 13px; }
-  #settingsDialog .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-  #settingsDialog .settings-group:first-child .settings-grid > label:nth-child(-n+3) { grid-column: 1 / -1; }
-  #settingsDialog label { gap: 4px; font-size: 12px; font-weight: 500; }
-  #settingsDialog input:not([type="checkbox"]),
-  #settingsDialog select { min-height: 34px; height: 34px; padding-block: 5px; font-size: 14px; }
-  #settingsDialog .toggle-row { margin-top: 10px; gap: 8px; }
-  #settingsDialog .cache-setting-inline { font-size: 12px; }
-  #settingsDialog #clearCacheBtn { min-height: 30px; padding: 4px 8px; font-size: 12px; }
-  #settingsDialog .config-message,
+  .app-body #settingsDialog .compact-actions button,
+  #monitorDialog .compact-actions button { min-height: 32px; padding: 6px 8px; font-size: var(--mobile-control-size); line-height: 1.3; white-space: nowrap; }
+  .app-body #settingsDialog .settings-groups { margin-top: 10px; gap: 10px; }
+  .app-body #settingsDialog .settings-group { padding: 10px; }
+  .app-body #settingsDialog .settings-group h3 { margin-bottom: 8px; font-size: 13px; }
+  .app-body #settingsDialog .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .app-body #settingsDialog label { gap: 4px; font-size: var(--mobile-control-size); font-weight: 500; }
+  .app-body #settingsDialog input:not([type="checkbox"]),
+  .app-body #settingsDialog select { min-height: 34px; height: 34px; padding-block: 5px; font-size: 14px; }
+  .app-body #settingsDialog .toggle-row { margin-top: 10px; gap: 8px; }
+  .app-body #settingsDialog .cache-setting-inline { font-size: 12px; }
+  .app-body #settingsDialog #clearCacheBtn { min-height: 30px; padding: 4px 8px; font-size: var(--mobile-control-size); }
+  .app-body #settingsDialog .config-message,
   #monitorDialog .config-message { margin-top: 6px; min-height: 0; padding: 4px 8px; font-size: 12px; font-weight: 400; line-height: 1.4; }
-  #settingsDialog .config-message[hidden],
+  .app-body #settingsDialog .config-message[hidden],
   #monitorDialog .config-message[hidden] { display: none !important; }
 }
-/* iOS needs 16px editable controls to avoid automatic zoom on focus. */
-@supports (-webkit-touch-callout: none) {
-  @media (max-width: 640px) {
-    #settingsDialog input:not([type="checkbox"]),
-    #settingsDialog select { font-size: 16px; }
+/* One type scale for mobile navigation and nested dialogs. Reading content
+   and font previews keep their own user-controlled typography. */
+@media (max-width: 760px) {
+  :root { --mobile-control-size: 13px; --mobile-dialog-title-size: 17px; }
+
+  :is(.app-body, .reader-body, .home-body) .dialog-head h2,
+  .ui-text-panel h2,
+  .action-confirm-panel h2,
+  .restart-confirm-panel h2 {
+    font-size: var(--mobile-dialog-title-size);
   }
+
+  :is(.app-body, .reader-body, .home-body) :is(
+    .top-actions, .reader-actions, .dialog-head, .dialog-actions,
+    .manage-book-actions, .toc-edit-actions, .offline-cache-actions,
+    .offline-cache-presets, .settings-section-head, .sleep-options,
+    .sleep-actions, .ui-text-actions, .action-confirm-actions
+  ) button:not(.icon-btn),
+  .reader-body .reader-actions a,
+  .reader-body .mimo-balance-actions :is(a, button) {
+    font-size: var(--mobile-control-size);
+  }
+
+  .app-body #settingsDialog #clearCacheBtn,
+  .app-body #settingsDialog label,
+  .reader-body :is(
+    .setting-row, .setting-check, .tts-settings-grid label,
+    .book-metadata-field, .offline-range-field, .mimo-cookie-field,
+    .sleep-custom
+  ),
+  .ui-text-panel label {
+    font-size: var(--mobile-control-size);
+  }
+
+  .ui-text-panel p,
+  .compact-confirm-message {
+    font-size: 14px;
+  }
+}
+
+/* Separate keyboard inputs from compact choice controls on mobile. */
+@media (max-width: 760px) {
+  :root { --mobile-input-size: 13px; }
+  html.iphone-safari { --mobile-input-size: 16px; }
+
+  .app-body #settingsDialog select,
+  .app-body .toolbar select,
+  .reader-body .reader-dialog select,
+  .reader-body .listen-toolbar select {
+    font-size: var(--mobile-control-size);
+  }
+
+  .app-body #settingsDialog input:not([type="checkbox"]),
+  .app-body #sourceText,
+  .reader-body .reader-dialog input:not([type="checkbox"]):not([type="range"]):not([type="file"]),
+  .reader-body .reader-dialog textarea,
+  .home-body .monitor-panel input,
+  .ui-text-dialog .ui-text-panel input,
+  .login-body .login-form .login-password {
+    font-size: var(--mobile-input-size);
+  }
+}
+
+/* Listening status stays between the title and actions, including long errors. */
+#ttsDialog .dialog-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+}
+#ttsDialog .dialog-head h2 { white-space: nowrap; }
+#ttsDialog .dialog-head .dialog-actions {
+  grid-column: 3;
+  grid-row: 1;
+  flex-wrap: nowrap;
+}
+#ttsDialog .dialog-head button { white-space: nowrap; }
+#ttsDialog #ttsConfigMessage {
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Desktop listening settings: connection fields above a complete voice row. */
+@media (min-width: 761px) {
+  #ttsDialog { width: min(760px, calc(100vw - 48px)); }
+  #ttsDialog .dialog-panel { padding: 22px 24px; gap: 16px; }
+  #ttsDialog .dialog-head h2 { font-size: 21px; }
+  #ttsDialog .dialog-head button {
+    min-height: 36px;
+    padding: 0 16px;
+    font-size: 14px;
+  }
+  #ttsDialog .tts-config-panel { gap: 16px; padding-top: 16px; }
+  #ttsDialog .tts-settings-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 14px 16px;
+  }
+  #ttsDialog .tts-settings-grid label {
+    grid-column: span 2;
+    min-width: 0;
+    gap: 7px;
+    color: var(--ink);
+    font-size: 14px;
+    font-weight: 500;
+  }
+  #ttsDialog .tts-settings-grid .tts-connection-field { grid-column: span 3; }
+  #ttsDialog .tts-settings-grid .tts-wide { grid-column: 1 / -1; }
+  #ttsDialog .tts-settings-grid :is(input, select, textarea) {
+    min-width: 0;
+    min-height: 40px;
+    font-size: 15px;
+    font-weight: 400;
+  }
+  #ttsDialog .tts-settings-grid textarea { min-height: 82px; line-height: 1.6; }
+  #ttsDialog .setting-check { font-size: 14px; font-weight: 500; }
+  #ttsDialog .mimo-balance-panel {
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--subtle);
+    flex-wrap: wrap;
+  }
+  #ttsDialog .mimo-balance { font-size: 14px; }
+  #ttsDialog .mimo-balance-actions :is(button, a) {
+    min-height: 32px;
+    padding: 5px 10px;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  #ttsDialog .tts-cache-row {
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    padding-top: 14px;
+    border-top: 1px solid var(--line);
+  }
+  #ttsDialog .tts-cache-stats,
+  #ttsDialog .reader-config-message { font-size: 13px; font-weight: 400; }
+}
+
+/* Equalize native desktop controls without changing touch-device Safari. */
+@media (min-width: 761px) and (hover: hover) and (pointer: fine) {
+  #ttsDialog :is(#ttsModel, #ttsVoiceId, #ttsChunkChars) {
+    box-sizing: border-box;
+    height: 40px;
+    min-height: 40px;
+    padding-block: 0;
+  }
+}
+
+/* Compact mobile listening settings without changing the control type scale. */
+@media (max-width: 760px) {
+  #ttsDialog { width: calc(100vw - 16px); max-width: calc(100vw - 16px); }
+  #ttsDialog .dialog-panel { padding: 8px 12px; gap: 8px; }
+  #ttsDialog .dialog-head button { min-height: 30px; padding: 0 10px; }
+  #ttsDialog .tts-config-panel { gap: 8px; padding-top: 8px; }
+  #ttsDialog .tts-settings-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px 10px;
+  }
+  #ttsDialog .tts-settings-grid label { min-width: 0; gap: 3px; line-height: 1.3; }
+  #ttsDialog .tts-settings-grid :is(.tts-connection-field, .tts-model-field, .tts-wide) {
+    grid-column: 1 / -1;
+  }
+  #ttsDialog .tts-settings-grid :is(input, select) {
+    min-width: 0;
+    min-height: 32px;
+    height: 32px;
+    padding: 0 9px;
+    font-weight: 400;
+  }
+  #ttsDialog .tts-settings-grid textarea { padding: 6px 9px; font-weight: 400; }
+  #ttsDialog .setting-check { gap: 7px; line-height: 1.4; font-weight: 500; }
+  #ttsDialog .mimo-balance-panel {
+    gap: 5px;
+    padding: 7px 9px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--subtle);
+  }
+  #ttsDialog .mimo-balance { min-height: 0; padding: 0; line-height: 1.4; }
+  #ttsDialog .mimo-balance-actions { gap: 5px; flex-wrap: wrap; }
+  #ttsDialog .mimo-balance-actions :is(a, button) { min-height: 28px; padding: 3px 8px; font-weight: 400; }
+  #ttsDialog .tts-cache-row { gap: 3px; padding-top: 7px; border-top: 1px solid var(--line); }
+  #ttsDialog .tts-cache-stats { font-size: 11px; line-height: 1.35; font-weight: 400; }
+}
+
+/* Reading preferences use a two-column font gallery on phones. */
+@media (max-width: 760px) {
+  .reader-body #settingsDialog {
+    width: calc(100vw - 16px);
+    max-width: calc(100vw - 16px);
+  }
+  .reader-body #settingsDialog .dialog-panel {
+    padding: 10px 12px;
+    gap: 10px;
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - max(12px, env(safe-area-inset-top)) - max(12px, env(safe-area-inset-bottom)));
+  }
+  .reader-body #settingsDialog .dialog-head button { min-height: 32px; padding: 0 10px; }
+  .reader-body #settingsDialog .setting-row { gap: 6px; }
+  .reader-body #settingsDialog .font-size-setting {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--line);
+  }
+  .reader-body #settingsDialog #fontValue { margin-left: 6px; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .reader-body #settingsDialog #fontInput { min-width: 0; height: 28px; margin: 0; }
+  .reader-body #settingsDialog .font-picker { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 10px; }
+  .reader-body #settingsDialog .font-option {
+    min-height: 42px;
+    padding: 6px 8px;
+    border-radius: 9px;
+    font-size: 16px;
+  }
+  .reader-body #settingsDialog .font-option.active { padding-left: 8px; padding-right: 23px; }
+  .reader-body #settingsDialog .font-option.active::after { right: 6px; }
+  .reader-body #settingsDialog .font-load-tools { min-height: 28px; padding: 2px 0 0; gap: 4px; justify-content: space-between; }
+  .reader-body #settingsDialog .font-load-status { font-weight: 400; }
+  .reader-body #settingsDialog .font-load-button { min-height: 28px; padding: 3px 6px; flex-shrink: 0; }
+}
+
+/* Translation settings: aligned provider headers and a readable desktop form. */
+html.translation-settings-open { overflow: hidden; overscroll-behavior: none; }
+html.translation-settings-open .app-body {
+  position: fixed;
+  top: var(--settings-scroll-top, 0px);
+  left: 0;
+  right: 0;
+  overflow: hidden;
+}
+.app-body #settingsDialog .settings { overscroll-behavior: contain; }
+.app-body #settingsDialog { width: min(840px, calc(100vw - 24px)); max-width: calc(100vw - 24px); }
+.app-body #settingsDialog .settings { padding: 22px; }
+.app-body #settingsDialog .dialog-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+.app-body #settingsDialog .compact-actions { grid-column: 3; grid-row: 1; }
+.app-body #settingsDialog .config-message {
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.app-body #settingsDialog .config-message.error { grid-column: 1 / -1; grid-row: 2; text-align: left; }
+
+/* Compact status badges shared by translation and listening settings. */
+.app-body #settingsDialog .config-message,
+#ttsDialog #ttsConfigMessage {
+  box-sizing: border-box;
+  justify-self: end;
+  max-width: 100%;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--subtle);
+  text-align: left;
+}
+.app-body #settingsDialog .config-message.success,
+#ttsDialog #ttsConfigMessage.success {
+  border-color: rgba(var(--success-rgb), 0.24);
+  background: rgba(var(--success-rgb), 0.08);
+  color: var(--success);
+}
+.app-body #settingsDialog .config-message.error,
+#ttsDialog #ttsConfigMessage.error {
+  border-color: rgba(var(--danger-rgb), 0.24);
+  background: rgba(var(--danger-rgb), 0.08);
+  color: var(--danger);
+}
+.app-body #settingsDialog .config-message.error { justify-self: stretch; }
+
+.app-body #settingsDialog .settings-groups { margin-top: 16px; gap: 14px; }
+.app-body #settingsDialog .settings-group { padding: 16px; background: var(--panel); }
+.app-body #settingsDialog .settings-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.app-body #settingsDialog .settings-group-head h3 { margin: 0; font-size: 16px; font-weight: 600; }
+.app-body #settingsDialog .settings-enable {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink);
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 500;
+}
+.app-body #settingsDialog .settings-enable input { width: 16px; height: 16px; margin: 0; }
+.app-body #settingsDialog .settings-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.app-body #settingsDialog .settings-grid > label { min-width: 0; font-size: 14px; font-weight: 500; gap: 6px; }
+.app-body #settingsDialog .settings-grid > label:nth-child(-n+4) { grid-column: span 2; }
+.app-body #settingsDialog .settings-grid > label:nth-child(n+5) { grid-column: span 1; }
+.app-body #settingsDialog .settings-grid :is(input, select) { min-width: 0; min-height: 40px; font-size: 15px; font-weight: 400; }
+.app-body #settingsDialog .google-settings-grid { grid-template-columns: minmax(0, 1fr) 112px; }
+.app-body #settingsDialog .google-settings-grid > label:nth-child(n) { grid-column: auto; }
+.app-body #settingsDialog .settings-group-footer { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.app-body #settingsDialog .cache-setting-inline { display: flex; justify-content: flex-start; gap: 8px; border: 0; padding: 0; }
+.app-body #settingsDialog .cache-setting-inline span { white-space: normal; font-size: 12px; }
+.app-body #settingsDialog .config-message[hidden] { display: none !important; }
+@media (min-width: 761px) {
+  .app-body #settingsDialog .dialog-head h2 { font-size: 21px; }
+  .app-body #settingsDialog .compact-actions button { min-height: 36px; padding: 0 14px; font-size: 14px; }
+}
+@media (max-width: 760px) {
+  .app-body #settingsDialog .settings { padding: 12px; }
+  .app-body #settingsDialog .dialog-head { gap: 6px; padding-bottom: 10px; }
+  .app-body #settingsDialog .settings-groups { margin-top: 10px; gap: 10px; }
+  .app-body #settingsDialog .settings-group { padding: 10px; }
+  .app-body #settingsDialog .settings-group-head { margin-bottom: 10px; gap: 8px; }
+  .app-body #settingsDialog .settings-group-head h3 { font-size: 15px; }
+  .app-body #settingsDialog .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 10px; }
+  .app-body #settingsDialog .settings-grid > label:nth-child(n) { grid-column: auto; font-size: 13px; gap: 4px; }
+  .app-body #settingsDialog .settings-grid > label:nth-child(-n+2) { grid-column: 1 / -1; }
+  .app-body #settingsDialog .settings-grid :is(input, select) { min-height: 34px; height: 34px; }
+  .app-body #settingsDialog .settings-grid input { font-size: var(--mobile-input-size); }
+  .app-body #settingsDialog .settings-grid select { font-size: var(--mobile-control-size); }
+  .app-body #settingsDialog .google-settings-grid { grid-template-columns: minmax(0, 1fr) 82px; }
+  .app-body #settingsDialog .google-settings-grid > label:nth-child(n) { grid-column: auto; }
+  .app-body #settingsDialog .settings-group-footer { margin-top: 9px; padding-top: 8px; }
+}
+
+@media (max-width: 360px) {
+  .app-body #settingsDialog .settings-group:first-child .settings-grid > label:nth-child(3) { grid-column: 1 / -1; }
 }

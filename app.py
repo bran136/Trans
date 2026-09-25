@@ -211,7 +211,6 @@ TTS_MODEL_OPTIONS = [
     "mimo-v2.5-tts",
 ]
 TTS_VOICE_OPTIONS = [
-    {"id": "mimo_default", "name": "MiMo-默认", "language": "自动", "gender": "自动", "models": ["mimo-v2.5-tts"]},
     {"id": "冰糖", "name": "冰糖", "language": "中文", "gender": "女声", "models": ["mimo-v2.5-tts"]},
     {"id": "茉莉", "name": "茉莉", "language": "中文", "gender": "女声", "models": ["mimo-v2.5-tts"]},
     {"id": "苏打", "name": "苏打", "language": "中文", "gender": "男声", "models": ["mimo-v2.5-tts"]},
@@ -260,7 +259,7 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "api_key": "",
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "temperature": 0.2,
         "thinking": "disabled",
         "reasoning_effort": "medium",
@@ -280,7 +279,7 @@ DEFAULT_CONFIG = {
         "balance_url": "https://platform.xiaomimimo.com/api/v1/balance",
         "balance_cookie": "",
         "model": "mimo-v2.5-tts",
-        "voice_id": "mimo_default",
+        "voice_id": "冰糖",
         "format": "m4a",
         "style_prompt": "自然清晰地朗读，适合小说听书，语速适中，情绪跟随文本。",
         "timeout": 30,
@@ -643,6 +642,12 @@ def save_dotenv_values(values):
         write_private_text_atomic(env_path, "\n".join(updated_lines).rstrip() + "\n")
 
 
+def normalize_deepseek_model(model):
+    if model in {"deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-chat", "deepseek-reasoner"}:
+        return "deepseek-flash"
+    return model
+
+
 def apply_env(config):
     config["app_password"] = os.getenv("APP_PASSWORD", config["app_password"])
     deepseek = config["deepseek"]
@@ -651,7 +656,7 @@ def apply_env(config):
         os.getenv("DEEPSEEK_BASE_URL", DEFAULT_CONFIG["deepseek"]["base_url"]),
         DEFAULT_CONFIG["deepseek"]["base_url"],
     )
-    deepseek["model"] = os.getenv("DEEPSEEK_MODEL", deepseek["model"])
+    deepseek["model"] = normalize_deepseek_model(os.getenv("DEEPSEEK_MODEL", deepseek["model"]))
     reader_tts = config["reader_tts"]
     reader_tts["api_key"] = os.getenv("MIMO_API_KEY", reader_tts["api_key"])
     reader_tts["base_url"] = validate_mimo_tts_url(
@@ -667,6 +672,8 @@ def apply_env(config):
     if reader_tts["model"] not in TTS_MODEL_OPTIONS:
         reader_tts["model"] = TTS_MODEL_OPTIONS[0]
     reader_tts["voice_id"] = os.getenv("MIMO_TTS_VOICE", reader_tts["voice_id"])
+    if not reader_tts["voice_id"] or reader_tts["voice_id"] == "mimo_default":
+        reader_tts["voice_id"] = "冰糖"
     reader_tts["style_prompt"] = os.getenv("MIMO_TTS_STYLE_PROMPT", reader_tts.get("style_prompt", ""))
     reader_tts.pop("optimize_text_preview", None)
     config["google"]["endpoint"] = validate_google_translate_url(
@@ -2664,6 +2671,8 @@ def update_reader_tts_config(config, payload):
     settings["model"] = model if model in TTS_MODEL_OPTIONS else TTS_MODEL_OPTIONS[0]
     env_updates["MIMO_TTS_MODEL"] = settings["model"]
     settings["voice_id"] = clean_single_line_value(payload.get("voice_id", settings["voice_id"]))[:200]
+    if not settings["voice_id"] or settings["voice_id"] == "mimo_default":
+        settings["voice_id"] = "冰糖"
     env_updates["MIMO_TTS_VOICE"] = settings["voice_id"]
     settings["format"] = "m4a"
     settings["style_prompt"] = clean_single_line_value(payload.get("style_prompt", settings.get("style_prompt", "")))[:1000]
@@ -2701,7 +2710,7 @@ def update_nested_config(config, payload):
             target["base_url"],
             DEFAULT_CONFIG["deepseek"]["base_url"],
         )
-        target["model"] = clean_single_line_value(deepseek.get("model", target["model"]))[:200]
+        target["model"] = normalize_deepseek_model(clean_single_line_value(deepseek.get("model", target["model"]))[:200])
         env_updates["DEEPSEEK_MODEL"] = target["model"]
         target["temperature"] = parse_number(deepseek.get("temperature"), target["temperature"], 0, 2)
         thinking = deepseek.get("thinking", target["thinking"])
@@ -3748,7 +3757,7 @@ def tts_offline_book_status(book, settings, use_snapshot=True):
         ]
         chapters_seconds = time.perf_counter() - chapters_started
 
-        voice_id = settings.get("voice_id") or "mimo_default"
+        voice_id = settings.get("voice_id") or "冰糖"
         voice = next((item for item in TTS_VOICE_OPTIONS if item.get("id") == voice_id), None)
         status = {
             "profile_key": profile_key,
@@ -5074,7 +5083,7 @@ def request_mimo_tts(text, settings):
     messages.append({"role": "assistant", "content": text})
     audio = {
         "format": audio_format,
-        "voice": settings.get("voice_id", "mimo_default"),
+        "voice": settings.get("voice_id") or "冰糖",
     }
     body = {
         "model": model,

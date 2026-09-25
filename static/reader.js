@@ -107,14 +107,14 @@ const BOOK_DATE_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
   hour12: false,
 });
 const FONT_OPTIONS = [
-  { id: "system", name: "系统字体", family: '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "微软雅黑", Arial, sans-serif', reliableOnIOS: true },
-  { id: "kai", name: "楷体", family: 'KaiTi, "楷体", serif', reliableOnIOS: false },
   { id: "lxgw-wenkai", name: "霞鹜文楷", family: '"ReaderLXGWWenKai", "LXGW WenKai", "霞鹜文楷", KaiTi, "楷体", serif', reliableOnIOS: true },
   { id: "source-serif", name: "思源宋体", family: '"ReaderSourceHanSerif", "Source Han Serif CN", "思源宋体", SimSun, "宋体", serif', reliableOnIOS: true },
   { id: "source-sans", name: "思源黑体", family: '"ReaderSourceHanSans", "Source Han Sans CN", "思源黑体", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
   { id: "jason", name: "清松手写体", family: '"ReaderJasonHandwriting", "清松手写体", "JasonHandwriting", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
   { id: "yshi-written", name: "写意体", family: '"ReaderYShiWritten", "YShi-Written", "写意体", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
   { id: "peak-plus", name: "随峰体Plus", family: '"ReaderThePeakFontPlus", "The Peak Font Plus", "随峰体Plus", "隨峰體Plus", "Microsoft YaHei", sans-serif', reliableOnIOS: true },
+  { id: "system", name: "系统字体", family: '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "微软雅黑", Arial, sans-serif', reliableOnIOS: true },
+  { id: "kai", name: "楷体", family: '"ReaderKai", serif', reliableOnIOS: true },
 ];
 const FONT_FAMILIES = Object.fromEntries(FONT_OPTIONS.map((font) => [font.id, font.family]));
 const FONT_WEB_FAMILIES = {
@@ -168,8 +168,8 @@ function canAdjustMediaVolume() {
 }
 
 function availableFontOptions() {
-  if (!isIOSLike()) return FONT_OPTIONS;
-  return FONT_OPTIONS.filter((font) => font.reliableOnIOS);
+  return FONT_OPTIONS.filter((font) =>
+    (font.id !== "kai" || localKaiLoaded) && (!isIOSLike() || font.reliableOnIOS));
 }
 
 function normalizeFontId(fontId) {
@@ -3173,6 +3173,25 @@ async function pruneStoredReaderFonts() {
     .map((request) => cache.delete(request)));
 }
 
+let localKaiLoaded = false;
+let localKaiPromise;
+
+async function activateLocalKaiFont() {
+  if (!localKaiPromise) {
+    localKaiPromise = (async () => {
+      if (typeof FontFace !== "function" || !document.fonts?.add) return false;
+      const names = ["Kaiti SC", "Kaiti SC Regular", "STKaiti", "KaiTi", "楷体", "Kaiti TC", "Kaiti TC Regular"];
+      const face = new FontFace("ReaderKai",
+        names.map((name) => `local("${name}")`).join(", "), { style: "normal", weight: "400" });
+      await face.load();
+      document.fonts.add(face);
+      localKaiLoaded = true;
+      return true;
+    })().catch(() => false);
+  }
+  return localKaiPromise;
+}
+
 function setFontLoadState(fontId, state) {
   const status = document.querySelector(`.font-load-status[data-font="${fontId}"]`);
   const loadButton = document.querySelector(`.font-load-button[data-font="${fontId}"]`);
@@ -3306,7 +3325,8 @@ async function updateReaderFontFamily(fontId = "", announce = true, allowDownloa
   if (selectedButton) selectedButton.style.fontFamily = FONT_FAMILIES[value];
 }
 
-function refreshSelectedReaderFont() {
+async function refreshSelectedReaderFont() {
+  await activateLocalKaiFont();
   const value = normalizeFontId(window.localStorage.getItem("readerFontFamily") || "system");
   updateReaderFontFamily(value, false, false);
 }
@@ -3383,13 +3403,15 @@ function renderFontPicker() {
       return;
     }
     status.dataset.state = "ready";
-    status.textContent = "无需加载";
+    status.textContent = font.id === "kai" ? "本机楷体" : "无需加载";
+    button.style.fontFamily = font.family;
     card.appendChild(tools);
     picker.appendChild(card);
   });
 }
 
-function restoreReaderSettings() {
+async function restoreReaderSettings() {
+  await activateLocalKaiFont();
   const savedSize = window.localStorage.getItem("readerFontSize");
   if (savedSize) $("fontInput").value = savedSize;
   renderFontPicker();
@@ -4459,7 +4481,7 @@ function renderTtsConfig() {
   const modelOptions = config.model_options || [];
   const models = modelOptions.includes(config.model) ? modelOptions : [config.model, ...modelOptions].filter(Boolean);
   const modelLabels = {
-    "mimo-v2.5-tts": "mimo-v2.5-tts · 内置音色",
+    "mimo-v2.5-tts": "mimo-v2.5-tts · 预置音色",
   };
   models.forEach((model) => $("ttsModel").appendChild(selectOption(modelLabels[model] || model, model, model === config.model)));
   renderTtsVoiceOptions(config);
@@ -4477,22 +4499,27 @@ function renderTtsConfig() {
 function ttsVoicesForModel(config = readerState.ttsConfig || {}, model = "") {
   const selectedModel = model || $("ttsModel")?.value || config.model || "mimo-v2.5-tts";
   const allVoices = config.voice_options || [];
-  return allVoices.filter((voice) => (voice.models || []).includes(selectedModel));
+  return allVoices.filter((voice) => voice.id !== "mimo_default" && (voice.models || []).includes(selectedModel));
 }
 
 function voiceOptionLabel(voice) {
   return `${voice.name || voice.id} · ${voice.language || ""}${voice.gender ? ` ${voice.gender}` : ""}`.trim();
 }
 
+function selectedTtsVoiceId(config) {
+  return !config.voice_id || config.voice_id === "mimo_default" ? "冰糖" : config.voice_id;
+}
+
 function renderTtsVoiceOptions(config = readerState.ttsConfig || {}) {
   const voices = ttsVoicesForModel(config);
+  const selectedVoice = selectedTtsVoiceId(config);
   $("ttsVoiceId").innerHTML = "";
   $("ttsVoiceId").disabled = false;
   voices.forEach((voice) => {
-    $("ttsVoiceId").appendChild(selectOption(voiceOptionLabel(voice), voice.id, voice.id === config.voice_id));
+    $("ttsVoiceId").appendChild(selectOption(voiceOptionLabel(voice), voice.id, voice.id === selectedVoice));
   });
-  if (config.voice_id && !voices.some((voice) => voice.id === config.voice_id)) {
-    $("ttsVoiceId").appendChild(selectOption(config.voice_id, config.voice_id, true));
+  if (selectedVoice && !voices.some((voice) => voice.id === selectedVoice)) {
+    $("ttsVoiceId").appendChild(selectOption(selectedVoice, selectedVoice, true));
   }
 }
 
@@ -4501,11 +4528,12 @@ function renderQuickVoiceOptions(config = readerState.ttsConfig || {}) {
   if (!select) return;
   select.innerHTML = "";
   const voices = ttsVoicesForModel(config, config.model);
+  const selectedVoice = selectedTtsVoiceId(config);
   voices.forEach((voice) => {
-    select.appendChild(selectOption(voiceOptionLabel(voice), voice.id, voice.id === config.voice_id));
+    select.appendChild(selectOption(voiceOptionLabel(voice), voice.id, voice.id === selectedVoice));
   });
-  if (config.voice_id && !voices.some((voice) => voice.id === config.voice_id)) {
-    select.appendChild(selectOption(config.voice_id, config.voice_id, true));
+  if (selectedVoice && !voices.some((voice) => voice.id === selectedVoice)) {
+    select.appendChild(selectOption(selectedVoice, selectedVoice, true));
   }
   select.disabled = !ttsReady(config);
   resizeQuickVoiceSelect();
@@ -4601,7 +4629,7 @@ function persistedTtsConfigPayload(overrides = {}) {
     api_key: "",
     base_url: config.base_url || "",
     model: config.model || "mimo-v2.5-tts",
-    voice_id: config.voice_id || "mimo_default",
+    voice_id: selectedTtsVoiceId(config),
     style_prompt: config.style_prompt || "",
     chunk_chars: Number(config.chunk_chars || 260),
     cache_enabled: config.cache_enabled !== false,

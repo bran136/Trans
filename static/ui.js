@@ -1,4 +1,11 @@
 (() => {
+  // Limit the larger editable text to iPhone Safari; other browsers stay compact.
+  const browserAgent = navigator.userAgent;
+  const isIPhoneSafari = /iPhone/.test(browserAgent)
+    && /Version\/[\d.]+.*Safari\//.test(browserAgent)
+    && !/(?:CriOS|FxiOS|EdgiOS|OPiOS|DuckDuckGo|GSA)\//.test(browserAgent);
+  document.documentElement.classList.toggle("iphone-safari", isIPhoneSafari);
+
   // Show keyboard focus only after keyboard navigation, not dialog auto-focus.
   document.addEventListener("keydown", (event) => {
     if (event.key === "Tab") document.documentElement.classList.add("keyboard-navigation");

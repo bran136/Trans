@@ -1,3 +1,10 @@
+/* Keep mobile Safari text sizing consistent across layouts and rotation;
+   browser pinch zoom and reader font-size controls remain available. */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 /* Shared palette: page, nested panels and controls use the same theme. */
 :root {
   color-scheme: light;

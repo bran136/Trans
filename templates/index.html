@@ -91,32 +91,33 @@
       <form method="dialog" class="settings">
         <div class="dialog-head">
           <h2 tabindex="-1" autofocus>服务配置</h2>
+          <div id="configMessage" class="config-message" role="status" hidden></div>
           <div class="dialog-actions compact-actions">
             <button class="ghost" value="cancel" type="submit">取消</button>
             <button class="ghost" id="saveConfigBtn" type="button">保存配置</button>
           </div>
         </div>
-        <div id="configMessage" class="config-message" hidden></div>
         <div class="settings-groups">
           <section class="settings-group">
-            <h3>DeepSeek</h3>
+            <div class="settings-group-head">
+              <h3>DeepSeek</h3>
+              <label class="settings-enable"><input id="deepseekEnabled" type="checkbox" aria-label="启用 DeepSeek 翻译"> 启用</label>
+            </div>
             <div class="settings-grid">
-              <label>
+              <label class="settings-connection-field">
                 API Key
                 <input id="deepseekKey" type="password" autocomplete="off">
               </label>
-              <label>
-                Base URL
+              <label class="settings-connection-field">
+                接口地址
                 <input id="deepseekBaseUrl" type="url">
               </label>
               <label>
                 模型
                 <span class="select-chevron">
                   <select id="deepseekModel">
-                    <option value="deepseek-v4-flash">deepseek-v4-flash</option>
+                    <option value="deepseek-flash">deepseek-flash</option>
                     <option value="deepseek-v4-pro">deepseek-v4-pro</option>
-                    <option value="deepseek-chat">deepseek-chat</option>
-                    <option value="deepseek-reasoner">deepseek-reasoner</option>
                   </select>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 9.5 12 15l5.5-5.5"></path></svg>
                 </span>
@@ -129,7 +130,7 @@
                 </span>
               </label>
               <label>
-                <span class="label-row">Temperature
+                <span class="label-row">随机性
                   <details class="info-help">
                     <summary>!</summary>
                     <div>控制随机性，越低越稳定。翻译推荐 0.1 到 0.3，当前推荐 0.2。</div>
@@ -138,7 +139,7 @@
                 <input id="deepseekTemperature" type="number" min="0" max="2" step="0.1">
               </label>
               <label>
-                <span class="label-row">Thinking
+                <span class="label-row">思考模式
                   <details class="info-help">
                     <summary>!</summary>
                     <div>推理模式。普通翻译推荐 disabled，更快且结果更直接；复杂改写或术语判断再考虑 enabled。</div>
@@ -153,7 +154,7 @@
                 </span>
               </label>
               <label>
-                <span class="label-row">Reasoning Effort
+                <span class="label-row">推理强度
                   <details class="info-help">
                     <summary>!</summary>
                     <div>推理投入强度。翻译通常保持 medium 即可；追求速度可选 low，复杂长文可选 high。</div>
@@ -173,8 +174,7 @@
                 <input id="deepseekTimeout" type="number" min="5" max="120">
               </label>
             </div>
-            <div class="toggle-row deepseek-toggle-row">
-              <label><input id="deepseekEnabled" type="checkbox"> 启用 DeepSeek</label>
+            <div class="settings-group-footer">
               <div class="cache-setting-inline">
                 <span>缓存 <strong id="deepseekCacheStats">正在读取</strong></span>
                 <button class="ghost" id="clearCacheBtn" type="button">清空</button>
@@ -182,8 +182,11 @@
             </div>
           </section>
           <section class="settings-group">
-            <h3>谷歌翻译</h3>
-            <div class="settings-grid">
+            <div class="settings-group-head">
+              <h3>谷歌翻译</h3>
+              <label class="settings-enable"><input id="googleEnabled" type="checkbox" aria-label="启用谷歌翻译"> 启用</label>
+            </div>
+            <div class="settings-grid google-settings-grid">
               <label class="google-endpoint-field">
                 接口地址
                 <span class="google-endpoint-control">
@@ -198,9 +201,6 @@
                 超时秒数
                 <input id="googleTimeout" type="number" min="5" max="120">
               </label>
-            </div>
-            <div class="toggle-row">
-              <label><input id="googleEnabled" type="checkbox"> 启用谷歌翻译</label>
             </div>
           </section>
         </div>

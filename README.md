@@ -115,7 +115,7 @@ ALLOW_ROOT_RUN=true
 
 DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_MODEL=deepseek-flash
 ALLOW_CUSTOM_DEEPSEEK_BASE_URL=false
 
 MIMO_API_KEY=
@@ -288,7 +288,7 @@ GET /api/deepseek/balance
 内置字体选项包括：
 
 - 系统字体
-- 楷体
+- 楷体（仅在浏览器可调用本机楷体时显示）
 - 霞鹜文楷
 - 思源宋体
 - 思源黑体
@@ -331,9 +331,8 @@ https://mimo.xiaomi.com/mimo-v2-5-tts
 mimo-v2.5-tts
 ```
 
-当前内置音色选项：
+当前预置音色选项（默认冰糖；旧配置中的 `mimo_default` 按冰糖处理）：
 
-- MiMo-默认，自动
 - 冰糖，中文女声
 - 茉莉，中文女声
 - 苏打，中文男声

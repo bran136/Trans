@@ -2299,17 +2299,6 @@ body > .action-confirm-overlay {
   }
 }
 
-@supports (-webkit-touch-callout: none) {
-  @media (max-width: 760px) {
-    .reader-dialog input,
-    .reader-dialog select,
-    .reader-dialog textarea,
-    .listen-toolbar select {
-      font-size: 16px;
-    }
-  }
-}
-
 /* Reparse uses the same indeterminate indicator as book import. */
 .reparse-progress { height: 6px; }
 @media (prefers-reduced-motion: reduce) {

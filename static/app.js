@@ -23,10 +23,27 @@ const state = {
   resultPanelCollapsed: {},
   activeSentence: null,
   clearCacheConfirmFocus: null,
+  settingsScrollPosition: null,
 };
 
 const $ = (id) => document.getElementById(id);
 const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || "";
+
+function lockSettingsBackground() {
+  if (state.settingsScrollPosition) return;
+  state.settingsScrollPosition = { x: window.scrollX, y: window.scrollY };
+  document.body.style.setProperty("--settings-scroll-top", `${-window.scrollY}px`);
+  document.documentElement.classList.add("translation-settings-open");
+}
+
+function unlockSettingsBackground() {
+  if ($("settingsDialog").open || !state.settingsScrollPosition) return;
+  const { x, y } = state.settingsScrollPosition;
+  document.documentElement.classList.remove("translation-settings-open");
+  document.body.style.removeProperty("--settings-scroll-top");
+  state.settingsScrollPosition = null;
+  window.scrollTo({ left: x, top: y, behavior: "instant" });
+}
 
 function option(label, value, selected = false) {
   const el = document.createElement("option");
@@ -175,7 +192,8 @@ function renderConfig() {
   $("deepseekBaseUrl").value = c.deepseek.base_url;
   $("deepseekBaseUrl").disabled = !c.deepseek.allow_custom_base_url;
   $("deepseekBaseUrl").title = "服务端接口地址只能在服务器 .env 中修改";
-  $("deepseekModel").value = c.deepseek.model;
+  const legacyFlashModels = ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-chat", "deepseek-reasoner"];
+  $("deepseekModel").value = legacyFlashModels.includes(c.deepseek.model) ? "deepseek-flash" : c.deepseek.model;
   $("deepseekStyle").innerHTML = "";
   (c.deepseek_styles || []).forEach((style) => {
     $("deepseekStyle").appendChild(option(style.name, style.id, style.id === c.deepseek.style));
@@ -959,9 +977,11 @@ document.addEventListener("visibilitychange", refreshBalanceWhenVisible);
 $("settingsBtn").addEventListener("click", () => {
   clearConfigMessage();
   $("deepseekCacheStats").textContent = "正在读取";
+  lockSettingsBackground();
   $("settingsDialog").showModal();
   loadDeepSeekCacheStatus();
 });
+$("settingsDialog").addEventListener("close", unlockSettingsBackground);
 $("settingsDialog").addEventListener("click", (event) => {
   if (event.target.closest(".info-help")) return;
   document.querySelectorAll(".info-help[open]").forEach((help) => {

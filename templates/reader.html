@@ -198,14 +198,14 @@
             <button id="closeSettingsBtn" type="button">关闭</button>
           </div>
         </div>
-        <label class="setting-row">
-          字号 <span id="fontValue">18</span>
+        <label class="setting-row font-size-setting">
+          <span>字号 <span id="fontValue">18</span></span>
           <input id="fontInput" type="range" min="15" max="24" step="1" value="18">
         </label>
-        <label class="setting-row">
-          字体
+        <div class="setting-row">
+          <span>字体</span>
           <div id="fontPicker" class="font-picker" role="group" aria-label="选择阅读字体"></div>
-        </label>
+        </div>
       </section>
     </dialog>
 
@@ -213,13 +213,13 @@
       <section class="dialog-panel">
         <div class="dialog-head">
           <h2>听书</h2>
+          <div id="ttsConfigMessage" class="reader-config-message" role="status" hidden></div>
           <div class="dialog-actions">
             <button id="saveTtsConfigBtn" type="button">保存</button>
             <button id="closeTtsBtn" type="button">关闭</button>
           </div>
         </div>
         <section class="tts-config-panel">
-          <div id="ttsConfigMessage" class="reader-config-message" hidden></div>
           <div id="mimoBalancePanel" class="mimo-balance-panel" hidden>
             <div id="mimoBalance" class="mimo-balance"></div>
             <div class="mimo-balance-actions">
@@ -230,13 +230,13 @@
           </div>
           <label class="setting-check"><input id="ttsEnabled" type="checkbox"> 启用 Xiaomi MiMo 听书</label>
           <div class="tts-settings-grid">
-            <label>API Key
+            <label class="tts-connection-field">API Key
               <input id="ttsApiKey" type="password" autocomplete="off">
             </label>
-            <label>接口地址
+            <label class="tts-connection-field">接口地址
               <input id="ttsBaseUrl" type="url" disabled aria-disabled="true">
             </label>
-            <label>模型
+            <label class="tts-model-field">模型
               <select id="ttsModel"></select>
             </label>
             <label>音色
