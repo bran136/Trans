@@ -4,7 +4,7 @@
 
 <h1 align="center">Trans</h1>
 
-<p align="center">一个集在线翻译与在线读书于一体的本地工具网站</p>
+<p align="center">集在线翻译、阅读与听书于一体的自部署工具网站</p>
 
 <p align="center">
   <a href="https://github.com/bran136/Trans/releases/latest"><img src="https://img.shields.io/github/v/release/bran136/Trans?display_name=tag&amp;sort=semver&amp;label=%E7%89%88%E6%9C%AC" alt="最新版本"></a>
@@ -12,14 +12,15 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/bran136/Trans" alt="许可证"></a>
 </p>
 
-在线翻译支持 DeepSeek 服务端代理、谷歌翻译服务器优先与浏览器回退、多引擎对比、历史记录、服务监控、DeepSeek 余额显示和持久化缓存。
+在线翻译支持 DeepSeek 与谷歌翻译、结果对比、原文高亮、历史记录和翻译缓存；内含 PDF 翻译，支持中英互译、双语对照 PDF 和任务管理。
 
-在线读书支持本地书架、TXT/EPUB/PDF 导入、章节阅读、进度保存、字体切换、黑暗模式和 Xiaomi MiMo 听书。
+在线读书支持 TXT/EPUB/PDF 书架、目录与正文搜索、进度同步、字体切换、黑暗模式和电脑端 TXT 全文编辑，并提供 Xiaomi MiMo 听书及音频缓存。
 
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
   <a href="#环境配置">环境配置</a> ·
   <a href="#在线翻译">在线翻译</a> ·
+  <a href="#pdf-论文翻译">PDF 翻译</a> ·
   <a href="#在线读书">在线读书</a> ·
   <a href="#听书">听书</a> ·
   <a href="#安全说明">安全说明</a>
@@ -29,7 +30,9 @@
 
 - 密码登录，不提供注册和用户体系；输入密码后点击右箭头或按回车进入主页。
 - 登录后进入工具入口页，可选择“在线翻译”或“在线读书”。
-- 两个功能页面相互独立，只共用登录入口和登录态。
+- 翻译与读书使用独立页面，共用登录入口和登录态；PDF 翻译从在线翻译页打开。
+- 主页提供服务监控与关于页面，便于查看运行状态、功能介绍和项目链接。
+- 采用共享访问密码，书架、阅读进度和服务配置由登录用户共用；文本翻译历史和本机音频缓存保存在各自浏览器。
 - 提供站点图标和 Web App Manifest；支持的手机浏览器可将网站安装到桌面，以独立窗口打开。
 - 页面统一显示“正式版本 + 构建指纹”和 GitHub 入口，例如 `v1.5+a07a6f8b`；页面资源变化后指纹和资源 URL 会自动更新。
 - Session Cookie 默认有效期为 30 天。
@@ -60,12 +63,7 @@ ffmpeg -version
 ffprobe -version
 ```
 
-当前正式版本记录在根目录的 [`VERSION`](VERSION) 文件中，版本变更见 [`CHANGELOG.md`](CHANGELOG.md)。加号后的
-八位构建指纹由当前运行的后端和前端文件内容自动生成。日常修改 CSS、JavaScript、模板、
-图标或 Manifest 时不需要手动修改版本号：刷新页面后，指纹和静态资源 URL 会一起变化，
-可以直接确认新页面已经生效。只有准备新的正式 Release 时才更新 `VERSION`。修改 `VERSION` 或后端
-`app.py` 后仍需重启服务；后端指纹只在进程启动时确定，避免把尚未加载的后端代码显示为
-已经生效。
+正式版本见 [`VERSION`](VERSION)，更新记录见 [`CHANGELOG.md`](CHANGELOG.md)。页面版本附带八位构建指纹，前端资源变化后刷新即可更新指纹与资源地址。更新版本号或 Python 后端文件后需重启服务。
 
 默认地址：
 
@@ -78,28 +76,49 @@ http://127.0.0.1:31000
 主要入口：
 
 ```text
-/           工具选择页
-/login      登录页
-/translate  在线翻译
-/reader     在线读书
+/               主页
+/login          登录页
+/translate      在线翻译
+/translate/pdf  PDF 翻译（从在线翻译页进入）
+/reader         在线读书
 ```
 
 ## 目录
 
+以下路径均相对于项目根目录；运行数据首次使用时自动生成。
+
 ```text
-./path_dir/.env                    真实运行配置，包含密码和 API Key
-./path_dir/.env.example            示例配置，不放真实密钥
-./path_dir/config/service_config.example.json  服务接口示例配置，首次运行时用于生成实际配置
-./path_dir/config/service_config.json  服务接口默认值和备选列表，缺失时自动生成
-./path_dir/config/app_config.json  普通页面配置，缺失时自动生成，不保存真实 API Key
-./path_dir/config/deepseek_cache.sqlite3  DeepSeek 翻译持久化缓存
-./path_dir/config/mimo_balance_state.json  MiMo 余额、过期状态和白名单 Cookie（私有）
-./path_dir/logs/app.log            应用日志
-./path_dir/reader_data             书籍、章节缓存、TTS 音频缓存
-./path_dir/static/fonts            页面字体资产和许可说明
+app.py                            应用入口、在线翻译、阅读与听书
+reader_search.py                  书籍正文搜索与索引
+pdf_translation.py                PDF 翻译服务接入、任务与文件管理
+templates/                        页面模板
+static/                           页面样式、脚本、图标与字体
+scripts/migrate_wav_cache_to_m4a.py 旧音频缓存迁移工具
+VERSION / CHANGELOG.md            正式版本与更新记录
+requirements.txt / .env.example   依赖与环境配置示例
+.env                              访问密码、在线翻译与听书 API Key
+config/
+  service_config.example.json     服务接口配置示例
+  service_config.json             服务接口默认值和备选列表
+  app_config.json                 普通页面配置，不保存真实 API Key
+  secret_key                      自动生成的会话签名密钥
+  deepseek_cache.sqlite3          文本翻译缓存
+  mimo_balance_state.json         MiMo 余额、过期状态及余额 Cookie
+reader_data/
+  books.json                      书架索引
+  books/                          原书、章节、进度、搜索索引及 TXT 备份
+  tts_cache/                      单句音频缓存
+  tts_pack_cache/                 播放包缓存
+  tts_offline.sqlite3             服务器固定音频记录
+  tts_pack_index.sqlite3          播放包归属索引
+pdf_data/
+  config.json                    PDF 配置及独立 API Key（如已填写）
+  tasks.sqlite3                  PDF 任务记录
+  <任务ID>/                      各任务上传原文与翻译结果
+logs/app.log                      应用日志
 ```
 
-`reader_data/`、`.env`、DeepSeek 缓存和日志等运行数据已加入 `.gitignore`。
+`.env`、实际配置、书籍、PDF 文件、缓存和日志等私有运行数据已加入 `.gitignore`。迁移或备份时应一并保护这些文件，不要提交到公开仓库。
 
 ## 环境配置
 
@@ -115,7 +134,7 @@ ALLOW_ROOT_RUN=true
 
 DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_MODEL=deepseek-v4-flash
 ALLOW_CUSTOM_DEEPSEEK_BASE_URL=false
 
 MIMO_API_KEY=
@@ -136,7 +155,7 @@ TTS_CACHE_TTL_DAYS=90
 - `APP_PASSWORD` 至少使用 12 位非默认密码；程序会拒绝用示例密码或常见弱密码提供服务。
 - `SECRET_KEY` 留空时会自动生成到 `config/secret_key`，文件权限为 `0600`；也可以自己填写至少 32 位随机值。
 - `HOST` 控制服务监听地址：`127.0.0.1` 仅允许本机访问；`0.0.0.0` 会监听所有网络接口，只有确实需要从其他机器直连时才应使用。
-- 网页配置页提交新 API Key 后，服务端会写入 `.env`；前端只能看到“已配置”，不会拿到真实 Key。
+- 在线翻译和听书的 API Key 保存到 `.env`；PDF 独立配置的 Key 保存到 `pdf_data/config.json`。前端仅显示配置状态，留空保存不会覆盖原 Key。
 - 如果只通过 HTTPS 域名访问，建议设置 `SESSION_COOKIE_SECURE=true`。
 - 如果直接用 `http://服务器IP:31000` 调试，`SESSION_COOKIE_SECURE=true` 会导致浏览器不发送登录 Cookie。
 
@@ -152,6 +171,7 @@ TTS_CACHE_TTL_DAYS=90
 - 默认源语言为自动检测，默认目标语言为中文。
 - 当源语言手动设置为中文，或自动检测为中文时，目标语言自动推荐英语。
 - 可同时勾选 DeepSeek 和谷歌翻译。
+- DeepSeek 可设置模型、温度、思考参数和翻译风格，提供默认、学术翻译、文学创作、商务正式、通俗易懂五种风格。
 - 哪个翻译引擎先返回，哪个结果先显示，不等待最慢的引擎。
 - 默认展开前两个翻译结果。
 - 每个结果卡片支持折叠、展开和一键复制。
@@ -159,7 +179,21 @@ TTS_CACHE_TTL_DAYS=90
 - 折叠状态会在当前页面会话中保持，刷新后恢复默认。
 - 本地浏览器历史记录默认保留 100 条。
 
-## DeepSeek 配置和安全
+### PDF 论文翻译
+
+从在线翻译页的 **PDF** 按钮进入独立页面，支持英语与中文互译，默认英语 → 中文。可选择生成译文 PDF、左右对照 PDF（左原文、右译文），默认两种都生成。
+
+- 单文件上传、串行处理，正在进行与历史任务分标签展示，支持进度与详情查看、历史搜索、结果预览、下载和任务删除。关闭页面后仍在后台继续。
+- 使用 DeepSeek，模型及论文参数独立设置，可复用在线翻译的 API Key；不继承其翻译风格，使用上游内置提示词。默认关闭 OCR 兼容模式和表格文本翻译，禁用自动术语提取，字体自动，输出无水印。
+- 可设置思考强度（支持的模型）、请求速率（QPS）、单个 PDF 的并发 Worker 数、富文本样式和 PDF 兼容性。页面提供参数说明及服务连接检测；跳过末尾页数在上传区按任务设置，0 表示全文翻译。任务详情可查看创建时的配置。
+- 任务默认保留至手动删除，也可设置结束后的保留天数。排队任务可取消，已提交上游的任务暂不支持中途取消。待核对时可打开上游，确认未创建或已结束后取消本地跟踪；结束后的任务可删除。上游副本、缓存和日志需单独清理。
+- 上传连接中断或上游记录缺失时，任务可能进入“待核对”并暂停后续队列，不会自动重复提交。先通过“打开上游”核对：结果完整时选择“取回结果”，确认未创建或已结束且无需取回时选择“取消”。取消保留原文件，需要重新翻译时重新上传。
+
+首次使用需单独部署 [Zotero PDF2zh](https://github.com/guaguastandup/zotero-pdf2zh)，确保其 `pdf2zh_next` 引擎可用，并在服务配置中填写 Trans 服务器可访问的内网 IP 与端口。无需安装 Zotero 客户端；未部署该服务时，仅 PDF 翻译不可用。上传大小还受反向代理和上游服务限制。
+
+文档和密钥会交给配置的服务，待翻译文本发送至 DeepSeek，请仅接入可信服务并上传有权处理的文件。默认不翻译表格文本，不启用图片 OCR；具体识别范围与排版保留效果取决于上游分析。PDF 配置、任务和文件保存在 `pdf_data/`，已从 Git 排除。
+
+### DeepSeek 配置和安全
 
 默认：
 
@@ -167,7 +201,9 @@ TTS_CACHE_TTL_DAYS=90
 ALLOW_CUSTOM_DEEPSEEK_BASE_URL=false
 ```
 
-此时配置页中的 DeepSeek `Base URL` 会变灰且不可修改，只允许官方地址：
+以下设置用于在线文本翻译；PDF 翻译的 DeepSeek 使用官方接口，不继承文本翻译的自定义地址、模型或风格。
+
+配置页中的 DeepSeek `Base URL` 始终只读。默认只允许官方地址：
 
 ```text
 https://api.deepseek.com
@@ -183,16 +219,14 @@ ALLOW_CUSTOM_DEEPSEEK_BASE_URL=true
 
 开启后仍只接受 HTTPS，并拒绝本机、内网、保留地址等非公网地址。为避免浏览器用户改变携带 API Key 的服务端请求目的地，Base URL 只能在服务器 `.env` 中修改，网页中始终只读。
 
-## DeepSeek 缓存与费用
+### DeepSeek 缓存与费用
 
 在线翻译的“配置 → DeepSeek”会显示当前缓存条数和容量上限，并提供带二次确认的清空缓存按钮。
 
 服务端使用 SQLite 持久化缓存：
 
 - 缓存上限：500 条
-- 每条翻译完成后立即通过事务写入 `config/deepseek_cache.sqlite3`
-- 服务重启后会继续读取原缓存，不会因进程退出而清空
-- 多个 Gunicorn worker 共用同一个缓存文件
+- 缓存保存在 `config/deepseek_cache.sqlite3`，重启后仍可复用
 - 缓存按最近使用时间淘汰，超过 500 条时自动删除最久未使用的记录
 - DeepSeek 按非空段落缓存，不再按整篇原文缓存
 - 空白行不进入缓存，但展示结果会按原文换行结构拼回
@@ -203,20 +237,9 @@ ALLOW_CUSTOM_DEEPSEEK_BASE_URL=true
 
 缓存文件包含翻译结果，权限会收紧为 `0600`，其所在 `config/` 目录为 `0700`。缓存不会提交到 Git；如果翻译内容敏感，备份和迁移时也应按私人数据处理。可在“在线翻译 → 配置”中清空。
 
-缓存键包含：
+缓存按段落、语言、模型、温度、思考设置、翻译风格和提示词版本区分。参数一致时，追加新段落只需翻译新增内容；同一次请求中的重复段落也只翻译一次。此缓存用于在线文本翻译，PDF 翻译缓存由独立上游服务管理。
 
-- 非空段落文本
-- 源语言
-- 目标语言
-- 模型
-- temperature
-- thinking
-- reasoning effort
-- 翻译风格
-
-只要这些参数一致，同一段落就会命中本地缓存。比如在已有原文后追加新段落时，旧段落会直接读取缓存，只把新增段落发给 DeepSeek。重复段落在同一次请求中也只翻译一次。
-
-## DeepSeek 余额
+### DeepSeek 余额
 
 主界面翻译引擎里会显示 DeepSeek 余额和更新时间：
 
@@ -224,13 +247,7 @@ ALLOW_CUSTOM_DEEPSEEK_BASE_URL=true
 DeepSeek (¥xx.xx · 02:31)
 ```
 
-余额查询走后端代理：
-
-```text
-GET /api/deepseek/balance
-```
-
-前端不会获得 DeepSeek API Key。
+余额查询由后端代理，前端不会获得 DeepSeek API Key。
 
 刷新策略：
 
@@ -245,17 +262,7 @@ GET /api/deepseek/balance
 
 ## 在线读书
 
-路由：
-
-```text
-/reader
-```
-
-支持格式：
-
-- TXT
-- EPUB
-- PDF
+支持 TXT、EPUB 和带文本层的 PDF。
 
 导入和解析：
 
@@ -267,7 +274,7 @@ GET /api/deepseek/balance
 - TXT 会智能识别章节；书籍管理中可重新解析，TXT 还支持清除目录信息后作为全文阅读。
 - TXT 在新导入或主动重新解析时，会从文件名和正文开头的“作者：…”信息识别作者；书名和作者都可以在书籍管理中手动修改，手动作者不会被重新解析覆盖。
 - 书籍管理中的 TXT 目录支持改名、添加和删除；EPUB 目录来自书籍自身的 nav/spine，可在管理中查看但不直接改写，避免章节资源和图片引用错位。
-- PDF 使用 `pypdf>=6.14.2` 提取文本；该最低版本包含多项恶意 PDF 资源耗尽修复。扫描版 PDF 如果没有文本层，无法直接阅读。
+- PDF 提取文本供阅读，不保留原版式；扫描版没有文本层时无法直接阅读。阅读导入最多 5,000 页，总提取文本上限为 300 万字符。
 - MOBI/AZW3 暂未启用。
 
 阅读功能：
@@ -354,7 +361,7 @@ mimo-v2.5-tts
 - 当前朗读句子会实时高亮。
 - 可以暂停、停止、快速切换音色，并选择 0.8、1、1.2、1.5、2 倍速（默认 1 倍）。
 - 可以设置定时暂停，支持 5、10、15、30、45、60 分钟和自定义分钟数。
-- 定时暂停会等当前句读完；页面会实际检测当前浏览器能否修改媒体元素音量，支持时按当前倍速在结束前约 7 秒逐渐降低音量。iPhone Safari 通常锁定网页媒体音量，因此在句末直接暂停；Safari 26 已允许 iPadOS 网页修改媒体音量，能够通过检测时会自动启用渐弱。后台页面仍可能被系统限流并减少渐弱步数。
+- 定时暂停会等当前句读完；浏览器支持网页调节音量时，会在结束前渐弱，否则直接在句末暂停。后台效果受浏览器和系统调度影响。
 - 浏览器支持 Media Session 时，系统媒体界面会显示书名、章节和站点图标，并提供播放、暂停和停止控制。
 - 页面使用 Screen Wake Lock 尽量在前台朗读时保持屏幕常亮；定时暂停、手动暂停或停止后会立即释放。切到后台时浏览器会释放屏幕常亮限制。
 - 安装到桌面不会绕过系统省电策略，后台朗读仍受 iOS/Android 和浏览器的音频调度限制。
@@ -386,13 +393,13 @@ MiMo 余额显示：
 
 “服务器固定”会保留所需的单句语音和播放包，避免被普通缓存淘汰，不会重新调用 MiMo 生成另一份相同语音。达到门槛的单句包只保存索引并读取原 M4A，不重复存储音频。
 
-浏览器会在内存中预加载当前章节和下一章的播放包；“固定并下载到本地”则把完整播放包保存到 IndexedDB。升级到 IndexedDB v6 时会清除与新播放器不兼容的旧浏览器缓存，需要重新下载。
+浏览器会在内存中预加载当前章节和下一章的播放包；“固定并下载到本地”则把完整播放包保存到 IndexedDB。旧版单句缓存及 v6 之前的播放包不兼容，升级时会清除并需重新下载；当前本机缓存数据库为 v8。
 
 服务器磁盘缓存：
 
-- 单句目录：`./path_dir/reader_data/tts_cache`
-- 播放包目录：`./path_dir/reader_data/tts_pack_cache`
-- 播放包归属索引：`./path_dir/reader_data/tts_pack_index.sqlite3`。旧缓存首次使用时自动建索引，后续只读取新增目录文件；删除书籍按归属查找播放包，索引不可用时回退到原有扫描方式。
+- 单句目录：`reader_data/tts_cache`
+- 播放包目录：`reader_data/tts_pack_cache`
+- 播放包归属索引：`reader_data/tts_pack_index.sqlite3`。用于快速查找和清理书籍关联的播放包。
 - 示例配置上限：`TTS_CACHE_LIMIT_MB=8192`
 - 示例配置有效期：`TTS_CACHE_TTL_DAYS=90`
 - 未固定缓存按容量和有效期自动清理；固定缓存不会自动淘汰，取消固定后会清理不再引用的播放包。
@@ -429,11 +436,11 @@ IndexedDB 没有统一的固定保存天数：
 - 桌面 Chrome：普通窗口通常可长期保留；清除网站数据、删除浏览器配置或磁盘压力可能导致删除。无痕窗口关闭后删除。
 - Android Chrome：普通模式通常可长期保留；清除应用数据、卸载浏览器或系统存储压力会删除。无痕模式关闭后删除。
 - macOS Safari：没有固定期限；清除网站数据、长期未访问或磁盘压力可能触发回收。私人浏览关闭后删除。
-- iPhone/iPad Safari 和 Chrome：都使用 WebKit，系统回收通常更积极；清除网站数据、长期未使用、空间不足或删除主屏幕 Web App 都可能删除。私人浏览关闭后删除。
+- iPhone/iPad 浏览器与主屏幕 Web App：缓存可能因系统存储压力、清理网站数据或长期未使用而被回收，不应作为唯一副本。私人浏览的数据通常在会话结束后删除。
 
 ### WAV 缓存迁移
 
-1.1 及更早版本的服务端 WAV 缓存不会被 1.2 直接读取。旧用户若要继续复用这些缓存，必须先停止服务并执行转换；转换不需要重新调用 MiMo。建议首次保留源文件：
+当前版本不直接读取 1.1 及更早版本的服务端 WAV 缓存。旧用户若要继续复用这些缓存，必须先停止服务并执行转换；转换不需要重新调用 MiMo。建议首次保留源文件：
 
 ```bash
 cp -a reader_data reader_data.backup
@@ -442,7 +449,7 @@ python3 scripts/migrate_wav_cache_to_m4a.py --keep-source
 
 转换后启动服务并确认听书正常。确认无误后，再停止服务并运行一次不带 `--keep-source` 的命令，脚本会验证已有 M4A、更新离线引用并删除对应 WAV。转换失败的 WAV 会保留，脚本可以重复运行。
 
-旧浏览器 IndexedDB 中的单句 WAV 无法在本地可靠转换为 M4A 播放包，升级到 IndexedDB v6 时会自动清除旧单句和旧分包；服务器缓存转换完成后，在该浏览器重新执行“固定并下载到本地”即可。全新安装不需要运行迁移脚本，正常运行也不会持久化 WAV 文件；MiMo 上游仍以 WAV 返回音频，但只在服务端内存中短暂存在，随后立即转为 M4A。
+旧浏览器 IndexedDB 中的单句 WAV 无法在本地可靠转换为 M4A 播放包，从旧版本升级时会自动清除旧单句和 v6 之前的分包；服务器缓存转换完成后，在该浏览器重新执行“固定并下载到本地”即可。全新安装不需要运行迁移脚本，正常运行也不会持久化 WAV 文件；MiMo 上游仍以 WAV 返回音频，但只在服务端内存中短暂存在，随后立即转为 M4A。
 
 在 HTTPS 安全上下文且浏览器支持 Storage API 时，页面显示当前站点的估算用量、浏览器分配额度及持久化状态，例如 `本机存储 1.2 GB / 10.0 GB · 已持久化`；未获持久化授权时显示“可能被回收”。HTTP 下即使浏览器能提供容量估算，也不能申请持久化存储；完全无法估算时显示“HTTP 下无法查询本机容量”。下载前会尝试调用 `navigator.storage.persist()`，是否批准由浏览器决定，Safari 和 iOS 不保证批准。
 
@@ -472,53 +479,27 @@ python3 scripts/migrate_wav_cache_to_m4a.py --keep-source
 - 重启服务，带二次确认
 - 验证当前密码后修改总入口访问密码；新旧密码不能相同，修改后其他浏览器中的旧会话会失效
 
-监控刷新频率为 5 秒。只有打开监控弹窗时才会轮询 `/api/status`，关闭后停止刷新。
+监控刷新频率为 5 秒，仅在监控弹窗打开时自动刷新。重启后通过轻量接口确认新进程已恢复，再更新监控数据；90 秒内未确认恢复时会提示检查服务日志。
 
 ## 日志
 
-日志目录：
+应用日志保存在 `logs/app.log`，单文件约 2 MB，最多保留 5 个轮转备份。查看实时日志：
 
-```text
-./path_dir/logs
+```bash
+tail -f logs/app.log
 ```
 
-主日志文件：
-
-```text
-./path_dir/logs/app.log
-```
-
-实时查看日志可运行 `tail -f ./path_dir/logs/app.log`。
-
-日志采用滚动写入：
-
-- 单文件约 2MB
-- 最多保留 5 个备份
-
-主要记录：
-
-- 登录成功、失败、限速
-- 退出
-- 配置保存
-- DeepSeek 翻译成功/失败
-- MiMo TTS 成功/失败和缓存命中状态
-- 书籍导入、删除、重命名、重新解析
-- 缓存清空
-- 服务重启请求
-- 余额查询失败
-- 跨站写请求拦截
+记录登录与限速、配置更新、翻译和听书请求、书籍操作、缓存清理、服务重启及请求拦截等事件。排查问题时请先检查日志；向他人提供日志前应确认其中不含私人内容。
 
 ## 安全说明
 
 - 登录密码不会返回前端。
 - 修改总入口密码必须先验证当前密码，新旧密码不能相同；连续验证失败会触发限速。
-- API Key 保存到 `.env`。
+- 在线翻译与听书 API Key 保存到 `.env`；PDF 独立 Key 保存到 `pdf_data/config.json`。
 - MiMo 余额 Cookie 不从 `.env` 读取或写入，只保留四个白名单字段，与最后成功余额和过期状态一起保存在私有的 `config/mimo_balance_state.json` 中。
-- 浏览器配置页只允许提交新 Key。
-- 服务端不会把真实 Key 或已保存的余额 Cookie 返回给浏览器。
-- 配置页只显示“已配置，留空不修改”。
+- 服务端不向浏览器返回真实 Key 或已保存的余额 Cookie；配置页只显示状态，Key 留空不修改。
 - `.env` 写入会清洗换行，避免注入额外环境变量。
-- `.env`、应用密钥、MiMo 余额状态、DeepSeek 缓存、书籍和音频缓存文件使用私有权限；它们仍属于服务器敏感数据，不应公开、备份到不可信位置或提交到 Git。
+- `.env`、应用密钥、MiMo 余额状态、翻译缓存、PDF 配置与文件、书籍和音频缓存使用私有权限；它们仍属于服务器敏感数据，不应公开、备份到不可信位置或提交到 Git。
 - Session Cookie 设置了 `HttpOnly` 和 `SameSite=Lax`。
 - 可通过 `SESSION_COOKIE_SECURE=true` 强制会话 Cookie 仅在 HTTPS 下发送。
 - 登录失败带轻量限速：同一 IP 在 5 分钟内失败 8 次后会暂时拒绝继续尝试。
@@ -526,7 +507,6 @@ python3 scripts/migrate_wav_cache_to_m4a.py --keep-source
 - 所有写请求还必须携带会话内 CSRF token；只伪造表单或省略 `Origin` 无法绕过。
 - 响应头包含 CSP、HSTS、`X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: same-origin` 和收紧的 `Permissions-Policy`。
 - 登录页、功能页和 API 响应使用 `Cache-Control: no-store`，避免私人书籍和配置残留在共享缓存。
-- 修改访问密码后，其他浏览器中的旧登录 Cookie 会立即失效。
 - 监控接口只读取固定 `/proc` 信息和项目目录磁盘占用，不接受浏览器传路径。
 - 重启接口不通过 shell 拼接浏览器参数，但登录用户可以触发服务重启，因此密码必须足够强。
 - 书籍导入只写入 `reader_data/books/<book_id>`，`book_id` 限制为 32 位十六进制字符串。
@@ -534,13 +514,14 @@ python3 scripts/migrate_wav_cache_to_m4a.py --keep-source
 - EPUB 图片资源只允许读取书籍 EPUB 内部的图片文件，并限制单图大小。
 - EPUB 不执行书内脚本，只提取文本和图片。
 - DeepSeek 和 MiMo 的自定义接口地址默认关闭；即使在服务器开启，也会拒绝本机、内网、保留地址，不跟随上游重定向，并且浏览器无权修改地址，降低 SSRF 和 API Key 外泄风险。
-- EPUB 限制文件数、单文件大小和总解压大小；普通外部 `DOCTYPE` 会在解析前移除且不会访问外部 DTD，实体声明和内部 DTD 会被拒绝；PDF 限制页数和总提取文本量。
+- EPUB 限制文件数和解压大小，拒绝实体声明和内部 DTD，不请求外部 DTD；阅读导入的 PDF 限制页数和提取文本量。
+- PDF 翻译仅接入明确配置的内网、回环或 Tailscale IP 地址，不跟随重定向。该服务会收到文档和 DeepSeek Key，应独立保护其访问权限。
 
 如果通过公网访问本工具，必须在 Nginx、Caddy 或 Cloudflare 上配置 HTTPS，并设置 `SESSION_COOKIE_SECURE=true`。使用 Cloudflare 时应选择 `Full (strict)`，避免 Cloudflare 到源站之间退回明文 HTTP。浏览器请求里的密码不是客户端哈希值，而是由 HTTPS 连接加密传输；服务端 `.env` 仍属于必须保护的敏感文件。
 
 示例配置为了兼容当前部署，设置了 `ALLOW_ROOT_RUN=true`，因此允许服务由 root 启动。如果删除该配置或改为 `false`，程序会拒绝以 root 启动或处理请求。这个开关只是显式解除保护，并不能降低 root 服务被利用后的系统风险；公开部署仍建议使用单独低权限用户，并交给 systemd、gunicorn 或类似进程管理器管理。
 
-如果之前曾用 root 运行，切换用户前要把 `.env`、`config/`、`logs/` 和 `reader_data/` 的所有权交给新的服务用户；不要把整个系统目录开放成可写。例如服务用户叫 `trans` 时，可按实际存在的路径执行 `chown -R trans:trans ...`。书籍、缓存、配置和日志会使用尽量收紧的目录/文件权限。
+如果之前曾用 root 运行，切换用户前要把 `.env`、`config/`、`logs/`、`reader_data/` 和 `pdf_data/` 的所有权交给新的服务用户；不要把整个系统目录开放成可写。例如服务用户叫 `trans` 时，可按实际存在的路径执行 `chown -R trans:trans ...`。书籍、缓存、配置和日志会使用尽量收紧的目录/文件权限。
 
 生产环境示例（仍只监听本机，由 Nginx/Caddy 提供 HTTPS）：
 
@@ -550,21 +531,21 @@ python3 scripts/migrate_wav_cache_to_m4a.py --keep-source
 gunicorn --workers 1 --threads 6 --bind 127.0.0.1:31000 app:app
 ```
 
-也可以直接运行 `python3 app.py`，但这是 Flask 自带服务器，适合开发或单机临时使用。管理页面的“重启服务”会沿用当前启动方式：直启模式原地重启，Gunicorn 模式由 Gunicorn 自动替换 worker；不会改成另一种启动方式。
+也可以直接运行 `python3 app.py`，但这是 Flask 自带服务器，适合开发或单机临时使用。管理页面的“重启服务”会沿用当前启动方式：直接启动时创建替代进程，Gunicorn 模式由 Gunicorn 自动替换 worker；不会改成另一种启动方式。重启会中断当前请求，包括尚未完成的 PDF 上传；已被上游接收的 PDF 任务继续由独立服务处理，Trans 恢复后核对其状态，不会自动重复提交。
 
 ## 开发检查
 
 提交前可运行：
 
 ```bash
-python3 -m py_compile app.py reader_search.py scripts/migrate_wav_cache_to_m4a.py
-node --check static/reader.js  # 已安装 Node.js 时
+python3 -m py_compile app.py reader_search.py pdf_translation.py scripts/migrate_wav_cache_to_m4a.py
+for file in static/*.js; do node --check "$file"; done  # 需安装 Node.js
 python3 -m pip check
 ffmpeg -version
 ffprobe -version
 ```
 
-推送到 `master` 或向 `master` 提交 Pull Request 时，GitHub Actions 会在 Python 3.11、3.12 和 3.13 上安装依赖，检查 Python 与 JavaScript 语法、确认 FFmpeg 工具并导入应用。工作流见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
+推送到 `master` 或向 `master` 提交 Pull Request 时，GitHub Actions 会在 Python 3.11、3.12 和 3.13 上安装依赖，检查 Python 与 JavaScript 语法并导入应用。工作流见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
 
 ## 许可证
 
@@ -572,3 +553,9 @@ ffprobe -version
 - 如果修改后作为在线服务提供给用户使用，需要按 AGPL-3.0 向这些用户提供对应源码。
 - `static/fonts/` 中的字体不适用项目 AGPL；其版权和再分发条件见 [`FONT_LICENSES.md`](static/fonts/FONT_LICENSES.md) 与 [`OFL-1.1.txt`](static/fonts/OFL-1.1.txt)。
 - 外部贡献默认按 AGPL-3.0 许可进入本项目。
+
+## 致谢
+
+感谢 [Zotero PDF2zh](https://github.com/guaguastandup/zotero-pdf2zh)、[PDFMathTranslate-next](https://github.com/PDFMathTranslate-next/PDFMathTranslate-next) 和 [BabelDOC](https://github.com/funstory-ai/BabelDOC) 的作者与贡献者。PDF 翻译通过 HTTP 调用独立部署的 Zotero PDF2zh 服务，由后两者完成翻译与排版；Trans 不打包上述项目的代码。
+
+上述项目采用 AGPL-3.0，部署和分发时请遵守各自许可证，并参阅上游仓库的使用说明。

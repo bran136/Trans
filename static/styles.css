@@ -1198,7 +1198,8 @@ dialog::backdrop {
   display: inline-block;
 }
 
-.info-help summary {
+.info-help summary,
+.pdf-body .pdf-help {
   display: grid;
   place-items: center;
   width: 16px;

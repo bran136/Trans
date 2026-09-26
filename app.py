@@ -37,6 +37,7 @@ from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree
 
 import reader_search
+import pdf_translation
 import requests
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
@@ -91,8 +92,11 @@ def content_fingerprint(paths, length=12, seed=""):
 
 
 APP_VERSION = load_app_version()
-RUNTIME_BACKEND_FINGERPRINT = content_fingerprint((BASE_DIR / "app.py", BASE_DIR / "reader_search.py"), length=16)
+RUNTIME_BACKEND_FINGERPRINT = content_fingerprint((BASE_DIR / "app.py", BASE_DIR / "reader_search.py", BASE_DIR / "pdf_translation.py"), length=16)
 BUILD_VERSION_FILES = (
+    BASE_DIR / "templates" / "pdf_translation.html",
+    BASE_DIR / "static" / "pdf-translation.css",
+    BASE_DIR / "static" / "pdf-translation.js",
     BASE_DIR / "templates" / "home.html",
     BASE_DIR / "templates" / "index.html",
     BASE_DIR / "templates" / "login.html",
@@ -2772,6 +2776,9 @@ def reject_cross_site_writes():
         request.max_content_length = MAX_TXT_DELTA_BYTES if request.mimetype == TXT_DELTA_MIMETYPE else MAX_TXT_EDIT_REQUEST_BYTES
         if request.content_length is not None and request.content_length > request.max_content_length:
             return jsonify({"error": "全文保存请求过大，正文最多支持 50MB（UTF-8）"}), 413
+    elif request.path == "/api/pdf/jobs" and request.method == "POST":
+        # PDF uploads use their own request policy; other endpoints retain their limits.
+        pass
     elif request.path != "/api/books":
         if request.content_length is not None and request.content_length > MAX_JSON_REQUEST_BYTES:
             return jsonify({"error": "请求内容过大"}), 413
@@ -2784,7 +2791,7 @@ def reject_cross_site_writes():
         app.logger.warning("blocked cross-site write ip=%s referer=%s path=%s", request.remote_addr, referer, request.path)
         return jsonify({"error": "forbidden"}), 403
     supplied_token = request.headers.get("X-CSRF-Token", "")
-    if not supplied_token and request.path != "/api/books":
+    if not supplied_token and request.path not in {"/api/books", "/api/pdf/jobs"}:
         supplied_token = request.form.get("csrf_token", "")
     expected_token = csrf_token()
     if not supplied_token or not secrets.compare_digest(supplied_token, expected_token):
@@ -2814,7 +2821,7 @@ def add_security_headers(response):
     )
     if request.path.startswith("/static/fonts/") and request.args.get("v"):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-    elif request.path.startswith("/api/") or request.path in {"/", "/login", "/translate", "/reader"} or request.path.startswith("/reader/books/"):
+    elif request.path.startswith("/api/") or request.path in {"/", "/login", "/translate", "/translate/pdf", "/reader"} or request.path.startswith("/reader/books/"):
         response.headers.setdefault("Cache-Control", "no-store")
     if request.endpoint in {"api_book_text", "api_book_text_backup"} and response.status_code == 200 and not response.direct_passthrough:
         response.vary.add("Accept-Encoding")
@@ -7423,6 +7430,14 @@ def api_password():
         return jsonify({"error": str(exc)}), 400
 
 
+@app.route("/api/ready")
+def api_ready():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    # No cache scan or upstream request: only identify the responding process.
+    return jsonify({"pid": os.getpid(), "started": PROCESS_START_TIME})
+
+
 @app.route("/api/status")
 def api_status():
     if not require_auth():
@@ -7468,7 +7483,7 @@ def api_restart():
     RESTART_STATE["time"] = now
     app.logger.warning("restart requested ip=%s", request.remote_addr)
     restart_process_later()
-    return jsonify({"ok": True, "message": "服务正在重启"})
+    return jsonify({"ok": True, "message": "服务正在重启", "pid": os.getpid(), "started": PROCESS_START_TIME})
 
 
 @app.route("/api/deepseek/balance")
@@ -7526,6 +7541,9 @@ def api_translate():
     except Exception as exc:
         app.logger.warning("%s translate failed ip=%s error=%s", engine, request.remote_addr, exc)
         return jsonify({"error": str(exc)}), 502
+
+
+pdf_translation.install(app, BASE_DIR / "pdf_data", require_auth, load_config, LANGUAGES)
 
 
 if __name__ == "__main__":

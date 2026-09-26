@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f6f5f2"><meta name="csrf-token" content="{{ csrf_token() }}">
+<title>PDF 翻译</title>
+<link rel="icon" type="image/svg+xml" sizes="any" href="{{ asset_url('site-icon.svg') }}">
+<link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
+<link rel="stylesheet" href="{{ asset_url('theme.css') }}"><link rel="stylesheet" href="{{ asset_url('styles.css') }}">
+<link rel="stylesheet" href="{{ asset_url('ui.css') }}"><link rel="stylesheet" href="{{ asset_url('pdf-translation.css') }}">
+</head>
+<body class="app-body pdf-body">
+<div class="app-shell">
+<header class="topbar">
+<div class="pdf-brand"><h1 id="pdfTitle" class="brand-title" tabindex="-1" autofocus>PDF 翻译</h1><span id="connectionState" class="pdf-connection" role="status" data-state="checking">检测中</span></div>
+<div class="top-actions"><button class="ghost" id="settingsBtn" type="button">服务配置</button><button class="ghost" id="aboutBtn" type="button">关于</button></div>
+</header>
+<main class="pdf-layout">
+<section class="pdf-panel pdf-upload-panel">
+<div class="pdf-section-head"><h2>上传论文</h2><span class="pdf-tag">PDF</span></div>
+<form id="uploadForm">
+<label class="pdf-file-picker" id="dropZone">
+<svg class="pdf-file-icon" viewBox="0 0 48 56" fill="none" aria-hidden="true"><path d="M9 2h21l13 13v36a3 3 0 0 1-3 3H9a3 3 0 0 1-3-3V5a3 3 0 0 1 3-3Z"/><path d="M29 2v14h14M15 30h19M15 37h19M15 44h12"/></svg>
+<strong id="fileName">选择 PDF 文件</strong><span id="fileDetail">点击上传或拖放到这里</span>
+<input id="pdfFile" type="file" accept=".pdf,application/pdf" aria-label="选择 PDF 文件">
+</label>
+<div class="pdf-language-row">
+<label>原文语言<span class="select-chevron"><select id="sourceLang"><option value="en">英语</option><option value="zh">中文</option></select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span></label><span aria-hidden="true">→</span>
+<label>目标语言<span class="select-chevron"><select id="targetLang"><option value="zh">中文</option><option value="en">英语</option></select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span></label>
+</div>
+<div class="pdf-page-range"><label for="skip_last_pages">跳过末尾页数</label><input id="skip_last_pages" type="number" min="0" max="100000" step="1" value="0" required aria-describedby="skipPagesHint"><span id="skipPagesHint" class="pdf-field-hint">0 为全文翻译，可跳过参考文献</span></div>
+<fieldset class="pdf-outputs"><legend>产物</legend><label class="pdf-check"><input id="outputMono" type="checkbox" checked>译文 PDF</label><label class="pdf-check" title="左侧原文，右侧译文"><input id="outputDual" type="checkbox" checked>左右对照 PDF</label></fieldset>
+<p id="serviceState" class="pdf-note" hidden></p>
+<progress id="uploadProgress" max="100" hidden aria-label="上传进度"></progress>
+<button class="ghost pdf-submit" id="uploadBtn" type="submit" disabled>开始翻译</button>
+</form>
+</section>
+<section class="pdf-panel pdf-tasks-panel" aria-labelledby="historyTitle">
+<div class="pdf-section-head"><h2 id="historyTitle">任务列表</h2><button class="ghost" id="refreshBtn" type="button">刷新</button></div>
+<div class="pdf-task-tabs" role="tablist" aria-label="任务分组">
+<button class="ghost" id="activeTab" role="tab" aria-selected="true" aria-controls="activePanel" type="button">正在进行 <span id="activeCount">0</span></button>
+<button class="ghost" id="historyTab" role="tab" aria-selected="false" aria-controls="historyPanel" tabindex="-1" type="button">历史任务 <span id="historyCount">0</span></button>
+</div>
+<div id="jobs">
+<section id="activePanel" class="pdf-task-group" role="tabpanel" aria-labelledby="activeTab"><div id="activeJobs"></div></section>
+<section id="historyPanel" class="pdf-task-group pdf-history-group" role="tabpanel" aria-labelledby="historyTab" hidden>
+<div class="pdf-filters"><input id="searchJobs" type="search" placeholder="搜索文件名" aria-label="搜索历史任务" maxlength="120"><span class="select-chevron"><select id="statusFilter" aria-label="任务状态"><option value="">全部状态</option><option value="completed">已完成</option><option value="failed">翻译失败</option><option value="download_failed">获取失败</option><option value="cancelled">已取消</option><option value="interrupted">已结束</option></select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span></div>
+<div id="historyJobs"></div>
+<div class="pdf-pagination" id="pagination" hidden><button class="ghost" id="prevPage" type="button">上一页</button><span id="pageInfo"></span><button class="ghost" id="nextPage" type="button">下一页</button></div>
+</section>
+</div>
+</section>
+</main>
+</div>
+<p id="pageMessage" class="pdf-message" role="status" hidden></p>
+<dialog id="settingsDialog" class="pdf-dialog" aria-labelledby="settingsTitle">
+<form id="settingsForm">
+<div class="dialog-head pdf-dialog-head"><h2 id="settingsTitle" tabindex="-1" autofocus>服务配置</h2><p id="configMessage" class="config-message" role="status" hidden></p><div class="dialog-actions compact-actions"><button class="ghost" id="testService" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v9M6.4 5.8a8 8 0 1 0 11.2 0"/></svg>测试连接</button><button class="ghost" id="saveConfig" type="submit">保存</button><button class="ghost" id="closeSettings" type="button">关闭</button></div></div>
+<div class="pdf-settings-scroll">
+<section class="pdf-settings-group"><h3>PDF2zh 服务地址</h3>
+<label class="pdf-address">接口地址<input id="endpoint" type="url" placeholder="http://内网IP:端口" autocomplete="off" maxlength="300"></label>
+</section>
+<section class="pdf-settings-group"><div class="pdf-group-heading"><h3>DeepSeek 配置</h3><label class="pdf-check"><input id="reuse_deepseek" type="checkbox">沿用在线翻译 API Key</label></div>
+<p class="pdf-note" id="sharedConfigInfo"></p>
+<div id="ownCredentials" class="pdf-credentials" hidden><label>API Key<input id="api_key" type="password" autocomplete="new-password" maxlength="4096"></label></div>
+<div class="pdf-settings-grid">
+<label>模型<span class="select-chevron"><select id="model"><option value="deepseek-flash">deepseek-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option></select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span></label>
+<label for="reasoning"><span class="pdf-label-title">思考强度 <button type="button" class="pdf-help" aria-label="思考强度说明" data-help="关闭：更快，适合普通论文翻译。高／最高：开启思考并选择推理强度，可能增加耗时与费用，需要 pdf2zh_next 2.9.0 或以上。当前服务仅支持 Pro 模型的思考控制。">!</button></span><span class="select-chevron"><select id="reasoning"><option value="disabled">关闭</option><option value="high">高</option><option value="max">最高</option></select><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span></label>
+</div>
+</section>
+<section class="pdf-settings-group"><h3>论文翻译配置</h3>
+<div class="pdf-settings-grid">
+<label for="qps"><span class="pdf-label-title">最大 QPS <button type="button" class="pdf-help" aria-label="最大 QPS 说明" data-help="每秒最多发起多少次翻译请求。数值越高，API 请求越密集；过高可能触发限流。建议先使用 2。">!</button></span><input id="qps" type="number" min="1" max="1000" step="1" required></label>
+<label for="pool_size"><span class="pdf-label-title">最大并发 Worker 数 <button type="button" class="pdf-help" aria-label="最大并发 Worker 数说明" data-help="单个 PDF 内同时处理翻译请求的工作线程数，不是同时翻译的 PDF 数量。0 表示跟随 QPS；增大可能增加服务端内存及 API 并发。">!</button></span><input id="pool_size" type="number" min="0" max="1000" step="1" required></label>
+
+<label>任务保留天数<input id="retention_days" type="number" min="0" max="3650" step="1" required><span class="pdf-field-hint">0 为永久保留，支持手动删除</span></label>
+</div>
+<div class="pdf-settings-switches">
+<label class="pdf-check"><input id="no_watermark" type="checkbox">无水印模式</label>
+<label class="pdf-check"><input id="disable_glossary" type="checkbox">禁用自动术语提取</label>
+<label class="pdf-check" for="translate_table_text"><input id="translate_table_text" type="checkbox">翻译表格文本 <button type="button" class="pdf-help" aria-label="翻译表格文本说明" data-help="默认关闭。是否保留表格取决于上游版面识别；未识别为表格的文字仍可能被当作正文翻译，表格标题也可能单独翻译。">!</button></label>
+<label class="pdf-check" for="ocr"><input id="ocr" type="checkbox">OCR 兼容模式 <button type="button" class="pdf-help" aria-label="OCR 兼容模式说明" data-help="仅用于部分扫描 PDF 的排版兼容，不是图片文字识别。开启会给译文加白底，并改变原文字层的处理，可能影响公式和图表。普通带文本层的论文请保持关闭。">!</button></label>
+<label class="pdf-check" for="rich_text"><input id="rich_text" type="checkbox">保留富文本样式 <button type="button" class="pdf-help" aria-label="保留富文本样式说明" data-help="翻译时尽量保留段落内的加粗、斜体等字体样式。建议开启；若译文出现样式错位，可关闭后重新翻译。实际效果取决于原文与上游排版分析。">!</button></label>
+<label class="pdf-check" for="enhance_compatibility"><input id="enhance_compatibility" type="checkbox">增强 PDF 兼容性 <button type="button" class="pdf-help" aria-label="增强 PDF 兼容性说明" data-help="遇到部分阅读器显示异常时可开启，可能增加处理时间和输出文件大小。">!</button></label>
+</div>
+</section>
+</div>
+</form>
+<div id="pdfHelpPopup" class="pdf-help-popup" role="tooltip" hidden></div>
+</dialog>
+<dialog id="aboutDialog" class="pdf-dialog pdf-about" aria-labelledby="aboutTitle">
+<div class="dialog-head pdf-dialog-head"><h2 id="aboutTitle" tabindex="-1" autofocus>关于 PDF 翻译</h2><button class="ghost" id="closeAbout" type="button">关闭</button></div>
+<div class="pdf-settings-scroll">
+<section class="pdf-about-intro"><span class="pdf-about-mark" aria-hidden="true">PDF</span><div><h3>PDF 论文中英互译</h3><p>译文 PDF · 左右对照 PDF</p></div></section>
+<section class="pdf-settings-group"><h3>部署与使用</h3><p>连接独立部署的 Zotero PDF2zh 服务，填写内网地址与 DeepSeek API Key（可沿用在线翻译）。使用 pdf2zh_next 引擎，无需 Zotero 客户端。</p><p>任务串行执行，关闭页面后继续处理。结果可预览、下载、删除或按保留天数清理。</p><p>尽量保留原文排版；公式、表格及图中文字的处理取决于文档和上游引擎，请核对重要内容。</p></section>
+<section class="pdf-settings-group"><h3>文件与隐私</h3><p>原文 PDF 与 DeepSeek API Key 会发送至所配置的服务，待翻译文本由该服务提交至 DeepSeek。请使用可信服务，仅上传有权处理的文档。</p><p>已提交上游的任务暂不支持中途取消。删除仅清理 Trans 保存的原文与结果，并移除任务列表中的记录；上游副本需另行清理。</p></section>
+<section class="pdf-settings-group"><h3>开源致谢</h3><div class="pdf-credit-links"><a href="https://github.com/guaguastandup/zotero-pdf2zh" target="_blank" rel="noopener noreferrer">Zotero PDF2zh</a><a href="https://github.com/PDFMathTranslate-next/PDFMathTranslate-next" target="_blank" rel="noopener noreferrer">PDFMathTranslate-next</a><a href="https://github.com/funstory-ai/BabelDOC" target="_blank" rel="noopener noreferrer">BabelDOC</a></div><p>感谢以上项目的作者与贡献者。Trans 通过 HTTP 调用独立服务，不打包上游代码；翻译与排版由 PDFMathTranslate-next 和 BabelDOC 完成。</p><p>以上项目采用 AGPL-3.0，部署与分发时请遵守各自许可证。</p></section>
+</div>
+</dialog>
+<dialog id="confirmDialog" class="pdf-confirm" aria-labelledby="confirmTitle"><form method="dialog"><h2 id="confirmTitle" tabindex="-1" autofocus></h2><p id="confirmText"></p><div class="pdf-dialog-actions"><button class="ghost" value="cancel">取消</button><button class="ghost" value="confirm">确认</button></div></form></dialog>
+    <div class="version-badge app-version">
+      <span>v{{ app_version() }}</span>
+      <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">
+        <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
+      </a>
+    </div>
+<script src="{{ asset_url('ui.js') }}"></script><script src="{{ asset_url('font-cache.js') }}"></script><script src="{{ asset_url('pdf-translation.js') }}"></script>
+</body></html>

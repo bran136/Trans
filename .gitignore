@@ -12,3 +12,4 @@ logs/*.log
 logs/*.log.*
 nohup.out
 reader_data/
+pdf_data/

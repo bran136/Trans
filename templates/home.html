@@ -22,6 +22,7 @@
         </div>
         <div class="home-actions">
           <button class="ghost" id="monitorBtn" type="button">监控</button>
+          <button class="ghost" id="aboutBtn" type="button">关于</button>
           <button class="ghost" id="logoutBtn" type="button">退出</button>
         </div>
       </header>
@@ -71,6 +72,21 @@
         </div>
       </footer>
     </main>
+
+    <dialog id="homeAboutDialog" class="home-about-dialog" aria-labelledby="homeAboutTitle">
+      <div class="home-about-head"><h2 id="homeAboutTitle" tabindex="-1" autofocus>关于 Trans</h2><button class="ghost" id="closeAboutBtn" type="button">关闭</button></div>
+      <div class="home-about-content">
+        <div class="home-about-brand"><img src="{{ asset_url('site-icon.svg') }}" alt="" aria-hidden="true"><div><strong>Trans</strong><span>v{{ app_version() }}</span></div></div>
+        <p class="home-about-intro">面向电脑与手机的自部署工具，集在线翻译、阅读与听书于一体。</p>
+        <dl class="home-about-features">
+          <div><dt>在线翻译</dt><dd>支持 DeepSeek 与谷歌翻译，提供双引擎对比、原文高亮与历史记录。内含 PDF 中英互译，可管理任务、预览和下载译文及左右对照 PDF。</dd></div>
+          <div><dt>在线读书</dt><dd>支持导入 TXT、EPUB 与 PDF，提供书架管理、目录与正文搜索、阅读进度同步及外观设置。电脑端支持 TXT 全文编辑。</dd></div>
+          <div><dt>听书</dt><dd>通过 Xiaomi MiMo 朗读正文，支持多种音色、倍速播放、定时暂停和音频缓存。</dd></div>
+        </dl>
+        <p class="home-about-note">DeepSeek 翻译与 MiMo 听书需配置对应的大模型服务；谷歌翻译无需 API Key。PDF 翻译另需连接独立部署的 Zotero PDF2zh 服务。</p>
+        <div class="home-about-links"><a href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer">GitHub 项目</a><a href="https://github.com/bran136/Trans/blob/master/CHANGELOG.md" target="_blank" rel="noopener noreferrer">更新日志</a><a href="https://github.com/bran136/Trans/blob/master/LICENSE" target="_blank" rel="noopener noreferrer">AGPL-3.0</a></div>
+      </div>
+    </dialog>
 
     <dialog id="monitorDialog">
       <section class="monitor-panel">

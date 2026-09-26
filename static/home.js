@@ -4,19 +4,28 @@ let monitorTimer = null;
 const $ = (id) => document.getElementById(id);
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.method && !["GET", "HEAD"].includes(options.method.toUpperCase()) ? { "X-CSRF-Token": csrfToken } : {}),
-      ...(options.headers || {}),
-    },
-    ...options,
-  });
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || `请求失败：${response.status}`);
-  }
-  return response.json();
+  const { timeout = 12000, ...requestOptions } = options;
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(path, {
+      ...requestOptions,
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.method && !["GET", "HEAD"].includes(options.method.toUpperCase()) ? { "X-CSRF-Token": csrfToken } : {}),
+        ...(options.headers || {}),
+      },
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || `请求失败：${response.status}`);
+    }
+    return await response.json();
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("请求超时，请稍后刷新状态");
+    throw error;
+  } finally { window.clearTimeout(timer); }
 }
 
 function formatBytes(bytes) {
@@ -112,18 +121,27 @@ async function restartService() {
   $("restartConfirmDialog").close();
   $("restartServiceBtn").disabled = true;
   try {
-    await api("/api/restart", { method: "POST", body: "{}" });
-    setMonitorMessage("服务正在重启，稍后自动刷新状态", "success");
+    const previous = await api("/api/restart", { method: "POST", body: "{}" });
+    setMonitorMessage("服务正在重启，恢复后自动刷新状态", "success");
     stopMonitorRefresh();
+    const deadline = Date.now() + 90000;
     window.setTimeout(async function poll() {
-      if (await loadServiceStatus(false)) {
-        setMonitorMessage("服务已恢复", "success");
+      try {
+        const ready = await api("/api/ready", { timeout: 2500 });
+        if (ready.pid !== previous.pid || ready.started !== previous.started) {
+          setMonitorMessage("服务已恢复", "success");
+          $("restartServiceBtn").disabled = false;
+          if ($("monitorDialog").open) startMonitorRefresh();
+          return;
+        }
+      } catch (_) { /* The listener can be unavailable while the process restarts. */ }
+      if (Date.now() >= deadline) {
+        setMonitorMessage("尚未确认服务恢复，请刷新页面或检查服务日志", "error");
         $("restartServiceBtn").disabled = false;
-        startMonitorRefresh();
         return;
       }
       window.setTimeout(poll, 1000);
-    }, 1200);
+    }, 600);
   } catch (error) {
     setMonitorMessage(`重启失败：${error.message}`, "error");
     $("restartServiceBtn").disabled = false;
@@ -199,4 +217,19 @@ $("logoutBtn").addEventListener("click", async () => {
   } catch (error) {
     await window.TransUI.message("退出失败", error.message);
   }
+});
+
+let aboutScrollY = 0;
+$("aboutBtn").addEventListener("click", () => {
+  aboutScrollY = window.scrollY;
+  document.body.style.setProperty("--about-scroll-top", `${-aboutScrollY}px`);
+  document.documentElement.classList.add("home-about-open");
+  $("homeAboutDialog").showModal();
+  $("homeAboutTitle").focus({ preventScroll: true });
+});
+$("closeAboutBtn").addEventListener("click", () => $("homeAboutDialog").close());
+$("homeAboutDialog").addEventListener("close", () => {
+  document.documentElement.classList.remove("home-about-open");
+  document.body.style.removeProperty("--about-scroll-top");
+  window.scrollTo(0, aboutScrollY);
 });
