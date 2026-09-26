@@ -276,7 +276,12 @@ GET /api/deepseek/balance
 - 书籍管理按导入时间由新到旧排序。
 - 支持编辑书名和作者、删除书籍、重新解析书籍。
 - 保存当前章节和句子进度。
-- 支持目录跳转、上一章、下一章。
+- 支持目录跳转、上一章、下一章；点击章节标题可筛选目录，或切换到“正文”搜索并跳转到匹配位置。首次正文搜索需要稍等片刻。
+- 书架和书籍管理支持搜索书名、作者。
+- 电脑端可在“管理 → 编辑 → 编辑 TXT 全文”中修改原文，支持章节导航、查找替换、修改高亮及逐条撤销。
+- Ctrl / ⌘ + S 仅保存原文；点击“保存并解析”后才更新阅读内容和目录。读写使用压缩传输，保存时只上传差异，节省流量。
+- 同一本书同时只能在一个页面编辑，退出后释放；异常退出后最多等待 5 分钟即可重新进入。
+- 自动保留最近一次修改前的原文备份，可下载、删除或载入恢复。备份在下次修改并保存时覆盖，删除书籍时一并删除。
 - 支持字体大小、字体切换和黑暗模式。
 - 自定义字体使用 WOFF2 并按需加载，不会在页面启动时下载全部字体。
 - 字体设置显示加载状态并支持手动加载；已下载字体保存在浏览器 Cache Storage 中。
@@ -552,7 +557,7 @@ gunicorn --workers 1 --threads 6 --bind 127.0.0.1:31000 app:app
 提交前可运行：
 
 ```bash
-python3 -m py_compile app.py scripts/migrate_wav_cache_to_m4a.py
+python3 -m py_compile app.py reader_search.py scripts/migrate_wav_cache_to_m4a.py
 node --check static/reader.js  # 已安装 Node.js 时
 python3 -m pip check
 ffmpeg -version

@@ -1,4 +1,8 @@
 import json
+import copy
+import gzip
+import zlib
+import fcntl
 import logging
 import hashlib
 import hmac
@@ -19,6 +23,7 @@ import threading
 import time
 import uuid
 import zipfile
+from functools import wraps
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -31,6 +36,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree
 
+import reader_search
 import requests
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
@@ -85,7 +91,7 @@ def content_fingerprint(paths, length=12, seed=""):
 
 
 APP_VERSION = load_app_version()
-RUNTIME_BACKEND_FINGERPRINT = content_fingerprint((BASE_DIR / "app.py",), length=16)
+RUNTIME_BACKEND_FINGERPRINT = content_fingerprint((BASE_DIR / "app.py", BASE_DIR / "reader_search.py"), length=16)
 BUILD_VERSION_FILES = (
     BASE_DIR / "templates" / "home.html",
     BASE_DIR / "templates" / "index.html",
@@ -102,6 +108,11 @@ BUILD_VERSION_FILES = (
     BASE_DIR / "static" / "reader.css",
     BASE_DIR / "static" / "reader-theme.js",
     BASE_DIR / "static" / "reader.js",
+    BASE_DIR / "static" / "reader-tools.js",
+    BASE_DIR / "static" / "reader-tools.css",
+    BASE_DIR / "static" / "txt-editor.js",
+    BASE_DIR / "static" / "txt-delta-worker.js",
+    BASE_DIR / "templates" / "txt_editor.html",
     BASE_DIR / "static" / "site-icon.svg",
     BASE_DIR / "static" / "site.webmanifest",
     BASE_DIR / "static" / "media-artwork.png",
@@ -115,6 +126,10 @@ DEEPSEEK_TRANSLATION_PROMPT_VERSION = 4
 DEEPSEEK_BATCH_MAX_CHARS = 5000
 DEEPSEEK_BATCH_MAX_SEGMENTS = 30
 MAX_BOOK_UPLOAD_BYTES = 50 * 1024 * 1024
+# JSON can encode each source byte as a six-byte Unicode escape.
+MAX_TXT_EDIT_REQUEST_BYTES = MAX_BOOK_UPLOAD_BYTES * 6 + 64 * 1024
+MAX_TXT_DELTA_BYTES = MAX_BOOK_UPLOAD_BYTES * 2 + 1024 * 1024
+TXT_DELTA_MIMETYPE = "application/vnd.trans.txt-delta+json"
 MAX_BOOK_TEXT_CHARS = 3_000_000
 MAX_EPUB_UNCOMPRESSED_BYTES = 80 * 1024 * 1024
 MAX_EPUB_ENTRY_BYTES = 12 * 1024 * 1024
@@ -988,12 +1003,115 @@ def book_tts_sentence_index_path(book_id):
     return book_dir(book_id) / "tts_sentence_counts.json"
 
 
-def read_book_record(book_id):
+# Per-process, bounded snapshots. Callers always receive independent mutable data.
+BOOK_RECORD_CACHE = OrderedDict()
+BOOK_SUMMARY_CACHE = OrderedDict()
+BOOK_RECORD_CACHE_BYTES = 32 * 1024 * 1024
+BOOK_RECORD_CACHE_COUNT = 8
+BOOK_SUMMARY_CACHE_COUNT = 256
+
+
+def book_file_signature(stat):
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def forget_book_record(book_id):
+    BOOK_RECORD_CACHE.pop(book_id, None)
+    BOOK_SUMMARY_CACHE.pop(book_id, None)
+
+
+def book_record_memory_size(book):
+    # JSON containers and strings only. Stop counting once the cache budget is exceeded.
+    pending, seen, size = [book], set(), 0
+    while pending:
+        value = pending.pop()
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        size += sys.getsizeof(value)
+        if size > BOOK_RECORD_CACHE_BYTES:
+            break
+        if isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    return size
+
+
+def read_book_base(book_id, summary_only=False):
+    # Must be called under READER_IO_LOCK. Atomic file replacement and stat checks
+    # also invalidate snapshots written by another server process.
     path = book_record_path(book_id)
+    try:
+        signature = book_file_signature(path.stat())
+    except FileNotFoundError:
+        forget_book_record(book_id)
+        raise FileNotFoundError("书籍不存在") from None
+    cache = BOOK_SUMMARY_CACHE if summary_only else BOOK_RECORD_CACHE
+    entry = cache.get(book_id)
+    if entry and entry[0] == signature:
+        cache.move_to_end(book_id)
+        return entry[1]
+    with path.open(encoding="utf-8") as handle:
+        signature = book_file_signature(os.fstat(handle.fileno()))
+        book = json.load(handle)
+    summary = book_summary(book)
+    BOOK_SUMMARY_CACHE[book_id] = (signature, summary)
+    BOOK_SUMMARY_CACHE.move_to_end(book_id)
+    while len(BOOK_SUMMARY_CACHE) > BOOK_SUMMARY_CACHE_COUNT:
+        BOOK_SUMMARY_CACHE.popitem(last=False)
+    BOOK_RECORD_CACHE.pop(book_id, None)
+    weight = book_record_memory_size(book)
+    if weight <= BOOK_RECORD_CACHE_BYTES:
+        BOOK_RECORD_CACHE[book_id] = (signature, book, weight)
+        while (len(BOOK_RECORD_CACHE) > BOOK_RECORD_CACHE_COUNT
+               or sum(item[2] for item in BOOK_RECORD_CACHE.values()) > BOOK_RECORD_CACHE_BYTES):
+            BOOK_RECORD_CACHE.popitem(last=False)
+    return summary if summary_only else book
+
+
+def apply_book_progress(book):
+    try:
+        saved = json.loads((book_dir(book["id"]) / "progress.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeError):
+        return book
+    if not isinstance(saved, dict) or saved.get("content_revision", "") != book.get("content_revision", ""):
+        return book
+    progress = saved.get("progress")
+    if (not isinstance(progress, dict)
+            or any(type(progress.get(key)) is not int or progress[key] < 0 for key in ("chapter", "sentence"))):
+        return book
+    count = book.get("chapter_count", len(book.get("chapters", [])))
+    if progress["chapter"] >= max(1, count):
+        return book
+    book["progress"] = dict(progress)
+    for key in ("updated_at", "last_opened_at"):
+        value = saved.get(key)
+        if type(value) in (int, float) and value >= 0:
+            book[key] = max(book.get(key) or 0, value)
+    return book
+
+
+def read_book_record(book_id):
     with READER_IO_LOCK:
-        if not path.exists():
-            raise FileNotFoundError("书籍不存在")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return apply_book_progress(copy.deepcopy(read_book_base(book_id)))
+
+
+def read_book_summary(book_id):
+    with READER_IO_LOCK:
+        return apply_book_progress(copy.deepcopy(read_book_base(book_id, summary_only=True)))
+
+
+def write_book_progress(summary):
+    # The caller holds the book's write lock; content changes get a new revision.
+    write_json_atomic(book_dir(summary["id"]) / "progress.json", {
+        "content_revision": summary.get("content_revision", ""),
+        "progress": summary.get("progress") or {"chapter": 0, "sentence": 0},
+        "updated_at": summary.get("updated_at", 0),
+        "last_opened_at": summary.get("last_opened_at", 0),
+    })
 
 
 def write_book_record(book):
@@ -1002,6 +1120,7 @@ def write_book_record(book):
         target_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         os.chmod(target_dir, 0o700)
         write_json_atomic(book_record_path(book["id"]), book)
+        forget_book_record(book["id"])
 
 
 def book_summary(book):
@@ -1012,6 +1131,8 @@ def book_summary(book):
         "title": book.get("title") or "未命名书籍",
         "author": book.get("author") or "",
         "format": book.get("format") or "",
+        "content_revision": book.get("content_revision", ""),
+        "txt_pending_parse": bool(book.get("txt_pending_parse")),
         "cover_url": f"/api/books/{book['id']}/cover" if book.get("cover_name") else "",
         "created_at": book.get("created_at", 0),
         "updated_at": book.get("updated_at", 0),
@@ -1051,7 +1172,7 @@ def rebuild_book_index():
         summaries = []
         for path in READER_BOOK_DIR.glob("*/book.json"):
             try:
-                summaries.append(book_summary(json.loads(path.read_text(encoding="utf-8"))))
+                summaries.append(read_book_summary(path.parent.name))
             except (OSError, json.JSONDecodeError, KeyError):
                 continue
         summaries.sort(key=lambda item: (item.get("last_opened_at", 0), item.get("created_at", 0)), reverse=True)
@@ -1067,6 +1188,8 @@ def load_book_index_or_rebuild():
     index_ids = {str(book["id"]) for book in books}
     if record_ids != index_ids or len(books) != len(index_ids):
         return rebuild_book_index()
+    for book in books:
+        apply_book_progress(book)
     books.sort(key=lambda item: (item.get("last_opened_at", 0), item.get("created_at", 0)), reverse=True)
     return books
 
@@ -1953,6 +2076,118 @@ def save_epub_cover(path, book_id, cover):
     return cover_name
 
 
+TXT_EDIT_LEASE_SECONDS = 300
+
+
+def read_txt_edit_lease(book_id):
+    path = book_dir(book_id) / ".editor-lease.json"
+    try:
+        lease = json.loads(path.read_text())
+        if lease.get("expires", 0) > time.time():
+            return lease
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def owns_txt_edit_lease(book_id):
+    lease = read_txt_edit_lease(book_id)
+    token = request.headers.get("X-Editor-Token", "")
+    return bool(lease and token and secrets.compare_digest(lease["token"], token))
+
+
+def editor_lock_error():
+    return jsonify({"error": "本书正在其他页面编辑，或本页编辑锁已过期。请退出后重新打开", "code": "editor_lock_lost"}), 423
+
+
+def serialize_book_write(view):
+    @wraps(view)
+    def wrapped(book_id, *args, **kwargs):
+        if request.method == "GET" and view.__name__ != "api_book_detail":
+            return view(book_id, *args, **kwargs)
+        if not require_auth():
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            directory = book_dir(book_id)
+            if not directory.exists():
+                raise FileNotFoundError("书籍不存在")
+            with (directory / ".text-edit.lock").open("a+b") as lock:
+                os.chmod(lock.name, 0o600)
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return jsonify({"error": "书籍正在更新，请稍后重试"}), 409
+                if view.__name__ != "api_txt_edit_lease":
+                    lease = read_txt_edit_lease(book_id)
+                    if view.__name__ in {"api_book_text", "api_book_text_backup"}:
+                        if not owns_txt_edit_lease(book_id):
+                            return editor_lock_error()
+                    elif view.__name__ not in {"api_book_progress", "api_book_detail"} and lease:
+                        return jsonify({"error": "本书正在全文编辑，请退出编辑页面后再操作"}), 423
+                    if view.__name__ in {"api_book_clear_toc", "api_txt_chapter_title_update", "api_txt_chapter_title_delete", "api_txt_chapter_split"} and read_book_record(book_id).get("txt_pending_parse"):
+                        return jsonify({"error": "原文有尚未解析的修改，请先重新解析书籍"}), 409
+                result = view(book_id, *args, **kwargs)
+                if view.__name__ in {"api_book_text", "api_book_text_backup"}:
+                    try:
+                        if owns_txt_edit_lease(book_id):
+                            lease = read_txt_edit_lease(book_id)
+                            lease["expires"] = time.time() + TXT_EDIT_LEASE_SECONDS
+                            write_json_atomic(directory / ".editor-lease.json", lease)
+                    except OSError:
+                        # A failed renewal must not turn a committed save into an error.
+                        app.logger.warning("editor lease renewal failed book=%s", book_id)
+                return result
+        except FileNotFoundError:
+            return jsonify({"error": "书籍不存在"}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+    return wrapped
+
+
+def invalidate_book_search(book):
+    token = uuid.uuid4().hex
+    write_private_text_atomic(book_dir(book["id"]) / "search-revision", token)
+    book["content_revision"] = token
+
+
+def search_chapter_paragraphs(book, chapter_index):
+    # Do not materialize all EPUB chapters or rewrite book.json while indexing.
+    chapter = book["chapters"][chapter_index]
+    if book.get("format") == "epub" and chapter.get("href"):
+        chapter = parse_epub_chapter_content(
+            book_dir(book["id"]) / book["stored_name"], chapter["href"],
+            chapter.get("fragment", ""), chapter.get("end_fragment", ""))
+    blocks = chapter.get("blocks") or []
+    paragraphs = [block.get("text", "").strip() for block in blocks if block.get("type") == "text"]
+    if not paragraphs and not blocks:
+        paragraphs = fallback_display_paragraphs(book, chapter.get("text", ""))
+    for paragraph in paragraphs:
+        if paragraph:
+            sentences, cursor = [], 0
+            for sentence in split_sentences(paragraph):
+                offset = paragraph.find(sentence, cursor)
+                if offset < 0:
+                    sentences.append(sentence)
+                else:
+                    end = offset + len(sentence)
+                    sentences.append(paragraph[cursor:end])
+                    cursor = end
+            yield sentences
+
+
+def txt_source_snapshot(book_id):
+    book = read_book_record(book_id)
+    if book.get("format") != "txt":
+        raise ValueError("全文编辑仅支持 TXT 书籍")
+    name = book.get("stored_name", "")
+    if not name or Path(name).name != name:
+        raise ValueError("书籍源文件缺失")
+    path = book_dir(book_id) / name
+    raw = path.read_bytes()
+    token = hashlib.sha256(raw + reader_search.revision(book_dir(book_id)).encode()).hexdigest()
+    return book, path, raw, token
+
+
 def reparse_book_record(book_id):
     book = read_book_record(book_id)
     stored_name = book.get("stored_name")
@@ -1985,6 +2220,8 @@ def reparse_book_record(book_id):
         "progress": progress,
         "chapters": parsed["chapters"],
     }
+    updated.pop("txt_pending_parse", None)
+    invalidate_book_search(updated)
     write_book_record(updated)
     upsert_book_index(updated)
     return updated
@@ -2025,6 +2262,7 @@ def clear_txt_book_toc(book_id):
             "char_count": len(text),
         }],
     }
+    invalidate_book_search(updated)
     write_book_record(updated)
     upsert_book_index(updated)
     return updated
@@ -2059,6 +2297,7 @@ def update_txt_chapter_title(book_id, chapter_index, title):
     chapters[chapter_index]["char_count"] = len(chapters[chapter_index].get("text", ""))
     book["chapters"] = reindex_chapters(chapters)
     book["updated_at"] = int(time.time())
+    invalidate_book_search(book)
     write_book_record(book)
     upsert_book_index(book)
     return book
@@ -2088,6 +2327,7 @@ def delete_txt_chapter_title(book_id, chapter_index):
     book["progress"] = progress
     book["chapters"] = reindex_chapters(chapters)
     book["updated_at"] = int(time.time())
+    invalidate_book_search(book)
     write_book_record(book)
     upsert_book_index(book)
     return book
@@ -2145,6 +2385,7 @@ def split_txt_chapter_at_line(book_id, chapter_index, line_index, title=""):
         })
     book["chapters"] = reindex_chapters(chapters)
     book["updated_at"] = int(time.time())
+    invalidate_book_search(book)
     write_book_record(book)
     upsert_book_index(book)
     return book
@@ -2174,6 +2415,7 @@ def refresh_epub_chapter_metadata(book):
     book["progress"] = progress
     book["metadata_version"] = CHAPTER_CACHE_VERSION
     book["updated_at"] = int(time.time())
+    invalidate_book_search(book)
     write_book_record(book)
     upsert_book_index(book)
     delete_tts_offline_refs(book["id"])
@@ -2526,7 +2768,11 @@ def reject_cross_site_writes():
             return jsonify({"error": "服务拒绝使用默认或弱密码，请先配置至少 12 位的 APP_PASSWORD"}), 503
     if request.method in {"GET", "HEAD", "OPTIONS"}:
         return None
-    if request.path != "/api/books":
+    if request.endpoint == "api_book_text" and request.method == "PUT":
+        request.max_content_length = MAX_TXT_DELTA_BYTES if request.mimetype == TXT_DELTA_MIMETYPE else MAX_TXT_EDIT_REQUEST_BYTES
+        if request.content_length is not None and request.content_length > request.max_content_length:
+            return jsonify({"error": "全文保存请求过大，正文最多支持 50MB（UTF-8）"}), 413
+    elif request.path != "/api/books":
         if request.content_length is not None and request.content_length > MAX_JSON_REQUEST_BYTES:
             return jsonify({"error": "请求内容过大"}), 413
     origin = request.headers.get("Origin")
@@ -2568,8 +2814,17 @@ def add_security_headers(response):
     )
     if request.path.startswith("/static/fonts/") and request.args.get("v"):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-    elif request.path.startswith("/api/") or request.path in {"/", "/login", "/translate", "/reader"}:
+    elif request.path.startswith("/api/") or request.path in {"/", "/login", "/translate", "/reader"} or request.path.startswith("/reader/books/"):
         response.headers.setdefault("Cache-Control", "no-store")
+    if request.endpoint in {"api_book_text", "api_book_text_backup"} and response.status_code == 200 and not response.direct_passthrough:
+        response.vary.add("Accept-Encoding")
+        if request.accept_encodings["gzip"] > 0 and "Content-Encoding" not in response.headers:
+            raw = response.get_data()
+            if len(raw) >= 1024:
+                packed = gzip.compress(raw, compresslevel=1, mtime=0)
+                if len(packed) < len(raw):
+                    response.set_data(packed)
+                    response.headers["Content-Encoding"] = "gzip"
     return response
 
 
@@ -5828,7 +6083,11 @@ def translate_google(text, source, target, config):
         raise RuntimeError("谷歌翻译返回内容不是 JSON") from exc
     translated = ""
     detected_source = ""
-    if isinstance(data, list) and data and isinstance(data[0], list):
+    if isinstance(data, list) and data and isinstance(data[0], str):
+        # The /t endpoint omits detection metadata when sl is explicit.
+        translated = data[0].strip()
+        detected_source = source if source != "auto" else ""
+    elif isinstance(data, list) and data and isinstance(data[0], list):
         first = data[0]
         if first and isinstance(first[0], str):
             translated = first[0].strip()
@@ -6463,7 +6722,295 @@ def api_books_upload():
         return jsonify({"error": str(exc)}), 400
 
 
+@app.route("/api/books/<book_id>/search-index", methods=["POST"])
+def api_book_search_index(book_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        directory = book_dir(book_id)
+        if not book_record_path(book_id).exists():
+            raise FileNotFoundError("书籍不存在")
+        reader_search.start_index(directory, READER_DIR, lambda: read_book_record(book_id),
+                                  search_chapter_paragraphs, app.logger)
+        return jsonify({"ok": True}), 202
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except (ValueError, OSError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/books/<book_id>/search")
+def api_book_search(book_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        directory = book_dir(book_id)
+        if not book_record_path(book_id).exists():
+            raise FileNotFoundError("书籍不存在")
+        query = request.args.get("q", "").strip()
+        if not 2 <= len(query) <= 80 or "\x00" in query:
+            raise ValueError("请输入 2–80 个字符")
+        cursor = min(2**63 - 1, max(0, int(request.args.get("cursor", "0"))))
+        if reader_search.ready(directory):
+            result = reader_search.search(directory, query, cursor)
+            if result is not None:
+                if cursor and request.args.get("revision") != result["revision"]:
+                    return jsonify({"error": "书籍内容已更新，请重新搜索"}), 409
+                return jsonify(result)
+        status_path = directory / "search-status.json"
+        status = json.loads(status_path.read_text()) if status_path.exists() else {"status": "waiting"}
+        # A completed index can be stale after editing; request a rebuild.
+        if status.get("status") == "ready":
+            status = {"status": "waiting"}
+        return jsonify(status), 202
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except (ValueError, OSError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except sqlite3.Error:
+        return jsonify({"error": "本次搜索用时过长，请输入更具体的关键词"}), 503
+
+
+@app.route("/reader/books/<book_id>/edit")
+def txt_editor_page(book_id):
+    if not require_auth():
+        return redirect(url_for("login"))
+    try:
+        book = read_book_record(book_id)
+        if book.get("format") != "txt":
+            return "全文编辑仅支持 TXT 书籍", 400
+        return render_template("txt_editor.html", book_id=book_id)
+    except (FileNotFoundError, ValueError):
+        return "书籍不存在", 404
+
+
+@app.route("/api/books/<book_id>/edit-lease", methods=["POST"])
+@serialize_book_write
+def api_txt_edit_lease(book_id):
+    payload = request_json_object() if request.is_json else request.form
+    token = payload.get("token", "")
+    action = payload.get("action", "")
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
+        return jsonify({"error": "编辑会话无效"}), 400
+    if action == "acquire" and read_book_record(book_id).get("format") != "txt":
+        return jsonify({"error": "全文编辑仅支持 TXT"}), 400
+    lease = read_txt_edit_lease(book_id)
+    own = bool(lease and secrets.compare_digest(lease["token"], token))
+    path = book_dir(book_id) / ".editor-lease.json"
+    if action == "release":
+        if own:
+            path.unlink(missing_ok=True)
+        return jsonify({"ok": True})
+    if action not in {"acquire", "renew"}:
+        return jsonify({"error": "编辑会话操作无效"}), 400
+    if (lease and not own) or (action == "renew" and not own):
+        return editor_lock_error()
+    write_json_atomic(path, {"token": token, "expires": time.time() + TXT_EDIT_LEASE_SECONDS})
+    return jsonify({"ok": True, "expires_in": TXT_EDIT_LEASE_SECONDS})
+
+
+def txt_editor_chapters(book):
+    chapters = []
+    for chapter in book.get("chapters", []):
+        first_line = re.search(r"\S[^\r\n]*", chapter.get("text", ""))
+        chapters.append({"title": chapter["title"], "anchor": first_line.group().strip() if first_line else ""})
+    return chapters
+
+
+def txt_backup_info(book_id):
+    try:
+        stamp = (book_dir(book_id) / ".source-before-edit").stat().st_mtime
+        return {"has_backup": True, "backup_time": stamp}
+    except FileNotFoundError:
+        return {"has_backup": False, "backup_time": None}
+
+
+@app.route("/api/books/<book_id>/text-backup", methods=["GET", "DELETE"])
+@serialize_book_write
+def api_book_text_backup(book_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        with READER_IO_LOCK:
+            book = read_book_record(book_id)
+            if book.get("format") != "txt":
+                raise ValueError("全文编辑仅支持 TXT")
+            if request.method == "DELETE":
+                (book_dir(book_id) / ".source-before-edit").unlink(missing_ok=True)
+                return jsonify({"ok": True, **txt_backup_info(book_id)})
+            raw = (book_dir(book_id) / ".source-before-edit").read_bytes()
+        if request.args.get("download") == "1":
+            return send_file(BytesIO(raw), mimetype="text/plain", as_attachment=True,
+                             download_name="book-before-edit.txt", max_age=0)
+        text = decode_text_bytes(raw)
+        return jsonify({"text": text, "chapters": txt_editor_chapters({"chapters": split_plain_chapters(text)}), **txt_backup_info(book_id)})
+    except FileNotFoundError:
+        return jsonify({"error": "没有可恢复的原文备份"}), 404
+    except (ValueError, OSError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+def read_txt_edit_payload():
+    if request.mimetype != TXT_DELTA_MIMETYPE:
+        if request.headers.get("Content-Encoding", "identity").lower() != "identity":
+            raise ValueError("不支持的正文传输编码")
+        return request_json_object(), False
+    if request.headers.get("Content-Encoding", "").lower() != "gzip":
+        raise ValueError("差异上传必须使用 gzip 压缩")
+    try:
+        with gzip.GzipFile(fileobj=BytesIO(request.get_data()), mode="rb") as stream:
+            raw = stream.read(MAX_TXT_DELTA_BYTES + 1)
+        if len(raw) > MAX_TXT_DELTA_BYTES:
+            raise ValueError("解压后的修改数据过大")
+        payload = json.loads(raw)
+    except (OSError, EOFError, zlib.error, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("修改数据损坏，请重新保存") from exc
+    if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1:
+        raise ValueError("不支持的差异格式")
+    return payload, True
+
+
+def apply_txt_delta(previous, payload):
+    # Textareas normalize CRLF/CR to LF before editing. Offsets refer to UTF-8 bytes.
+    base = decode_text_bytes(previous).replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+    size, ops = payload.get("size"), payload.get("ops")
+    if type(size) is not int or not 0 < size <= MAX_BOOK_UPLOAD_BYTES:
+        raise ValueError("正文大小无效或超过 50MB")
+    if not isinstance(ops, list) or not 0 < len(ops) <= 500000:
+        raise ValueError("修改片段数量无效")
+    result = bytearray()
+    for operation in ops:
+        if not isinstance(operation, dict) or len(operation) != 1:
+            raise ValueError("修改片段格式无效")
+        if "copy" in operation:
+            span = operation["copy"]
+            if not isinstance(span, list) or len(span) != 2 or any(type(n) is not int for n in span):
+                raise ValueError("原文引用无效")
+            start, length = span
+            if start < 0 or length <= 0 or start + length > len(base) or len(result) + length > size:
+                raise ValueError("原文引用超出范围")
+            result.extend(memoryview(base)[start:start + length])
+        elif "insert" in operation:
+            value = operation["insert"]
+            if not isinstance(value, str) or len(value) > ((size - len(result) + 2) // 3) * 4:
+                raise ValueError("新增文字超出范围")
+            try:
+                inserted = base64.b64decode(value, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise ValueError("新增文字编码无效") from exc
+            if len(result) + len(inserted) > size:
+                raise ValueError("新增文字超出范围")
+            result.extend(inserted)
+        else:
+            raise ValueError("未知的修改片段")
+    if len(result) != size:
+        raise ValueError("还原后的正文大小不一致")
+    try:
+        return result.decode("utf-8")
+    except UnicodeError as exc:
+        raise ValueError("还原后的正文编码无效") from exc
+
+
+@app.route("/api/books/<book_id>/text", methods=["GET", "PUT"])
+@serialize_book_write
+def api_book_text(book_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        if request.method == "GET":
+            if not owns_txt_edit_lease(book_id):
+                return editor_lock_error()
+            book, path, raw, token = txt_source_snapshot(book_id)
+            return jsonify({"title": book["title"], "text": decode_text_bytes(raw), "revision": token,
+                            "max_chars": MAX_BOOK_UPLOAD_BYTES, "max_bytes": MAX_BOOK_UPLOAD_BYTES, "chapters": txt_editor_chapters(book),
+                            **txt_backup_info(book_id),
+                            "pending_parse": bool(book.get("txt_pending_parse"))})
+        payload, is_delta = read_txt_edit_payload()
+        parse = payload.get("parse", True)
+        if type(parse) is not bool:
+            raise ValueError("解析选项无效")
+        # Serialize editors across workers; no API keys or runtime data enter the editor.
+        directory = book_dir(book_id)
+        if not directory.exists():
+            raise FileNotFoundError("书籍不存在")
+        with TTS_OFFLINE_JOB_LOCK, READER_IO_LOCK:
+            if active_tts_offline_job_for_book(book_id):
+                return jsonify({"error": "该书正在生成离线缓存，请等待任务完成后保存"}), 409
+            book, source, previous, token = txt_source_snapshot(book_id)
+            if payload.get("revision") != token:
+                return jsonify({"error": "书籍已被其他页面修改，请先保留当前文字，再重新加载"}), 409
+            text = (decode_text_bytes(previous) if payload.get("reparse_current") is True and not is_delta
+                    else apply_txt_delta(previous, payload) if is_delta else payload.get("text"))
+            if not isinstance(text, str) or not text.strip() or "\x00" in text:
+                raise ValueError("正文不能为空或包含空字符")
+            if len(text.encode("utf-8")) > MAX_BOOK_UPLOAD_BYTES:
+                raise ValueError("正文超过 50MB，未保存任何修改")
+            fd, name = tempfile.mkstemp(suffix=".txt", prefix=".editing-", dir=directory)
+            os.close(fd)
+            staged = Path(name)
+            try:
+                staged.write_text(text, encoding="utf-8")
+                source_changed = text != decode_text_bytes(previous)
+                updated = {**book, "updated_at": int(time.time())}
+                if parse:
+                    parsed = parse_book_file(staged, book.get("original_name") or source.name)
+                    old_chapter = int((book.get("progress") or {}).get("chapter") or 0)
+                    old_title = next((c.get("title") for i, c in enumerate(book["chapters"]) if i == old_chapter), "")
+                    position = next((i for i, c in enumerate(parsed["chapters"]) if c["title"] == old_title),
+                                    min(old_chapter, len(parsed["chapters"]) - 1))
+                    updated.update({"chapters": parsed["chapters"], "lazy": False,
+                                    "metadata_version": CHAPTER_CACHE_VERSION,
+                                    "progress": {"chapter": max(0, position), "sentence": 0}})
+                    updated.pop("txt_pending_parse", None)
+                    if not book.get("author_manually_set"):
+                        updated["author"] = parsed.get("author", "")
+                elif source_changed:
+                    updated["txt_pending_parse"] = True
+                backup = directory / ".source-before-edit"
+                old_backup_stat = backup.stat() if source_changed and backup.exists() else None
+                old_backup = backup.read_bytes() if old_backup_stat else None
+                try:
+                    if source_changed:
+                        write_private_bytes_atomic(backup, previous)
+                    if parse:
+                        delete_tts_offline_refs(book_id)
+                        invalidate_book_search(updated)
+                    os.replace(staged, source)
+                    write_book_record(updated)
+                    upsert_book_index(updated)
+                except Exception:
+                    write_private_bytes_atomic(source, previous)
+                    write_book_record(book)
+                    upsert_book_index(book)
+                    write_private_text_atomic(directory / "search-revision", book.get("content_revision") or "original")
+                    if source_changed:
+                        if old_backup is None:
+                            backup.unlink(missing_ok=True)
+                        else:
+                            write_private_bytes_atomic(backup, old_backup)
+                            os.utime(backup, ns=(old_backup_stat.st_atime_ns, old_backup_stat.st_mtime_ns))
+                    raise
+                if parse:
+                    shutil.rmtree(book_chapter_cache_dir(book_id), ignore_errors=True)
+                    try:
+                        book_tts_sentence_index_path(book_id).unlink(missing_ok=True)
+                    except OSError:
+                        app.logger.warning("stale sentence index cleanup failed book=%s", book_id)
+                new_token = hashlib.sha256(source.read_bytes() + reader_search.revision(directory).encode()).hexdigest()
+                app.logger.info("txt full text saved ip=%s book=%s", request.remote_addr, book_id)
+                return jsonify({"ok": True, "book": book_summary(updated), "revision": new_token,
+                                "chapters": txt_editor_chapters(updated), **txt_backup_info(book_id),
+                                "pending_parse": bool(updated.get("txt_pending_parse")), "parsed": parse})
+            finally:
+                staged.unlink(missing_ok=True)
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except (ValueError, OSError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
 @app.route("/api/books/<book_id>")
+@serialize_book_write
 def api_book_detail(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
@@ -6482,18 +7029,18 @@ def api_book_detail(book_id):
                         "job": active,
                     }), 409
                 book = refresh_epub_chapter_metadata(book)
-        if request.args.get("inspect") != "1":
+        if request.args.get("inspect") != "1" and not read_txt_edit_lease(book_id) and not book.get("txt_pending_parse"):
             now = int(time.time())
             book["last_opened_at"] = now
             book["updated_at"] = max(int(book.get("updated_at") or 0), now)
-            write_book_record(book)
-            upsert_book_index(book)
+            write_book_progress(book_summary(book))
         return jsonify({"book": book_summary(book), "chapters": book_chapter_summaries(book)})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 404
 
 
 @app.route("/api/books/<book_id>", methods=["PATCH"])
+@serialize_book_write
 def api_book_update(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
@@ -6531,6 +7078,7 @@ def api_book_update(book_id):
 
 
 @app.route("/api/books/<book_id>/reparse", methods=["POST"])
+@serialize_book_write
 def api_book_reparse(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
@@ -6554,6 +7102,7 @@ def api_book_reparse(book_id):
 
 
 @app.route("/api/books/<book_id>/clear-toc", methods=["POST"])
+@serialize_book_write
 def api_book_clear_toc(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
@@ -6640,6 +7189,7 @@ def api_book_chapter(book_id, chapter_index):
 
 
 @app.route("/api/books/<book_id>/chapters/<int:chapter_index>/title", methods=["PATCH"])
+@serialize_book_write
 def api_txt_chapter_title_update(book_id, chapter_index):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
@@ -6654,6 +7204,7 @@ def api_txt_chapter_title_update(book_id, chapter_index):
 
 
 @app.route("/api/books/<book_id>/chapters/<int:chapter_index>/title", methods=["DELETE"])
+@serialize_book_write
 def api_txt_chapter_title_delete(book_id, chapter_index):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
@@ -6703,6 +7254,7 @@ def api_txt_chapter_lines(book_id, chapter_index):
 
 
 @app.route("/api/books/<book_id>/chapters/<int:chapter_index>/split", methods=["POST"])
+@serialize_book_write
 def api_txt_chapter_split(book_id, chapter_index):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
@@ -6742,29 +7294,32 @@ def api_txt_chapter_split(book_id, chapter_index):
 
 
 @app.route("/api/books/<book_id>/progress", methods=["PUT"])
+@serialize_book_write
 def api_book_progress(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     payload = request_json_object()
     try:
         with READER_IO_LOCK:
-            book = read_book_record(book_id)
+            book = read_book_summary(book_id)
+            if "content_revision" in payload and payload["content_revision"] != book.get("content_revision", ""):
+                return jsonify({"error": "书籍正文或目录已更新，请重新打开本书"}), 409
             chapter = int(payload.get("chapter", 0))
             sentence = int(payload.get("sentence", 0))
-            chapter = max(0, min(chapter, max(len(book.get("chapters", [])) - 1, 0)))
+            chapter = max(0, min(chapter, max(book["chapter_count"] - 1, 0)))
             sentence = max(0, sentence)
             now = int(time.time())
             book["progress"] = {"chapter": chapter, "sentence": sentence}
             book["updated_at"] = now
             book["last_opened_at"] = now
-            write_book_record(book)
-            upsert_book_index(book)
-        return jsonify({"ok": True, "book": book_summary(book)})
+            write_book_progress(book)
+        return jsonify({"ok": True, "book": book})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/books/<book_id>", methods=["DELETE"])
+@serialize_book_write
 def api_book_delete(book_id):
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
@@ -6787,6 +7342,7 @@ def api_book_delete(book_id):
             removed = delete_tts_offline_refs(book_id, delete_files=True)
             cleanup_seconds = time.perf_counter() - cleanup_started
             shutil.rmtree(target_dir)
+            forget_book_record(book_id)
             remove_from_book_index(book_id)
     app.logger.info(
         "book deleted ip=%s id=%s refs=%s packs=%s cleanup=%.3fs total=%.3fs",

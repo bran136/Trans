@@ -12,6 +12,7 @@
     <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
     <link rel="stylesheet" href="{{ asset_url('reader.css') }}">
     <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
+    <link rel="stylesheet" href="{{ asset_url('reader-tools.css') }}">
   </head>
   <body class="reader-body" data-media-artwork-url="{{ asset_url('media-artwork.png') }}">
     <div class="reader-shell">
@@ -39,6 +40,7 @@
               <span id="bookCount">0 本</span>
             </div>
           </div>
+          <input id="shelfSearch" class="library-search" type="search" placeholder="搜索书名或作者" aria-label="搜索书架" autocomplete="off">
           <div id="bookList" class="book-list"></div>
         </section>
 
@@ -72,9 +74,21 @@
     <dialog id="chapterSelectDialog" class="reader-dialog chapter-select-dialog">
       <section class="dialog-panel">
         <div class="dialog-head">
-          <h2>选择章节</h2>
+          <h2>目录与搜索</h2>
           <button id="closeChapterSelectBtn" type="button">关闭</button>
         </div>
+        <div class="book-search-tabs" role="group" aria-label="搜索范围">
+          <button id="searchTocTab" type="button" aria-pressed="true">目录</button>
+          <button id="searchBodyTab" type="button" aria-pressed="false">正文</button>
+        </div>
+        <form id="bookSearchForm" class="book-search-form">
+          <input id="bookSearchInput" type="search" placeholder="搜索章节标题或序号" aria-label="搜索本书" maxlength="80" autocomplete="off">
+          <button id="bookSearchSubmit" type="submit" hidden>搜索</button>
+        </form>
+        <div id="bookSearchStatus" class="book-search-status" role="status" aria-live="polite"></div>
+        <div id="bookSearchProgress" class="upload-progress parsing reparse-progress" hidden><div></div></div>
+        <div id="bookSearchResults" class="book-search-results" hidden></div>
+        <button id="bookSearchMore" type="button" hidden>加载更多</button>
         <div id="chapterSelectList" class="chapter-select-list" role="listbox" aria-label="章节列表"></div>
       </section>
     </dialog>
@@ -104,6 +118,7 @@
             </form>
           </section>
           <section>
+            <input id="manageSearch" class="library-search" type="search" placeholder="搜索书名或作者" aria-label="搜索管理中的书籍" autocomplete="off">
             <div id="manageBookList" class="manage-book-list"></div>
           </section>
         </div>
@@ -150,6 +165,7 @@
         <label class="book-metadata-field">作者
           <input id="bookAuthorInput" type="text" maxlength="120" autocomplete="off" placeholder="作者未知">
         </label>
+        <a id="editTxtLink" class="txt-desktop-entry" href="#" hidden>编辑 TXT 全文 →</a>
       </form>
     </dialog>
 
@@ -362,5 +378,6 @@
     <script src="{{ asset_url('ui.js') }}"></script>
     <script src="{{ asset_url('font-cache.js') }}"></script>
     <script src="{{ asset_url('reader.js') }}"></script>
+    <script src="{{ asset_url('reader-tools.js') }}"></script>
   </body>
 </html>

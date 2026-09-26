@@ -466,7 +466,10 @@ function renderVisualText(pre, text) {
 
 function applyVisualSentenceHighlight(paragraphIndex, sentenceIndex) {
   document.querySelectorAll(".visual-sentence.active").forEach((item) => item.classList.remove("active"));
-  if (!Number.isFinite(paragraphIndex) || !Number.isFinite(sentenceIndex)) return;
+  if (!Number.isFinite(paragraphIndex) || !Number.isFinite(sentenceIndex)) {
+    $("sourceHighlight").replaceChildren();
+    return;
+  }
   document
     .querySelectorAll(`.visual-sentence[data-paragraph-index="${paragraphIndex}"][data-sentence-index="${sentenceIndex}"]`)
     .forEach((item) => {
@@ -483,7 +486,11 @@ function paragraphFallbackRange(value, paragraphIndex) {
 }
 
 function sourceRangeForVisualSentence(paragraphIndex, sentenceIndex, resultRoot) {
-  const sourceValue = $("sourceText").value || "";
+  const rawValue = $("sourceText").value || "";
+  // Requests trim leading whitespace; map the returned sentence back to the original input.
+  const leading = rawValue.length - rawValue.trimStart().length;
+  const sourceValue = rawValue.trim();
+  const originalRange = range => range ? { ...range, start: range.start + leading, end: range.end + leading } : null;
   const sourceRanges = buildHighlightRanges(sourceValue);
   const sourceParagraphRanges = sourceRanges.filter((item) => item.paragraphIndex === paragraphIndex);
   const resultSentenceCount = resultRoot
@@ -491,9 +498,21 @@ function sourceRangeForVisualSentence(paragraphIndex, sentenceIndex, resultRoot)
     : 0;
   if (sourceParagraphRanges.length && sourceParagraphRanges.length === resultSentenceCount) {
     const exact = sourceParagraphRanges.find((item) => item.sentenceIndex === sentenceIndex);
-    if (exact) return exact;
+    if (exact) return originalRange(exact);
   }
-  return paragraphFallbackRange(sourceValue, paragraphIndex) || sourceParagraphRanges[0] || null;
+  return originalRange(paragraphFallbackRange(sourceValue, paragraphIndex) || sourceParagraphRanges[0] || null);
+}
+
+function syncSourceHighlight() {
+  const source = $("sourceText"), layer = $("sourceHighlight");
+  if (!layer.firstChild) return;
+  const style = getComputedStyle(source);
+  for (const property of ["font", "line-height", "letter-spacing", "word-spacing", "padding", "text-align", "text-indent", "tab-size", "direction", "word-break", "overflow-wrap"]) {
+    layer.style.setProperty(property, style.getPropertyValue(property));
+  }
+  layer.style.width = `${source.clientWidth}px`;
+  layer.scrollTop = source.scrollTop;
+  layer.scrollLeft = source.scrollLeft;
 }
 
 function highlightVisualSentence(paragraphIndex, sentenceIndex, resultRoot = null) {
@@ -501,14 +520,22 @@ function highlightVisualSentence(paragraphIndex, sentenceIndex, resultRoot = nul
   state.activeSentence = { paragraphIndex, sentenceIndex };
   applyVisualSentenceHighlight(paragraphIndex, sentenceIndex);
   const range = sourceRangeForVisualSentence(paragraphIndex, sentenceIndex, resultRoot);
+  const layer = $("sourceHighlight");
+  layer.replaceChildren();
   if (range) {
     const source = $("sourceText");
-    try {
-      source.focus({ preventScroll: true });
-    } catch {
-      source.focus();
-    }
+    // Update the corresponding range without opening the mobile keyboard.
     source.setSelectionRange(range.start, range.end);
+    const mark = document.createElement("mark");
+    mark.textContent = source.value.slice(range.start, range.end);
+    layer.append(document.createTextNode(source.value.slice(0, range.start)), mark,
+      document.createTextNode(source.value.slice(range.end) + "\u200b"));
+    syncSourceHighlight();
+    const bounds = layer.getBoundingClientRect(), target = mark.getBoundingClientRect();
+    if (target.top < bounds.top || target.bottom > bounds.bottom) {
+      source.scrollTop += target.top - bounds.top - source.clientHeight / 3;
+      syncSourceHighlight();
+    }
   }
 }
 
@@ -622,7 +649,7 @@ async function retryTranslationEngine(engineId, index, button) {
     }
     return;
   }
-  if (result.ok) updateDetectedSource([result], text);
+  if (result.ok && result.detectedSource) updateDetectedSource([result], text);
   updateResultCard(result, index);
 }
 
@@ -714,7 +741,10 @@ async function translateGoogleFromClient(text, source, target) {
   const data = await response.json();
   let translated = "";
   let detectedSource = "";
-  if (Array.isArray(data) && Array.isArray(data[0])) {
+  if (Array.isArray(data) && typeof data[0] === "string") {
+    translated = data[0].trim();
+    detectedSource = source === "auto" ? "" : source;
+  } else if (Array.isArray(data) && Array.isArray(data[0])) {
     if (typeof data[0][0] === "string") {
       translated = data[0][0].trim();
       detectedSource = typeof data[0][1] === "string" ? data[0][1] : "";
@@ -820,6 +850,8 @@ function handleSourceInput() {
 }
 
 function scheduleTranslate(delay = 500) {
+  // Invalidate in-flight responses immediately, including during the input debounce.
+  state.requestId++;
   window.clearTimeout(state.translateTimer);
   state.translateTimer = window.setTimeout(translate, delay);
 }
@@ -868,7 +900,7 @@ async function translate() {
       }
       if (requestId === state.requestId) {
         results[index] = result;
-        updateDetectedSource([result], text);
+        updateDetectedSource(results.filter(Boolean), text);
         updateResultCard(result, index);
       }
       return result;
@@ -935,6 +967,9 @@ async function bootstrap() {
 }
 
 $("sourceText").addEventListener("input", handleSourceInput);
+$("sourceText").addEventListener("scroll", syncSourceHighlight, { passive: true });
+$("sourceText").addEventListener("focus", () => $("sourceHighlight").replaceChildren());
+new ResizeObserver(syncSourceHighlight).observe($("sourceText"));
 $("sourceLang").addEventListener("change", () => {
   state.sourceAutoMode = $("sourceLang").value === "auto";
   if (state.sourceAutoMode) {

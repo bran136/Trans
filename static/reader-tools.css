@@ -1,0 +1,104 @@
+/* Search uses the existing reader palette in both themes. */
+.reader-body .reader-toolbar { grid-template-columns: auto minmax(0, 1fr) auto; }
+.reader-body .reader-dialog.chapter-select-dialog { width: min(780px, calc(100vw - 24px)); }
+.reader-body .chapter-select-dialog .dialog-panel { max-height: calc(100dvh - 32px); gap: 12px; }
+.book-search-tabs { display: flex; gap: 6px; }
+.book-search-tabs button, .book-search-form button, #bookSearchMore {
+  border: 1px solid var(--line); border-radius: 9px; padding: 7px 14px;
+  background: var(--subtle); color: var(--ink); font-size: 13px;
+}
+.book-search-tabs button[aria-pressed="true"] { color: var(--accent-strong); border-color: var(--accent); background: var(--selected); }
+.book-search-form { display: flex; gap: 8px; }
+.book-search-form input {
+  width: 100%; min-width: 0; min-height: 38px; padding: 8px 11px;
+  border: 1px solid var(--line); border-radius: 9px; background: var(--control); color: var(--ink); font-size: 14px;
+}
+.book-search-form button { flex-shrink: 0; }
+.book-search-status { color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.book-search-results { min-height: 0; overflow-y: auto; overscroll-behavior: contain; max-height: min(52dvh, 480px); }
+.book-search-result { display: block; width: 100%; text-align: left; padding: 12px; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: var(--subtle); }
+.book-search-result strong { display: block; margin-bottom: 5px; font-size: 14px; }
+.book-search-result span { font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.reader-body mark { background: rgba(var(--accent-rgb), .2); color: var(--accent-strong); border-radius: 2px; }
+#bookSearchMore { justify-self: center; }
+.txt-desktop-entry { display: none; color: var(--accent-strong); font-size: 13px; text-decoration: none; padding: 10px 0; border-top: 1px solid var(--line); }
+@media (hover: hover) and (pointer: fine) { .txt-desktop-enabled .txt-desktop-entry:not([hidden]) { display: block; } }
+@media (max-width: 760px) {
+  .reader-body .reader-toolbar > button { padding-inline: 8px; }
+  .reader-body .chapter-select-dialog .dialog-panel { padding: 12px; gap: 9px; }
+  .reader-body .book-search-form input { font-size: var(--mobile-input-size, 13px); }
+  .book-search-results { max-height: 45dvh; }
+}
+.txt-editor-body { height: 100dvh; overflow: hidden; }
+.txt-editor-page { width: min(1440px, 100%); height: 100%; margin: auto; padding: 24px 32px; display: flex; flex-direction: column; gap: 12px; }
+.txt-editor-head { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.txt-editor-head > div:first-child { min-width: 0; }
+.txt-editor-eyebrow { color: var(--muted); font-size: 12px; }
+.txt-editor-head h1 { margin: 5px 0 0; font-size: 23px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.txt-editor-head .dialog-actions { flex-shrink: 0; }
+.txt-editor-body button, .txt-editor-unavailable a { border: 1px solid var(--line); border-radius: 10px; padding: 9px 15px; background: var(--panel); color: var(--ink); }
+.txt-editor-body #txtEditorSave { background: var(--selected); color: var(--accent-strong); border-color: var(--accent); }
+.txt-editor-body button:disabled { opacity: .5; cursor: default; }
+.txt-editor-info, .txt-editor-footer { display: flex; justify-content: space-between; gap: 18px; font-size: 12px; line-height: 1.6; color: var(--muted); }
+.txt-editor-info .error { color: var(--danger); }
+#txtEditorContent { flex: 1; min-height: 0; width: 100%; resize: none; border: 1px solid var(--line); border-radius: 12px; padding: 20px 24px; background: var(--panel); color: var(--ink); font: 16px/32px system-ui, sans-serif; tab-size: 4; }
+#txtEditorContent:focus { outline: none; border-color: var(--line-strong); }
+.txt-editor-footer span:last-child { white-space: nowrap; }
+.txt-editor-unavailable { margin: 15vh auto; padding: 24px; max-width: 480px; text-align: center; }
+@media (max-width: 760px) { .txt-editor-page { padding: 12px; } .txt-editor-footer { flex-wrap: wrap; } }
+#txtEditorContent { scrollbar-width: auto; scrollbar-color: var(--muted) var(--subtle); }
+#txtEditorContent::-webkit-scrollbar { width: 16px; height: 16px; }
+#txtEditorContent::-webkit-scrollbar-track { background: var(--subtle); border-radius: 12px; }
+#txtEditorContent::-webkit-scrollbar-thumb { background: var(--muted); border: 3px solid var(--subtle); border-radius: 12px; }
+#txtEditorContent::-webkit-scrollbar-thumb:hover { background: var(--ink); }
+.txt-editor-workspace { display: flex; flex: 1; min-height: 0; min-width: 0; --toc-width: 240px; }
+.txt-editor-sidebar { width: var(--toc-width); flex-shrink: 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; padding: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+.txt-editor-sidebar > strong { font-size: 14px; }
+#txtEditorChapter { overflow: auto; min-height: 0; font-size: 13px; color: var(--muted); }
+.txt-editor-body #txtEditorChapter button { display: block; text-align: left; width: 100%; border-color: transparent; border-radius: 7px; padding: 9px 8px; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.txt-editor-body #txtEditorChapter button[aria-current="true"] { color: var(--accent-strong); background: var(--selected); border-color: var(--accent); }
+.txt-editor-divider { width: 12px; flex-shrink: 0; cursor: col-resize; touch-action: none; position: relative; }
+.txt-editor-divider::after { content: ''; position: absolute; width: 3px; height: 48px; border-radius: 3px; top: calc(50% - 24px); left: 4px; background: var(--line-strong); }
+.txt-editor-divider:hover::after, .txt-editor-divider:focus-visible::after { background: var(--accent); }
+.txt-editor-workspace #txtEditorContent { width: 0; min-width: 0; }
+.txt-find-panel { display: flex; align-items: center; flex-wrap: nowrap; overflow-x: auto; flex-shrink: 0; gap: 8px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--subtle); }
+.txt-find-panel input { flex: 1 1 180px; width: 180px; min-width: 100px !important; }
+.txt-find-panel button { flex-shrink: 0; padding: 8px 10px; font-size: 13px; white-space: nowrap; }
+#txtFindStatus { flex-shrink: 0; white-space: nowrap; color: var(--muted); font-size: 12px; }
+.txt-editor-sidebar input, .txt-find-panel input, .reader-body .library-search { min-width: 0; border: 1px solid var(--line); border-radius: 9px; background: var(--control); color: var(--ink); padding: 9px 11px; font: 13px/1.5 system-ui, sans-serif; }
+.reader-body .library-search { display: block; width: 100%; height: 40px; min-height: 40px; max-height: 40px; flex: none; align-self: start; margin-bottom: 14px; }
+.reader-body .shelf-view { grid-template-rows: auto auto minmax(0, 1fr); }
+.reader-body .shelf-view > .library-search { margin-bottom: 0; }
+.txt-editor-sidebar input { width: 100%; }
+@media (max-width: 760px) {
+  .reader-body .library-search { font-size: var(--mobile-input-size, 13px); }
+  .txt-editor-head { flex-wrap: wrap; gap: 10px; }
+  .txt-editor-head .dialog-actions { flex-wrap: wrap; }
+}
+
+#txtEditorDownload { color: var(--accent-strong); text-decoration: none; margin-right: 10px; }
+.txt-editor-changes { flex-shrink: 0; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--subtle); font-size: 12px; }
+.txt-editor-changes summary { cursor: pointer; color: var(--ink); }
+#txtEditorChangesList { max-height: 140px; overflow: auto; margin-top: 8px; }
+.txt-editor-body .txt-change { display: block; width: 100%; margin-bottom: 6px; text-align: left; font: 12px/1.7 system-ui, sans-serif; white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px 10px; }
+.txt-change ins { background: #daf1df; color: #185d30; text-decoration: none; }
+.txt-change del { background: #fbe0e1; color: #96303a; }
+.reader-dark .txt-change ins { background: #233f2f; color: #afe4bd; }
+.reader-dark .txt-change del { background: #4d2c32; color: #ffc0c5; }
+.txt-editor-body .txt-text-button { padding: 0; margin-right: 12px; border: 0; border-radius: 0; background: transparent; color: var(--muted); font: inherit; }
+.txt-editor-body .txt-text-button:hover { color: var(--danger); }
+
+#txtEditorLocked { max-width: 560px; }
+#txtEditorLocked h1 { font-size: 22px; line-height: 1.4; }
+#txtEditorLockMessage { margin: 16px 0 24px; font-size: 14px; line-height: 1.9; color: var(--muted); white-space: pre-line; overflow-wrap: anywhere; }
+#txtEditorStatus { white-space: pre-line; }
+.txt-editor-lock-actions { display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; }
+.txt-editor-lock-actions a { text-decoration: none; }
+
+.txt-backup-info { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px 10px; }
+#txtEditorBackupTime { white-space: nowrap; font-variant-numeric: tabular-nums; }
+#txtFindStatus { font-variant-numeric: tabular-nums; }
+
+.txt-change-row { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 6px; }
+.txt-editor-body .txt-change-row .txt-change { flex: 1; min-width: 0; margin-bottom: 0; }
+.txt-editor-body .txt-change-undo { flex: none; padding: 8px 10px; font-size: 12px; }

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <meta name="theme-color" content="#f6f5f2">
+  <title>TXT 全文编辑 · Trans</title>
+  <link rel="icon" href="{{ asset_url('site-icon.svg') }}" type="image/svg+xml">
+  <script src="{{ asset_url('reader-theme.js') }}"></script>
+  <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
+  <link rel="stylesheet" href="{{ asset_url('reader.css') }}">
+  <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
+  <link rel="stylesheet" href="{{ asset_url('reader-tools.css') }}">
+</head>
+<body class="reader-body txt-editor-body" data-book-id="{{ book_id }}" data-delta-worker="{{ asset_url('txt-delta-worker.js') }}">
+  <main id="txtEditorPage" class="txt-editor-page" hidden>
+    <header class="txt-editor-head">
+      <div><span class="txt-editor-eyebrow">TXT 全文编辑</span><h1 id="txtEditorTitle">正在加载书籍…</h1></div>
+      <div class="dialog-actions"><button id="txtEditorBackup" type="button" disabled>载入备份</button><button id="txtEditorBack" type="button">返回编辑</button><button id="txtEditorSave" type="button" disabled>保存并解析</button></div>
+    </header>
+    <div class="txt-editor-info"><span id="txtEditorStatus" role="status" aria-live="polite">正在读取正文…</span><span class="txt-backup-info"><time id="txtEditorBackupTime" hidden></time><a id="txtEditorDownload" href="/api/books/{{ book_id }}/text-backup?download=1" hidden>下载备份</a><button id="txtEditorDeleteBackup" class="txt-text-button" type="button" hidden>删除备份</button><span id="txtEditorCount"></span></span></div>
+    <div id="txtEditorProgress" class="upload-progress parsing reparse-progress"><div></div></div>
+    <section id="txtEditorFindPanel" class="txt-find-panel" aria-label="查找替换">
+      <input id="txtFind" type="search" placeholder="查找文字" aria-label="查找文字"><button id="txtFindPrev" type="button">上一个</button><button id="txtFindNext" type="button">下一个</button>
+      <input id="txtReplace" type="text" placeholder="替换为（可留空）" aria-label="替换文字"><button id="txtReplaceOne" type="button">替换</button><button id="txtReplaceAll" type="button">全部替换</button><span id="txtFindStatus" role="status" aria-live="polite"></span>
+    </section>
+    <details id="txtEditorChanges" class="txt-editor-changes" open hidden><summary id="txtEditorChangesSummary">未保存的修改</summary><div id="txtEditorChangesList"></div></details>
+    <div id="txtEditorWorkspace" class="txt-editor-workspace">
+      <aside id="txtEditorSidebar" class="txt-editor-sidebar" aria-label="章节导航">
+        <strong>章节目录</strong><input id="txtTocFilter" type="search" placeholder="搜索章节" aria-label="筛选章节目录">
+        <nav id="txtEditorChapter" aria-label="章节列表"></nav>
+      </aside>
+      <div id="txtEditorDivider" class="txt-editor-divider" role="separator" tabindex="0" aria-label="调整目录宽度" aria-orientation="vertical" aria-valuemin="160" aria-valuemax="480" aria-valuenow="240"></div>
+      <textarea id="txtEditorContent" aria-label="TXT 全文" spellcheck="false" autocomplete="off" disabled></textarea>
+    </div>
+    <footer class="txt-editor-footer"><span>快捷键只保存原文；点击“保存并解析”后，阅读目录与缓存才会更新。</span><span>Ctrl / ⌘ + S 仅保存</span></footer>
+  </main>
+  <div id="txtEditorUnavailable" class="txt-editor-unavailable" hidden><h1>请在电脑上编辑</h1><p>TXT 全文编辑仅在桌面浏览器提供。</p><a href="/reader">返回在线读书</a></div>
+  <div id="txtEditorLocked" class="txt-editor-unavailable" hidden><h1>暂时无法编辑</h1><p id="txtEditorLockMessage">本书正在其他页面编辑，请等待该页面退出。</p><div class="txt-editor-lock-actions"><button id="txtEditorRetry" type="button">重试</button><a href="/reader">返回在线读书</a></div></div>
+  <dialog id="txtEditorDeleteConfirm" class="reader-dialog"><section class="dialog-panel"><div class="dialog-head"><h2>删除原文备份？</h2></div><p>仅删除上次保存前的 TXT 备份，当前书籍不会改变。下次修改并保存时会重新生成备份。</p><div class="dialog-actions"><button id="txtEditorDeleteCancel" type="button">取消</button><button id="txtEditorDeleteYes" type="button">删除备份</button></div></section></dialog>
+  <dialog id="txtEditorRestore" class="reader-dialog">
+    <section class="dialog-panel"><div class="dialog-head"><h2>载入上次保存前的原文？</h2></div><p>将替换编辑框内的文字（包括未保存的修改）。确认内容并保存后才会恢复原文，点击“保存并解析”还会更新阅读目录。</p><p>只保留一份 TXT 原文备份，下次保存时覆盖；删除书籍时一起删除。</p><div class="dialog-actions"><button id="txtEditorRestoreCancel" type="button">取消</button><button id="txtEditorRestoreConfirm" type="button">载入备份</button></div></section>
+  </dialog>
+  <dialog id="txtEditorLeave" class="reader-dialog">
+    <section class="dialog-panel"><div class="dialog-head"><h2>有未保存的修改</h2></div><p>离开后，本次修改不会保存。</p><div class="dialog-actions"><button id="txtEditorStay" type="button">继续编辑</button><button id="txtEditorDiscard" type="button">放弃修改并返回</button></div></section>
+  </dialog>
+  <script src="{{ asset_url('ui.js') }}"></script>
+  <script src="{{ asset_url('txt-editor.js') }}"></script>
+</body>
+</html>

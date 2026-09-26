@@ -642,7 +642,7 @@ async function hasLocalOfflinePack(manifest, entry) {
   }
 }
 
-async function saveLocalOfflinePack(manifest, entry, blob) {
+async function saveLocalOfflinePack(manifest, entry, blob, signal) {
   if (!(blob instanceof Blob) || !blob.size || blob.size > TTS_MAX_PACK_BYTES) {
     throw new Error("下载的播放包大小无效");
   }
@@ -657,6 +657,7 @@ async function saveLocalOfflinePack(manifest, entry, blob) {
     throw new Error("离线章节句数无效");
   }
   const database = await openTtsOfflineDb();
+  if (signal?.aborted) throw new DOMException("本机下载已取消", "AbortError");
   const record = {
     id: offlinePackRecordId(manifest.book_id, manifest.profile_key, manifest.chapter_index, normalized.packKey),
     bookId: manifest.book_id,
@@ -1103,6 +1104,17 @@ async function loadBooks() {
   const data = await api("/api/books");
   readerState.books = data.books || [];
   renderBooks();
+  const url = new URL(location.href);
+  const editBook = url.searchParams.get("editBook");
+  if (editBook) {
+    url.searchParams.delete("editBook");
+    history.replaceState(history.state, "", url);
+    const book = readerState.books.find(item => item.id === editBook);
+    if (book) {
+      openReaderDialog($("manageDialog"));
+      openBookMetadataEditor(book);
+    }
+  }
 }
 
 function renderBooks() {
@@ -1112,13 +1124,22 @@ function renderBooks() {
   renderStatistics();
 }
 
+function filterLibraryBooks(books, inputId) {
+  const query = $(inputId).value.trim().toLocaleLowerCase();
+  return query ? books.filter(book => `${book.title || ""} ${book.author || ""}`.toLocaleLowerCase().includes(query)) : books;
+}
+$("shelfSearch").addEventListener("input", () => renderBookList($("bookList")));
+$("manageSearch").addEventListener("input", renderManageBooks);
+
 function renderBookList(list) {
   list.innerHTML = "";
   if (!readerState.books.length) {
     list.innerHTML = '<div class="book-item"><strong>暂无书籍</strong><span>导入 TXT、EPUB 或 PDF</span></div>';
     return;
   }
-  const shelfBooks = recentlyOpenedBooks();
+  const shelfBooks = filterLibraryBooks(recentlyOpenedBooks(), "shelfSearch");
+  $("bookCount").textContent = $("shelfSearch").value.trim() ? `${shelfBooks.length} / ${readerState.books.length} 本` : `${readerState.books.length} 本`;
+  if (!shelfBooks.length) list.innerHTML = '<div class="manage-empty">没有匹配的书籍</div>';
   shelfBooks.forEach((book) => {
     const button = document.createElement("button");
     button.className = `book-item ${book.id === readerState.currentBookId ? "active" : ""}`;
@@ -1171,9 +1192,10 @@ function renderManageBooks() {
     list.innerHTML = '<div class="manage-empty">暂无书籍</div>';
     return;
   }
-  const managedBooks = [...readerState.books].sort((a, b) => (
+  const managedBooks = filterLibraryBooks(readerState.books, "manageSearch").slice().sort((a, b) => (
     Number(b.created_at || 0) - Number(a.created_at || 0)
   ));
+  if (!managedBooks.length) list.innerHTML = '<div class="manage-empty">没有匹配的书籍</div>';
   managedBooks.forEach((book) => {
     const hasToc = book.format === "txt" || book.format === "epub";
     const row = document.createElement("div");
@@ -1483,6 +1505,8 @@ function showBookMetadataMessage(text, type = "") {
 
 function openBookMetadataEditor(book) {
   readerState.metadataEditBookId = book.id;
+  $("editTxtLink").hidden = book.format !== "txt";
+  $("editTxtLink").href = `/reader/books/${encodeURIComponent(book.id)}/edit`;
   $("bookTitleInput").value = book.title || "";
   $("bookAuthorInput").value = book.author || "";
   showBookMetadataMessage("");
@@ -1784,6 +1808,20 @@ async function openBook(bookId, chapter = 0, sentence = 0, addHistory = true) {
   stopListening(false);
   readerState.currentBookId = bookId;
   const data = await api(`/api/books/${bookId}`);
+  if (readerState.currentBookId !== bookId) return;
+  if (data.book.content_revision) {
+    const key = `readerContentRevision:${bookId}`;
+    try {
+      if (window.localStorage.getItem(key) !== data.book.content_revision) {
+        if (readerState.offlineDownloadController?.bookId === bookId) readerState.offlineDownloadController.controller.abort();
+        await deleteLocalOfflineBook(bookId);
+        window.localStorage.setItem(key, data.book.content_revision);
+      }
+    } catch {
+      // Keep the old revision so temporary storage failures are retried.
+    }
+  }
+  if (readerState.currentBookId !== bookId) return;
   readerState.currentBook = data.book;
   readerState.chapters = data.chapters || [];
   renderBooks();
@@ -1814,6 +1852,7 @@ function updateCurrentBookProgressLocally() {
     bookId,
     chapter: readerState.currentChapter,
     sentence: readerState.currentSentence,
+    contentRevision: readerState.currentBook?.content_revision || "",
   };
   readerState.books = readerState.books.map((book) => (
     book.id === bookId
@@ -2065,6 +2104,7 @@ async function saveProgress(snapshot = null) {
       body: JSON.stringify({
         chapter,
         sentence,
+        content_revision: snapshot?.contentRevision ?? readerState.currentBook?.content_revision ?? "",
       }),
     });
     if (data.book) {
@@ -4198,7 +4238,7 @@ async function downloadOfflineChapters(bookId, chapterIndexes) {
         const blob = await promiseWithTimeout(response.blob(), 180000, "读取下载音频超时");
         if (!blob.size) throw new Error("下载的音频为空");
         await promiseWithTimeout(
-          saveLocalOfflinePack(manifest, entry, blob),
+          saveLocalOfflinePack(manifest, entry, blob, controller.signal),
           180000,
           "写入本机播放包超时",
         );
