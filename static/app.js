@@ -1,7 +1,9 @@
 function storedHistory() {
   try {
     const value = JSON.parse(localStorage.getItem("trans-history") || "[]");
-    return Array.isArray(value) ? value.slice(0, 100) : [];
+    return Array.isArray(value) ? value.filter((item) => item &&
+      ["text", "source", "target", "targetName"].every((key) => typeof item[key] === "string")
+    ).slice(0, 100) : [];
   } catch {
     return [];
   }
@@ -541,6 +543,7 @@ function highlightVisualSentence(paragraphIndex, sentenceIndex, resultRoot = nul
 
 function fillResultCard(card, result, index) {
   card.dataset.engine = result.engine;
+  card.dataset.outcome = result.ok === true ? "success" : result.ok === false ? "error" : "pending";
   card.className = `result-card ${result.ok === false ? "error" : ""}`;
   if (isResultPanelCollapsed(result.engine, index)) card.classList.add("collapsed");
   const header = document.createElement("div");
@@ -567,7 +570,18 @@ function fillResultCard(card, result, index) {
 function updateResultCard(result, index) {
   const cards = [...$("results").querySelectorAll(".result-card")];
   const card = cards.find((item) => item.dataset.engine === result.engine);
-  if (card) fillResultCard(card, result, index);
+  if (card) {
+    fillResultCard(card, result, index);
+    updateTranslationStatus();
+  }
+}
+
+function updateTranslationStatus() {
+  const cards = [...$("results").querySelectorAll(".result-card")];
+  const succeeded = cards.filter((card) => card.dataset.outcome === "success").length;
+  if (cards.some((card) => card.dataset.outcome === "pending")) setStatus("翻译中");
+  else setStatus(!succeeded ? "翻译失败" : succeeded === cards.length ? "已完成" : "部分翻译失败");
+  return succeeded;
 }
 
 function createResultTitle(name) {
@@ -651,6 +665,10 @@ async function retryTranslationEngine(engineId, index, button) {
   }
   if (result.ok && result.detectedSource) updateDetectedSource([result], text);
   updateResultCard(result, index);
+  if (result.ok) {
+    const targetName = $("targetLang").selectedOptions[0].textContent;
+    saveHistory({ text, source: sourceForRequest(), target, targetName, time: Date.now() });
+  }
 }
 
 async function copyText(text) {
@@ -798,7 +816,11 @@ async function translateWithEngine(engineId, text, source, target) {
 
 function saveHistory(item) {
   state.history = [item, ...state.history.filter((old) => old.text !== item.text)].slice(0, 100);
-  localStorage.setItem("trans-history", JSON.stringify(state.history));
+  try {
+    localStorage.setItem("trans-history", JSON.stringify(state.history));
+  } catch {
+    // Storage can be full or unavailable; keep this session's history usable.
+  }
   renderHistory();
 }
 
@@ -857,6 +879,7 @@ function scheduleTranslate(delay = 500) {
 }
 
 async function translate() {
+  window.clearTimeout(state.translateTimer);
   const requestId = ++state.requestId;
   const text = $("sourceText").value.trim();
   const engines = selectedEngines();
@@ -907,7 +930,7 @@ async function translate() {
     });
     await Promise.all(tasks);
     if (requestId !== state.requestId) return;
-    setStatus("已完成");
+    if (!updateTranslationStatus()) return;
     const targetName = $("targetLang").selectedOptions[0].textContent;
     saveHistory({ text, source: sourceForRequest(), target, targetName, time: Date.now() });
   } catch (error) {

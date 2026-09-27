@@ -1,5 +1,7 @@
 const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
 let monitorTimer = null;
+let monitorRequestId = 0;
+let monitorAppliedRequestId = 0;
 
 const $ = (id) => document.getElementById(id);
 
@@ -57,8 +59,9 @@ function formatUptime(seconds) {
   return `${minutes}分`;
 }
 
-function setMonitorMessage(text, type = "success") {
+function setMonitorMessage(text, type = "success", source = "") {
   const message = $("monitorMessage");
+  message.dataset.source = source;
   message.textContent = text;
   message.className = `config-message ${type}`;
   message.hidden = false;
@@ -66,6 +69,7 @@ function setMonitorMessage(text, type = "success") {
 
 function clearMonitorMessage() {
   const message = $("monitorMessage");
+  delete message.dataset.source;
   message.textContent = "";
   message.className = "config-message";
   message.hidden = true;
@@ -90,17 +94,24 @@ function renderServiceStatus(data) {
 }
 
 async function loadServiceStatus(showError = true) {
+  const requestId = ++monitorRequestId;
   try {
-    renderServiceStatus(await api("/api/status"));
+    const data = await api("/api/status");
+    if (requestId < monitorAppliedRequestId) return false;
+    monitorAppliedRequestId = requestId;
+    renderServiceStatus(data);
+    if ($("monitorMessage").dataset.source === "status") clearMonitorMessage();
     return true;
   } catch (error) {
-    if (showError) setMonitorMessage(`状态获取失败：${error.message}`, "error");
+    if (requestId < monitorAppliedRequestId) return false;
+    monitorAppliedRequestId = requestId;
+    if (showError) setMonitorMessage(`状态获取失败：${error.message}`, "error", "status");
     return false;
   }
 }
 
 function startMonitorRefresh() {
-  window.clearInterval(monitorTimer);
+  stopMonitorRefresh();
   loadServiceStatus();
   monitorTimer = window.setInterval(() => loadServiceStatus(false), 5000);
 }
@@ -108,6 +119,8 @@ function startMonitorRefresh() {
 function stopMonitorRefresh() {
   window.clearInterval(monitorTimer);
   monitorTimer = null;
+  // Ignore outstanding requests after closing the dialog or starting a restart.
+  monitorAppliedRequestId = ++monitorRequestId;
 }
 
 function openRestartConfirmation() {
@@ -148,45 +161,6 @@ async function restartService() {
   }
 }
 
-async function saveAccessPassword() {
-  const currentInput = $("currentPassword");
-  const newInput = $("newPassword");
-  if (!currentInput.value) {
-    setMonitorMessage("请输入当前访问密码", "error");
-    currentInput.focus();
-    return;
-  }
-  if (newInput.value.length < 12) {
-    setMonitorMessage("访问密码至少需要 12 位", "error");
-    newInput.focus();
-    return;
-  }
-  if (newInput.value === currentInput.value) {
-    setMonitorMessage("新密码不能与当前密码相同", "error");
-    newInput.focus();
-    return;
-  }
-  const button = $("savePasswordBtn");
-  if (button.disabled) return;
-  button.disabled = true;
-  try {
-    await api("/api/password", {
-      method: "PUT",
-      body: JSON.stringify({
-        current_password: currentInput.value,
-        new_password: newInput.value,
-      }),
-    });
-    currentInput.value = "";
-    newInput.value = "";
-    setMonitorMessage("访问密码已修改，其他浏览器需要重新登录", "success");
-  } catch (error) {
-    setMonitorMessage(`密码修改失败：${error.message}`, "error");
-  } finally {
-    button.disabled = false;
-  }
-}
-
 $("monitorBtn").addEventListener("click", () => {
   clearMonitorMessage();
   $("monitorDialog").showModal();
@@ -198,16 +172,8 @@ $("refreshStatusBtn").addEventListener("click", () => loadServiceStatus());
 $("restartServiceBtn").addEventListener("click", openRestartConfirmation);
 $("cancelRestartBtn").addEventListener("click", () => $("restartConfirmDialog").close());
 $("confirmRestartBtn").addEventListener("click", restartService);
-$("savePasswordBtn").addEventListener("click", saveAccessPassword);
-[$("currentPassword"), $("newPassword")].forEach((input) => {
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") saveAccessPassword();
-  });
-});
 $("monitorDialog").addEventListener("close", () => {
   stopMonitorRefresh();
-  $("currentPassword").value = "";
-  $("newPassword").value = "";
 });
 
 $("logoutBtn").addEventListener("click", async () => {
@@ -232,4 +198,420 @@ $("homeAboutDialog").addEventListener("close", () => {
   document.documentElement.classList.remove("home-about-open");
   document.body.style.removeProperty("--about-scroll-top");
   window.scrollTo(0, aboutScrollY);
+});
+
+let securityState = null;
+let securityBusy = false;
+let securityScrollY = 0;
+let mfaAction = "setup";
+let mfaStep = "password";
+let clientListRevision = 0;
+
+function securityMessage(text = "", type = "success", id = "securityMessage") {
+  const node = $(id);
+  node.textContent = text;
+  node.className = `config-message ${type}`;
+  node.hidden = !text;
+}
+
+function recoveryRecentlyVerified() {
+  return Number(securityState?.recovery_verified_until || 0) * 1000 > Date.now();
+}
+
+function renderLoginClients() {
+  const revision = ++clientListRevision;
+  const container = $("loginClients");
+  container.replaceChildren();
+  const clients = securityState?.clients;
+  if (!Array.isArray(clients) || !clients.length) {
+    const hint = document.createElement("p");
+    hint.className = "security-hint";
+    hint.textContent = !securityState ? "正在读取…" : "暂无已登录设备";
+    container.appendChild(hint);
+    return;
+  }
+  const formatTime = (seconds) => {
+    if (seconds == null) return "未知";
+    const date = new Date(Number(seconds) * 1000);
+    return Number.isFinite(date.getTime()) ? date.toLocaleString("zh-CN", { hour12: false }) : "未知";
+  };
+  const locations = new Map();
+  clients.forEach((client) => {
+    const card = document.createElement("div");
+    card.className = "login-client";
+    const head = document.createElement("div");
+    head.className = "login-client-head";
+    const title = document.createElement("strong");
+    title.textContent = `${client.browser} · ${client.platform}`;
+    head.appendChild(title);
+    const actions = document.createElement("div");
+    actions.className = "login-client-actions";
+    if (client.current) {
+      const badge = document.createElement("span");
+      badge.className = "security-status enabled";
+      badge.textContent = "当前客户端";
+      actions.appendChild(badge);
+    }
+    const logout = document.createElement("button");
+    logout.type = "button";
+    logout.className = "danger-btn login-client-logout";
+    logout.textContent = "退出";
+    logout.title = client.current ? "退出当前客户端" : "退出此客户端";
+    logout.disabled = securityBusy || !client.id;
+    logout.addEventListener("click", () => logoutClient(client));
+    actions.appendChild(logout);
+    head.appendChild(actions);
+    const meta = document.createElement("div");
+    meta.className = "login-client-meta";
+    const location = document.createElement("span");
+    location.className = "login-client-location";
+    location.textContent = `查询地区中（${client.ip}）`;
+    if (!locations.has(client.ip)) locations.set(client.ip, []);
+    locations.get(client.ip).push(location);
+    meta.appendChild(location);
+    [`登录：${formatTime(client.created_at)}`, `活动：${formatTime(client.last_seen)}`].forEach((text) => {
+      const span = document.createElement("span");
+      span.textContent = text;
+      meta.appendChild(span);
+    });
+    card.append(head, meta);
+    if (client.user_agent) {
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "浏览器详情";
+      const agent = document.createElement("p");
+      agent.textContent = client.user_agent;
+      details.append(summary, agent);
+      card.appendChild(details);
+    }
+    container.appendChild(card);
+  });
+  // Location is optional enrichment: do not hold up settings or authentication.
+  const queue = [...locations];
+  async function locateNext() {
+    while (queue.length && revision === clientListRevision && $("securityDialog").open) {
+      const [ip, nodes] = queue.shift();
+      let label = "未知地区";
+      try {
+        const data = await api(`/api/security/client-location?ip=${encodeURIComponent(ip)}`, { timeout: 8000 });
+        if (typeof data.location === "string" && data.location) label = data.location;
+      } catch (_) { /* A failed lookup must leave the IP and other controls usable. */ }
+      if (revision !== clientListRevision || !$("securityDialog").open) return;
+      nodes.forEach((node) => { node.textContent = `${label}（${ip}）`; });
+    }
+  }
+  locateNext();
+  locateNext();
+}
+
+async function logoutClient(client) {
+  if (securityBusy || !securityState || !client.id) return;
+  securityBusy = true;
+  renderSecurityState();
+  securityMessage();
+  try {
+    const data = await api(`/api/security/clients/${encodeURIComponent(client.id)}`, { method: "DELETE" });
+    if (data.signed_out_current) {
+      clientListRevision += 1;
+      window.location.replace("/login");
+      return;
+    }
+    securityState = data;
+    renderLoginClients();
+    securityMessage("该客户端已退出");
+  } catch (error) {
+    securityMessage(`退出失败：${error.message}`, "error");
+  } finally {
+    securityBusy = false;
+    renderSecurityState();
+  }
+}
+
+function renderSecurityState() {
+  const enabled = Boolean(securityState?.enabled);
+  $("mfaStatus").textContent = securityState ? (enabled ? "已启用" : "未启用") : "正在读取";
+  $("mfaStatus").classList.toggle("enabled", enabled);
+  $("mfaSummary").textContent = enabled
+    ? `登录时验证动态验证码，剩余 ${securityState.recovery_remaining} 个恢复码。`
+    : "使用验证器生成动态验证码，为密码登录增加一层保护。";
+  $("setupMfaBtn").hidden = enabled;
+  $("recoveryMfaBtn").hidden = !enabled;
+  $("disableMfaBtn").hidden = !enabled;
+  $("closeSecurityBtn").disabled = securityBusy;
+  $("refreshClientsBtn").disabled = securityBusy || !securityState;
+  $("savePasswordBtn").disabled = securityBusy || !securityState;
+  document.querySelectorAll("#securityDialog .security-actions button").forEach((button) => {
+    button.disabled = securityBusy || !securityState;
+  });
+  document.querySelectorAll("#loginClients .login-client-logout").forEach((button, index) => {
+    button.disabled = securityBusy || !securityState?.clients?.[index]?.id;
+  });
+  if ($("mfaDialog").open) renderMfaDialog();
+}
+
+function renderMfaDialog() {
+  const binding = mfaStep === "bind";
+  const codes = mfaStep === "codes";
+  const changingPassword = mfaAction === "password";
+  const recovered = recoveryRecentlyVerified();
+  $("mfaDialogTitle").textContent = codes ? "保存恢复码" : {
+    setup: "绑定验证器", recovery: "重新生成恢复码", disable: "关闭双重验证", password: "验证身份",
+  }[mfaAction];
+  $("mfaDialogHint").textContent = codes
+    ? (mfaAction === "setup" ? "2FA 双重验证已启用，请保存下方恢复码。" : "旧恢复码已失效，请保存下方新恢复码。") : binding
+    ? "输入验证器中的 6 位验证码，完成绑定。" : {
+      setup: "请先验证当前访问密码。",
+      recovery: "验证身份后生成新的恢复码，旧恢复码将全部失效。",
+      disable: "验证身份后关闭双重验证，此后仅使用密码登录。",
+      password: "请输入验证器中的动态验证码或一条恢复码，确认修改访问密码。",
+    }[mfaAction];
+  $("mfaForm").hidden = codes;
+  $("mfaPasswordField").hidden = binding || changingPassword;
+  $("mfaPassword").required = !binding && !codes && !changingPassword;
+  $("mfaSetup").hidden = !binding;
+  $("mfaCodeField").hidden = !binding && mfaAction === "setup";
+  $("mfaCodeLabel").textContent = binding ? "6 位验证码" : "验证码或恢复码";
+  $("mfaCode").required = !codes && (binding || (mfaAction !== "setup" && !recovered));
+  $("mfaCode").inputMode = binding ? "numeric" : "text";
+  $("mfaCode").placeholder = !binding && recovered ? "恢复码验证后 5 分钟内可留空" : "";
+  $("confirmMfaBtn").textContent = binding ? "确认启用" : {
+    setup: "验证密码", recovery: "验证并重新生成", disable: "验证并关闭", password: "验证并修改",
+  }[mfaAction];
+  $("confirmMfaBtn").className = mfaAction === "disable" ? "danger-btn" : "primary";
+  $("restartMfaBtn").hidden = !binding;
+  $("recoveryPanel").hidden = !codes;
+  ["confirmMfaBtn", "restartMfaBtn", "closeMfaBtn"].forEach((id) => { $(id).disabled = securityBusy; });
+}
+
+function clearMfaDialog() {
+  mfaStep = "password";
+  $("mfaForm").reset();
+  $("mfaQr").removeAttribute("src");
+  $("mfaSecret").textContent = "";
+  $("recoveryCodes").textContent = "";
+  securityMessage("", "success", "mfaMessage");
+}
+
+function openMfaDialog(action) {
+  if (securityBusy || !securityState || $("mfaDialog").open) return;
+  clearMfaDialog();
+  mfaAction = action;
+  renderMfaDialog();
+  $("mfaDialog").showModal();
+  $("mfaDialogTitle").focus({ preventScroll: true });
+}
+
+async function changeSecurity(event) {
+  event.preventDefault();
+  if (securityBusy || !securityState || mfaStep === "codes") return;
+  if (mfaAction === "password") return submitAccessPassword($("mfaCode").value);
+  const action = mfaStep === "bind" ? "enable" : mfaAction;
+  securityBusy = true;
+  renderSecurityState();
+  securityMessage("", "success", "mfaMessage");
+  try {
+    const data = await api("/api/security", {
+      method: "POST",
+      body: JSON.stringify({ action, current_password: $("mfaPassword").value, code: $("mfaCode").value }),
+    });
+    if (action === "setup") {
+      mfaStep = "bind";
+      $("mfaQr").src = data.qr;
+      $("mfaSecret").textContent = data.secret;
+      $("mfaCode").value = "";
+    } else {
+      securityState = data;
+      renderLoginClients();
+      clearMfaDialog();
+      const codes = data.recovery_codes || [];
+      if (codes.length) {
+        mfaStep = "codes";
+        $("recoveryCodes").textContent = codes.join("\n");
+      } else {
+        $("mfaDialog").close();
+      }
+      securityMessage(action === "disable" ? "双重验证已关闭，其他客户端已退出" : action === "enable"
+        ? "2FA 已启用，其他客户端已退出" : "恢复码已更新，其他客户端已退出");
+    }
+    $("mfaDialogTitle").focus({ preventScroll: true });
+  } catch (error) {
+    securityMessage(error.message, "error", "mfaMessage");
+  } finally {
+    securityBusy = false;
+    renderSecurityState();
+  }
+}
+
+function saveAccessPassword(event) {
+  event.preventDefault();
+  if (securityBusy || !securityState || $("mfaDialog").open) return;
+  if (!$("passwordForm").reportValidity()) return;
+  securityMessage();
+  if (securityState.enabled) {
+    openMfaDialog("password");
+    return;
+  }
+  return submitAccessPassword();
+}
+
+async function submitAccessPassword(code = "") {
+  if (securityBusy || !securityState) return;
+  const verifying = $("mfaDialog").open && mfaAction === "password";
+  const messageId = verifying ? "mfaMessage" : "securityMessage";
+  securityBusy = true;
+  renderSecurityState();
+  securityMessage("", "success", messageId);
+  try {
+    securityState = await api("/api/password", {
+      method: "PUT",
+      body: JSON.stringify({ current_password: $("currentPassword").value,
+        new_password: $("newPassword").value, code }),
+    });
+    renderLoginClients();
+    $("passwordForm").reset();
+    if (verifying) {
+      clearMfaDialog();
+      $("mfaDialog").close();
+    }
+    securityMessage("访问密码已修改，其他浏览器需要重新登录");
+  } catch (error) {
+    securityMessage(error.message, "error", messageId);
+  } finally {
+    securityBusy = false;
+    renderSecurityState();
+  }
+}
+
+$("settingsBtn").addEventListener("click", async () => {
+  if ($("securityDialog").open) return;
+  securityScrollY = window.scrollY;
+  document.body.style.setProperty("--about-scroll-top", `${-securityScrollY}px`);
+  document.documentElement.classList.add("home-about-open");
+  securityState = null;
+  securityBusy = true;
+  securityMessage();
+  renderSecurityState();
+  renderLoginClients();
+  $("securityDialog").showModal();
+  $("securityTitle").focus({ preventScroll: true });
+  try {
+    securityState = await api("/api/security");
+    renderLoginClients();
+  } catch (error) {
+    securityMessage(`设置读取失败：${error.message}`, "error");
+    $("loginClients").textContent = "读取失败，请重新打开设置";
+  } finally {
+    securityBusy = false;
+    renderSecurityState();
+    if (!securityState) $("mfaStatus").textContent = "读取失败";
+  }
+});
+$("refreshClientsBtn").addEventListener("click", async () => {
+  if (securityBusy || !securityState) return;
+  securityBusy = true;
+  renderSecurityState();
+  securityMessage();
+  try {
+    securityState = await api("/api/security");
+    renderLoginClients();
+  } catch (error) {
+    securityMessage(`刷新失败：${error.message}`, "error");
+  } finally {
+    securityBusy = false;
+    renderSecurityState();
+  }
+});
+$("closeSecurityBtn").addEventListener("click", () => {
+  if (!securityBusy) $("securityDialog").close();
+});
+$("securityDialog").addEventListener("cancel", (event) => {
+  if (securityBusy) event.preventDefault();
+});
+$("securityDialog").addEventListener("close", () => {
+  clientListRevision += 1;
+  $("passwordForm").reset();
+  clearMfaDialog();
+  document.documentElement.classList.remove("home-about-open");
+  document.body.style.removeProperty("--about-scroll-top");
+  window.scrollTo(0, securityScrollY);
+});
+$("closeMfaBtn").addEventListener("click", () => {
+  if (!securityBusy) $("mfaDialog").close();
+});
+$("mfaDialog").addEventListener("cancel", (event) => {
+  if (securityBusy) event.preventDefault();
+});
+$("mfaDialog").addEventListener("close", () => {
+  clearMfaDialog();
+  if ($("securityDialog").open) $("securityTitle").focus({ preventScroll: true });
+});
+$("mfaForm").addEventListener("submit", changeSecurity);
+$("restartMfaBtn").addEventListener("click", () => {
+  clearMfaDialog();
+  renderMfaDialog();
+  $("mfaDialogTitle").focus({ preventScroll: true });
+});
+$("setupMfaBtn").addEventListener("click", () => openMfaDialog("setup"));
+$("recoveryMfaBtn").addEventListener("click", () => openMfaDialog("recovery"));
+$("disableMfaBtn").addEventListener("click", () => openMfaDialog("disable"));
+function setAccessPasswordVisible(id, visible) {
+  $(id).type = visible ? "text" : "password";
+  const button = $(`${id}Toggle`);
+  const label = `${visible ? "隐藏" : "显示"}${id === "currentPassword" ? "当前密码" : "新密码"}`;
+  button.setAttribute("aria-pressed", String(visible));
+  button.setAttribute("aria-label", label);
+  button.title = label;
+}
+["currentPassword", "newPassword"].forEach((id) => {
+  $(`${id}Toggle`).addEventListener("click", () => setAccessPasswordVisible(id, $(id).type === "password"));
+});
+$("passwordForm").addEventListener("reset", () => {
+  ["currentPassword", "newPassword"].forEach((id) => setAccessPasswordVisible(id, false));
+});
+$("passwordForm").addEventListener("submit", saveAccessPassword);
+$("copyRecoveryBtn").addEventListener("click", async () => {
+  const codes = $("recoveryCodes").textContent;
+  const button = $("copyRecoveryBtn");
+  if (!codes || button.disabled || mfaStep !== "codes") return;
+  button.disabled = true;
+  let message = "恢复码已复制";
+  let type = "success";
+  try {
+    if (navigator.clipboard?.writeText && window.isSecureContext) {
+      await navigator.clipboard.writeText(codes);
+    } else {
+      const field = document.createElement("textarea");
+      field.value = codes;
+      field.readOnly = true;
+      field.style.cssText = "position:fixed;opacity:0;pointer-events:none;width:1px;height:1px;font-size:16px;";
+      $("mfaDialog").appendChild(field);
+      try {
+        field.focus({ preventScroll: true });
+        field.select();
+        if (!document.execCommand("copy")) throw new Error("Copy unavailable");
+      } finally {
+        field.remove();
+        button.focus({ preventScroll: true });
+      }
+    }
+  } catch (_) {
+    message = "复制失败，请手动选择恢复码复制或下载";
+    type = "error";
+  } finally {
+    button.disabled = false;
+  }
+  if ($("mfaDialog").open && mfaStep === "codes" && $("recoveryCodes").textContent === codes) {
+    securityMessage(message, type, "mfaMessage");
+  }
+});
+$("downloadRecoveryBtn").addEventListener("click", () => {
+  const blob = new Blob(["Trans 一次性恢复码\n每个恢复码仅可使用一次，请与访问密码分开保管。\n\n" + $("recoveryCodes").textContent + "\n"], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "Trans-recovery-codes.txt";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 10000);
 });

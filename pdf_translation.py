@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -66,34 +67,70 @@ class UploadBody:
 
 
 def translation_progress(record):
-    """Only surface recognized progress messages, never arbitrary upstream logs."""
-    value = record.get('progress')
-    progress = max(0, min(99, float(value))) if type(value) in (int, float) and value == value else None
+    """Prefer optional BabelDOC event fields; keep legacy servers compatible.
+
+    The upstream task record may expose stage, stage_current, stage_total,
+    stage_progress, overall_progress, part_index and total_parts. Percentages
+    are 0..100; part_index is one-based. Never mistake stage progress for overall
+    progress or expose unrecognized upstream log text to the browser.
+    """
+    def percentage(value):
+        if type(value) not in (int, float) or not 0 <= value <= 100 or not math.isfinite(value):
+            return None
+        return round(value, 1)
+
+    def counter(value):
+        return value if type(value) is int and 0 <= value <= 999999999 else None
+
     message = record.get('message')
     message = message.strip() if isinstance(message, str) else ''
-    counts = re.fullmatch(r'translate\s+(\d{1,9})/(\d{1,9})', message, re.I)
     stages = {
         'Parse PDF and Create Intermediate Representation': '正在解析 PDF',
         'Detect Scanned PDF': '正在检测扫描页面',
+        'DetectScannedFile': '正在检测扫描页面',
         'Layout Analysis': '正在分析版面',
+        'Parse Page Layout': '正在分析版面',
         'Table Recognition': '正在识别表格',
         'Paragraph Finding': '正在识别段落',
+        'Parse Paragraphs': '正在识别段落',
         'Styles and Formulas': '正在分析样式与公式',
+        'Parse Formulas and Styles': '正在分析样式与公式',
         'Automatic Term Extraction': '正在提取术语',
         'Translate Paragraphs': '正在翻译段落',
         'Typesetting': '正在排版',
+        'Add Fonts': '正在添加字体',
+        'Generate drawing instructions': '正在生成绘制指令',
         'Font Subsetting': '正在处理字体',
+        'Subset font': '正在处理字体',
         'Generate PDF': '正在生成 PDF',
         'Save PDF': '正在保存 PDF',
     }
-    phase = stages.get(message, '正在翻译与排版')
-    if counts and int(counts[2]) > 0:
-        phase = f'正在翻译 · {int(counts[1])}/{int(counts[2])}'
-    elif message in stages and message != 'Translate Paragraphs':
-        # Upstream may report a parse/font substep as 100%; it is not total progress.
-        progress = None
-    # An initial upstream zero often means that no measurable progress exists yet.
-    return phase, progress if progress else None
+    stage = record.get('stage')
+    stage = stage.strip() if isinstance(stage, str) else ''
+    # Accept a display-name suffix from older BabelDOC versions as well.
+    stage = re.sub(r'\s+\(\d+/\d+\)$', '', stage or message)
+    phase = stages.get(stage, '正在翻译与排版')
+    overall = percentage(record.get('overall_progress'))
+    structured = bool(isinstance(record.get('stage'), str) and record['stage'].strip()) or overall is not None
+    if structured:
+        current, total = counter(record.get('stage_current')), counter(record.get('stage_total'))
+        stage_percent = percentage(record.get('stage_progress'))
+        if stage in stages:
+            if current is not None and total is not None and 0 <= current <= total and total > 0:
+                phase += f' · {current}/{total}'
+            elif stage_percent is not None:
+                phase += f' · 本阶段 {stage_percent:g}%'
+        part, parts = counter(record.get('part_index')), counter(record.get('total_parts'))
+        if part is not None and parts is not None and 1 <= part <= parts and parts > 1:
+            phase += f' · 第 {part}/{parts} 部分'
+        return phase, overall
+
+    # Only the legacy "translate x/y" line unambiguously describes overall
+    # progress. A step name may accompany a stale or step-local percentage.
+    counts = re.fullmatch(r'translate\s+(\d{1,9})/(\d{1,9})', message, re.I)
+    if counts and 0 <= int(counts[1]) <= int(counts[2]) and int(counts[2]) > 0:
+        return '正在翻译与排版', round(int(counts[1]) / int(counts[2]) * 100, 1)
+    return phase, None
 
 
 def service_url(value):
@@ -344,10 +381,16 @@ class PdfTasks:
             conditions.append('instr(lower(filename),lower(?))>0')
             params.append(query[:120])
         if status:
-            if status not in ACTIVE + TERMINAL:
+            groups = {'unsuccessful': ('failed', 'download_failed'),
+                      'closed': ('cancelled', 'interrupted')}
+            if status in groups:
+                conditions.append('status IN (?,?)')
+                params.extend(groups[status])
+            elif status in ACTIVE + TERMINAL:
+                conditions.append('status=?')
+                params.append(status)
+            else:
                 raise PdfError('任务状态无效')
-            conditions.append('status=?')
-            params.append(status)
         where = ' AND '.join(conditions)
         with self.connect() as db:
             count = db.execute('SELECT COUNT(*) FROM jobs WHERE ' + where, params).fetchone()[0]
@@ -524,7 +567,7 @@ class PdfTasks:
                 except Exception:
                     # Do not log upstream payloads/exception strings: they may contain credentials.
                     self.logger.warning('PDF task worker encountered an error; state retained for recovery')
-                self.wake.wait(3 if self.active_jobs() else 60)
+                self.wake.wait(2 if self.active_jobs() else 60)
                 self.wake.clear()
 
     def tick(self):
@@ -717,7 +760,7 @@ class PdfTasks:
             self.update(job['id'], expected_status=job['status'], status='download_failed', phase='结果不完整，请核对上游后重新获取结果', finished=time.time())
             self.finish_delete(job['id'])
             return
-        if not self.update(job['id'], expected_status=job['status'], status='fetching', remote_files=json.dumps(output), phase='翻译完成，正在保存 PDF', progress=99):
+        if not self.update(job['id'], expected_status=job['status'], status='fetching', remote_files=json.dumps(output), phase='翻译完成，等待下载 PDF 到 Trans', progress=None):
             return
         self.fetch_results(self.get(job['id']))
 
@@ -731,7 +774,10 @@ class PdfTasks:
                 return
             files = json.loads(job['remote_files'])
             self.output_names(job, list(files.values()))
-            for kind in self.selected_outputs(job):
+            outputs = self.selected_outputs(job)
+            for index, kind in enumerate(outputs, 1):
+                label = '译文 PDF' if kind == 'mono' else '左右对照 PDF'
+                phase = f'下载{label}到 Trans（{index}/{len(outputs)}）'
                 path = self.directory(job['id']) / (kind + '.pdf')
                 if path.is_file():
                     try:
@@ -741,15 +787,40 @@ class PdfTasks:
                         path.unlink(missing_ok=True)
                 temp = path.with_suffix('.part')
                 try:
-                    with self.response('GET', job['endpoint'], '/translatedFile/' + quote(files[kind], safe=''), stream=True) as response:
+                    self.update(job['id'], expected_status='fetching', phase=phase, progress=None, poll_warning='')
+                    with self.response('GET', job['endpoint'], '/translatedFile/' + quote(files[kind], safe=''), stream=True,
+                                       headers={'Accept-Encoding': 'identity'}) as response:
+                        length = response.headers.get('Content-Length', '')
+                        total = int(length) if re.fullmatch(r'[0-9]{1,18}', length) else 0
+                        if response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
+                            total = 0  # iter_content yields decoded bytes, not the encoded length.
+                        received = 0
+                        started = last_report = time.monotonic()
                         with temp.open('wb') as handle:
                             os.chmod(temp, 0o600)
-                            for chunk in response.iter_content(1024 * 1024):
+                            for chunk in response.iter_content(256 * 1024):
+                                if not chunk:
+                                    continue
                                 if self.get(job['id'])['delete_requested']:
                                     raise PdfError('任务已标记清理')
                                 with self.storage_lock():
                                     self.check_space(len(chunk))
                                     handle.write(chunk)
+                                received += len(chunk)
+                                now = time.monotonic()
+                                if now - last_report >= 1:
+                                    amount = f'{received / 1048576:.2f} MB'
+                                    if total:
+                                        amount += f' / {total / 1048576:.2f} MB'
+                                    speed = received / max(now - started, .001) / 1024
+                                    # Progress is for this file; its label includes the file index.
+                                    self.update(job['id'], expected_status='fetching',
+                                                phase=f'{phase} · {amount} · {speed:.0f} KB/s',
+                                                progress=min(100, received / total * 100) if total else None)
+                                    last_report = now
+                        if total and received != total:
+                            raise PdfError('下载文件不完整')
+                    self.update(job['id'], expected_status='fetching', phase=f'正在校验{label}（{index}/{len(outputs)}）', progress=None)
                     self.validate_pdf(temp)
                     os.replace(temp, path)
                 finally:
@@ -805,7 +876,7 @@ class PdfTasks:
                 if not self.update(job_id, expected_status=job['status'], status='cancelled', phase='已核对上游结束或未创建任务，取消本地跟踪', finished=time.time()):
                     raise PdfError('任务状态已更新，请刷新后重试')
             elif action == 'retry_download' and files is not None:
-                if not self.update(job_id, allow_terminal=True, expected_status=job['status'], status='fetching', remote_files=json.dumps(files), phase='等待重新获取结果', finished=None):
+                if not self.update(job_id, allow_terminal=True, expected_status=job['status'], status='fetching', remote_files=json.dumps(files), phase='等待重新获取结果', progress=None, finished=None):
                     raise PdfError('任务状态已更新，请刷新后重试')
             elif action == 'acknowledge' and job['status'] == 'unknown' and check_remote:
                 if not self.update(job_id, expected_status=job['status'], status='interrupted', phase='已确认上游结束；如需重试，请重新上传', finished=time.time()):

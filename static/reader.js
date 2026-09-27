@@ -2,11 +2,21 @@ const readerState = {
   books: [],
   reparseBusy: false,
   currentBookId: "",
+  displayedBookId: "",
+  navigationRequest: 0,
   currentBook: null,
   chapters: [],
   currentChapter: 0,
   currentSentence: 0,
+  progressSentence: 0,
+  progressFollowsAudio: false,
+  lastProgressKey: "",
+  progressRequests: new Set(),
   sentences: [],
+  readingOffsets: [0],
+  sentenceOffsets: [0],
+  sentenceElements: [],
+  chapterComplete: false,
   voices: [],
   reading: false,
   paused: false,
@@ -209,6 +219,9 @@ function openReaderDialog(dialog) {
 }
 function markUserScrollIntent() {
   readerState.lastUserScrollAt = Date.now();
+  if (!readerState.reading && !document.querySelector("dialog[open]")) {
+    readerState.progressFollowsAudio = false;
+  }
 }
 
 function shouldKeepReaderAwake() {
@@ -1080,10 +1093,29 @@ function formatBookAuthor(book) {
 }
 
 function bookProgressPercent(book) {
+  if (Number.isFinite(book.progress?.percent)) return Math.max(0, Math.min(100, book.progress.percent));
   const chapterCount = Math.max(0, Number(book.chapter_count) || 0);
   if (!chapterCount) return 0;
   const chapterIndex = Math.max(0, Math.min(chapterCount - 1, Number(book.progress?.chapter) || 0));
-  return Math.round(((chapterIndex + 1) / chapterCount) * 100);
+  return Math.round((chapterIndex / chapterCount) * 100);
+}
+
+function prepareReadingOffsets() {
+  const offsets = [0];
+  for (const chapter of readerState.chapters) offsets.push(offsets[offsets.length - 1] + Math.max(0, Number(chapter.char_count) || 0));
+  readerState.readingOffsets = offsets;
+}
+
+function currentReadingPercent() {
+  const offsets = readerState.readingOffsets;
+  const total = offsets[offsets.length - 1];
+  if (!total || offsets.length !== readerState.chapters.length + 1) return 0;
+  const chapter = readerState.currentChapter;
+  const sentences = readerState.sentenceOffsets;
+  const length = sentences[sentences.length - 1];
+  const fraction = readerState.chapterComplete ? 1 : length ? (sentences[readerState.progressSentence] || 0) / length : 0;
+  const percent = ((offsets[chapter] || 0) + ((offsets[chapter + 1] || 0) - (offsets[chapter] || 0)) * fraction) / total * 100;
+  return Math.min(readerState.chapterComplete && chapter === readerState.chapters.length - 1 ? 100 : 99.9, Math.round(percent * 10) / 10);
 }
 
 function formatBookLastOpened(book) {
@@ -1161,7 +1193,7 @@ function renderStatistics() {
   const list = $("statisticsList");
   if (!summary || !list) return;
   const books = recentlyOpenedBooks();
-  summary.textContent = books.length ? `共 ${books.length} 本 · 按最近打开排列 · 进度按章节估算` : "书架中还没有书籍";
+  summary.textContent = books.length ? `共 ${books.length} 本 · 按正文位置统计；旧记录再次阅读后更新` : "书架中还没有书籍";
   list.innerHTML = "";
   books.forEach((book) => {
     const progressPercent = bookProgressPercent(book);
@@ -1170,9 +1202,9 @@ function renderStatistics() {
     item.innerHTML = `
       <div class="statistics-book-head">
         <strong>${escapeHtml(book.title)}</strong>
-        <span>${progressPercent}%</span>
+        <span>${!Number.isFinite(book.progress?.percent) && progressPercent ? "约 " : ""}${progressPercent}%</span>
       </div>
-      <div class="statistics-progress" role="progressbar" aria-label="${escapeAttribute(`${book.title} 章节进度`)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progressPercent}">
+      <div class="statistics-progress" role="progressbar" aria-label="${escapeAttribute(`${book.title} 阅读进度`)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progressPercent}">
         <i style="width: ${progressPercent}%"></i>
       </div>
       <div class="statistics-book-meta">
@@ -1608,6 +1640,7 @@ async function confirmDeleteBook() {
     readerState.books = readerState.books.filter((item) => item.id !== book.id);
     renderBooks();
     if (deletedCurrentBook) {
+      readerState.navigationRequest += 1;
       stopListening(false);
       window.clearTimeout(readerState.saveTimer);
       readerState.saveTimer = null;
@@ -1804,11 +1837,26 @@ async function uploadBook(event) {
 }
 
 async function openBook(bookId, chapter = 0, sentence = 0, addHistory = true) {
+  const navigationRequest = ++readerState.navigationRequest;
   const openedFromShelf = !$("shelfView").hidden;
+  flushPendingProgress();
   stopListening(false);
+  window.clearTimeout(readerState.saveTimer);
+  readerState.saveTimer = null;
+  readerState.displayedBookId = "";
   readerState.currentBookId = bookId;
-  const data = await api(`/api/books/${bookId}`);
-  if (readerState.currentBookId !== bookId) return;
+  setStatus("正在打开书籍…");
+  const data = await api(`/api/books/${bookId}`).catch((error) => {
+    if (navigationRequest === readerState.navigationRequest) throw error;
+    return null;
+  });
+  if (readerState.currentBookId !== bookId || navigationRequest !== readerState.navigationRequest) return;
+  const previous = readerState.books.find((book) => book.id === bookId);
+  if (previous && previous.content_revision !== data.book.content_revision
+      && chapter === (previous.progress?.chapter || 0) && sentence === (previous.progress?.sentence || 0)) {
+    chapter = data.book.progress?.chapter || 0;
+    sentence = data.book.progress?.sentence || 0;
+  }
   if (data.book.content_revision) {
     const key = `readerContentRevision:${bookId}`;
     try {
@@ -1821,9 +1869,10 @@ async function openBook(bookId, chapter = 0, sentence = 0, addHistory = true) {
       // Keep the old revision so temporary storage failures are retried.
     }
   }
-  if (readerState.currentBookId !== bookId) return;
+  if (readerState.currentBookId !== bookId || navigationRequest !== readerState.navigationRequest) return;
   readerState.currentBook = data.book;
   readerState.chapters = data.chapters || [];
+  prepareReadingOffsets();
   renderBooks();
   renderChapterSelect();
   showReadingView(addHistory && openedFromShelf);
@@ -1845,20 +1894,22 @@ function showReadingView(addHistory = false) {
 }
 
 function updateCurrentBookProgressLocally() {
+  updateProgressFromScroll(false);
   const bookId = readerState.currentBookId;
-  if (!bookId) return null;
+  if (!bookId || readerState.displayedBookId !== bookId) return null;
   const now = Date.now() / 1000;
   const snapshot = {
     bookId,
     chapter: readerState.currentChapter,
-    sentence: readerState.currentSentence,
+    sentence: readerState.progressSentence,
+    percent: currentReadingPercent(),
     contentRevision: readerState.currentBook?.content_revision || "",
   };
   readerState.books = readerState.books.map((book) => (
     book.id === bookId
       ? {
           ...book,
-          progress: { chapter: snapshot.chapter, sentence: snapshot.sentence },
+          progress: { chapter: snapshot.chapter, sentence: snapshot.sentence, percent: snapshot.percent },
           updated_at: now,
           last_opened_at: now,
         }
@@ -1868,10 +1919,11 @@ function updateCurrentBookProgressLocally() {
 }
 
 function showShelfView() {
+  readerState.navigationRequest += 1;
+  const progressSnapshot = updateCurrentBookProgressLocally();
   stopListening(false);
   window.clearTimeout(readerState.saveTimer);
   readerState.saveTimer = null;
-  const progressSnapshot = updateCurrentBookProgressLocally();
   if (progressSnapshot) saveProgress(progressSnapshot);
   $("readingView").hidden = true;
   $("shelfView").hidden = false;
@@ -1928,20 +1980,25 @@ function openChapterSelect() {
 function selectChapter(chapterIndex) {
   $("chapterSelectDialog").close();
   const normalizedChapterIndex = Number(chapterIndex);
-  if (normalizedChapterIndex === Number(readerState.currentChapter)) return;
+  if (normalizedChapterIndex === Number(readerState.currentChapter)) {
+    readerState.navigationRequest += 1;
+    return;
+  }
   const shouldResume = readerState.reading && !readerState.paused;
   stopListening(false, false);
   loadChapter(normalizedChapterIndex, 0)
-    .then(() => {
-      if (shouldResume) return startListeningFrom(0);
+    .then((loaded) => {
+      if (loaded && shouldResume) return startListeningFrom(0);
       return null;
     })
     .catch((error) => setListenStatus(error.message));
 }
 
 async function loadChapter(chapterIndex, sentenceIndex = 0) {
-  if (!readerState.currentBookId) return;
+  if (!readerState.currentBookId) return false;
+  const navigationRequest = ++readerState.navigationRequest;
   const bookId = readerState.currentBookId;
+  const isCurrent = () => readerState.currentBookId === bookId && navigationRequest === readerState.navigationRequest;
   const normalizedChapterIndex = Number(chapterIndex);
   const preparedEntry = readerState.nextChapterPrefetch;
   const canUsePrepared = preparedEntry
@@ -1952,26 +2009,42 @@ async function loadChapter(chapterIndex, sentenceIndex = 0) {
   if (!prepared && canUsePrepared && readerState.reading) {
     prepared = await preparedEntry.promise;
   }
-  if (readerState.currentBookId !== bookId) return;
-  const data = prepared?.data || await api(`/api/books/${bookId}/chapters/${normalizedChapterIndex}`);
-  if (readerState.currentBookId !== bookId) return;
+  if (!isCurrent()) return false;
+  const data = prepared?.data || await api(`/api/books/${bookId}/chapters/${normalizedChapterIndex}`).catch((error) => {
+    if (isCurrent()) throw error;
+    return null;
+  });
+  if (!isCurrent()) return false;
   readerState.currentBook = data.book;
   readerState.currentChapter = data.chapter.index;
   readerState.currentSentence = sentenceIndex;
   syncChapterSelection();
   renderChapter(data.chapter, prepared?.packs || []);
-  highlightSentence(sentenceIndex, true);
+  highlightSentence(sentenceIndex, false);
+  readerState.progressSentence = readerState.currentSentence;
+  scrollActiveSentence("instant");
+  if (data.book.progress?.percent === 100 && data.book.progress.chapter === readerState.currentChapter
+      && data.book.progress.sentence === readerState.currentSentence) readerState.chapterComplete = true;
   saveProgressSoon();
   setStatus(readerState.currentBook.title);
   if (readerState.reading) updateMediaSessionMetadata();
+  return true;
 }
 
 function renderChapter(chapter, prefetchedPacks = []) {
   clearTtsBrowserCache();
+  readerState.displayedBookId = readerState.currentBookId;
   const content = $("bookContent");
   content.classList.remove("empty");
   content.innerHTML = "";
   readerState.sentences = [];
+  readerState.chapterComplete = false;
+  readerState.progressSentence = 0;
+  readerState.progressFollowsAudio = false;
+  if (Number.isFinite(chapter.char_count) && readerState.chapters[chapter.index] && readerState.chapters[chapter.index].char_count !== chapter.char_count) {
+    readerState.chapters[chapter.index].char_count = chapter.char_count;
+    prepareReadingOffsets();
+  }
   let hasRenderableContent = false;
   const title = document.createElement("h2");
   title.className = "chapter-title";
@@ -2012,6 +2085,11 @@ function renderChapter(chapter, prefetchedPacks = []) {
     content.classList.add("empty");
     content.textContent = "本章没有可阅读文本";
   }
+  readerState.sentenceElements = [...content.querySelectorAll(".reader-sentence")];
+  readerState.sentenceOffsets = [0];
+  for (const sentence of readerState.sentences) {
+    readerState.sentenceOffsets.push(readerState.sentenceOffsets[readerState.sentenceOffsets.length - 1] + sentence.text.length);
+  }
   prefetchedPacks.forEach((pack) => {
     if (!(pack?.blob instanceof Blob) || !validPackSegments(pack.segments)) return;
     const textByIndex = new Map(readerState.sentences.map((sentence) => [
@@ -2044,6 +2122,7 @@ function handleSentenceTap(event, index) {
 }
 
 function focusSentence(index, read = false) {
+  if (!readerState.reading) readerState.progressFollowsAudio = false;
   highlightSentence(index, !read);
   saveProgressSoon();
   if (read) startListeningFrom(index).catch((error) => setListenStatus(error.message));
@@ -2071,6 +2150,11 @@ function scheduleAutoCenterSentence() {
 
 function highlightSentence(index, scroll = false) {
   readerState.currentSentence = Math.max(0, Math.min(Number(index) || 0, Math.max(readerState.sentences.length - 1, 0)));
+  if (readerState.reading) {
+    readerState.progressSentence = readerState.currentSentence;
+    readerState.progressFollowsAudio = true;
+    readerState.chapterComplete = false;
+  }
   document.querySelectorAll(".reader-sentence.active").forEach((item) => item.classList.remove("active"));
   const active = activeSentenceElement();
   if (active) {
@@ -2085,28 +2169,80 @@ function highlightSentence(index, scroll = false) {
   }
 }
 
-function saveProgressSoon() {
-  window.clearTimeout(readerState.saveTimer);
-  readerState.saveTimer = window.setTimeout(() => {
-    readerState.saveTimer = null;
-    saveProgress();
-  }, 350);
+function updateProgressFromScroll(save = true) {
+  if (readerState.reading || readerState.progressFollowsAudio || !readerState.currentBookId
+      || readerState.displayedBookId !== readerState.currentBookId || $("readingView").hidden
+      || document.querySelector("dialog[open]") || !readerState.sentenceElements.length) return;
+  const content = $("bookContent");
+  const bounds = content.getBoundingClientRect();
+  const contained = getComputedStyle(content).overflowY !== "visible";
+  const top = contained ? Math.max(0, bounds.top) : Math.max(0, document.querySelector(".reader-topbar").getBoundingClientRect().bottom,
+    $("readingView").querySelector(".reader-toolbar").getBoundingClientRect().bottom,
+    $("listenToolbar").getBoundingClientRect().bottom);
+  const bottom = Math.min(bounds.bottom, window.innerHeight);
+  if (bottom <= top) return;
+  const atEnd = contained ? content.scrollHeight - content.scrollTop - content.clientHeight <= 3 : bounds.bottom <= bottom + 3;
+  const elements = readerState.sentenceElements;
+  let low = -1, high = elements.length - 1;
+  // A sentence must fit completely below the toolbars and above the viewport bottom.
+  while (low < high) {
+    const middle = (low + high + 1) >> 1;
+    if (elements[middle].getBoundingClientRect().bottom <= bottom) low = middle;
+    else high = middle - 1;
+  }
+  if (low < 0) return;
+  const visible = elements[low].getBoundingClientRect();
+  if (visible.top < top || visible.bottom <= visible.top) return;
+  const index = low;
+  const complete = atEnd && index === elements.length - 1;
+  if (readerState.progressSentence === index && readerState.chapterComplete === complete) return;
+  readerState.progressSentence = index;
+  readerState.chapterComplete = complete;
+  if (save) saveProgressSoon();
 }
 
-async function saveProgress(snapshot = null) {
+function saveProgressSoon() {
+  // One lightweight viewport check every five seconds while a book is open.
+  // Unchanged positions never issue another server write; TTS retains its own position.
+  if (readerState.saveTimer !== null || !readerState.currentBookId || $("readingView").hidden) return;
+  readerState.saveTimer = window.setTimeout(() => {
+    readerState.saveTimer = null;
+    if (!readerState.currentBookId || $("readingView").hidden) return;
+    if (document.visibilityState !== "visible" && !readerState.reading) return;
+    updateProgressFromScroll(false);
+    saveProgress();
+    saveProgressSoon();
+  }, 5000);
+}
+
+function flushPendingProgress(keepalive = false) {
+  window.clearTimeout(readerState.saveTimer);
+  readerState.saveTimer = null;
+  const snapshot = updateCurrentBookProgressLocally();
+  if (snapshot) return saveProgress(snapshot, keepalive);
+}
+
+async function saveProgress(snapshot = null, keepalive = false) {
   const bookId = snapshot?.bookId || readerState.currentBookId;
   const chapter = snapshot?.chapter ?? readerState.currentChapter;
-  const sentence = snapshot?.sentence ?? readerState.currentSentence;
-  if (!bookId) return;
+  const sentence = snapshot?.sentence ?? readerState.progressSentence;
+  if (!bookId || (!snapshot && readerState.displayedBookId !== bookId)) return;
+  const payload = JSON.stringify({
+    chapter,
+    sentence,
+    percent: snapshot?.percent ?? currentReadingPercent(),
+    content_revision: snapshot?.contentRevision ?? readerState.currentBook?.content_revision ?? "",
+  });
+  const progressKey = `${bookId}:${payload}`;
+  if (readerState.lastProgressKey === progressKey || (!keepalive && readerState.progressRequests.has(progressKey))) return;
+  readerState.progressRequests.add(progressKey);
   try {
     const data = await api(`/api/books/${bookId}/progress`, {
       method: "PUT",
-      body: JSON.stringify({
-        chapter,
-        sentence,
-        content_revision: snapshot?.contentRevision ?? readerState.currentBook?.content_revision ?? "",
-      }),
+      keepalive,
+      body: payload,
     });
+    readerState.lastProgressKey = progressKey;
     if (data.book) {
       readerState.books = readerState.books.map((book) => (book.id === data.book.id ? data.book : book));
       if (readerState.currentBookId === data.book.id && readerState.currentBook) {
@@ -2116,6 +2252,8 @@ async function saveProgress(snapshot = null) {
     }
   } catch (error) {
     setStatus(error.message);
+  } finally {
+    readerState.progressRequests.delete(progressKey);
   }
 }
 
@@ -2349,9 +2487,11 @@ function finishSleepPause(index) {
         || readerState.currentBookId !== currentBookId
         || readerState.currentChapter !== finishedChapter) return;
       try {
-        await loadChapter(finishedChapter + 1, 0);
+        if (!await loadChapter(finishedChapter + 1, 0)) return;
         const firstIndex = nextReadableSentenceIndex(0);
         if (firstIndex >= 0) highlightSentence(firstIndex, false);
+        readerState.progressSentence = readerState.currentSentence;
+        readerState.progressFollowsAudio = true;
         setListenStatus("定时已暂停｜下次从下一章开始");
       } catch (error) {
         setListenStatus(error.message || "下一章准备失败，下次播放时重试");
@@ -2924,7 +3064,10 @@ function stopListening(resetStatus = true, clearTimer = true) {
 }
 
 async function startListeningFrom(index = readerState.currentSentence) {
-  if (!readerState.currentBookId || !readerState.sentences.length) return;
+  // During a book switch the old text may still be visible while the new
+  // request is pending or has failed. Never play it under the new book ID.
+  if (!readerState.currentBookId || readerState.displayedBookId !== readerState.currentBookId
+      || !readerState.sentences.length) return;
   const config = readerState.ttsConfig || {};
   if (!config.enabled || !config.api_key_configured) {
     setListenStatus("请先在设置里启用并配置 API Key");
@@ -2957,7 +3100,7 @@ async function playSentence(index, token = readerState.ttsToken, continuous = fa
       setListenStatus("正在切换下一章");
       setMediaSessionPlaybackState("playing");
       try {
-        await loadChapter(readerState.currentChapter + 1, 0);
+        if (!await loadChapter(readerState.currentChapter + 1, 0)) return;
         await playSentence(nextReadableSentenceIndex(0), token, true);
       } catch (error) {
         if (readerState.reading && token === readerState.ttsToken) {
@@ -2968,6 +3111,8 @@ async function playSentence(index, token = readerState.ttsToken, continuous = fa
       return;
     }
     stopListening(false);
+    readerState.chapterComplete = true;
+    saveProgressSoon();
     setListenStatus("本书朗读完成");
     return;
   }
@@ -3128,7 +3273,7 @@ async function moveChapter(delta) {
   }
   const shouldResume = readerState.reading && !readerState.paused;
   stopListening(false, false);
-  await loadChapter(next, 0);
+  if (!await loadChapter(next, 0)) return;
   if (shouldResume) await startListeningFrom(0);
 }
 
@@ -4845,6 +4990,11 @@ window.addEventListener("resize", () => {
 });
 window.addEventListener("wheel", markUserScrollIntent, { passive: true });
 window.addEventListener("touchmove", markUserScrollIntent, { passive: true });
+window.addEventListener("pointerdown", (event) => {
+  if (event.target === document.documentElement || event.target === document.body || $("bookContent").contains(event.target)) {
+    markUserScrollIntent();
+  }
+}, { passive: true });
 window.addEventListener("keydown", (event) => {
   if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
     markUserScrollIntent();
@@ -4852,14 +5002,19 @@ window.addEventListener("keydown", (event) => {
 });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
+    saveProgressSoon();
     refreshSelectedReaderFont();
     syncReaderWakeLock();
     refreshMimoBalanceWhenVisible();
   } else {
+    flushPendingProgress(true);
     releaseReaderWakeLock();
   }
 });
-window.addEventListener("pageshow", refreshSelectedReaderFont);
+window.addEventListener("pageshow", () => {
+  refreshSelectedReaderFont();
+  saveProgressSoon();
+});
 window.addEventListener("popstate", (event) => {
   const state = event.state || {};
   if (state.readerView === "book" && state.bookId) {
@@ -4876,6 +5031,7 @@ window.addEventListener("popstate", (event) => {
   showShelfView();
 });
 window.addEventListener("pagehide", () => {
+  flushPendingProgress(true);
   readerState.wakeLockWanted = false;
   readerState.offlineDownloadWakeLockWanted = false;
   releaseReaderWakeLock();
@@ -4899,6 +5055,7 @@ document.querySelectorAll(".reader-dialog").forEach((dialog) => {
   });
 });
 $("logoutBtn").addEventListener("click", async () => {
+  await flushPendingProgress();
   readerState.wakeLockWanted = false;
   readerState.offlineDownloadWakeLockWanted = false;
   releaseReaderWakeLock();

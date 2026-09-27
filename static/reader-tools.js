@@ -190,6 +190,7 @@
       if (readerState.currentBookId === update.bookId) {
         stopListening(false);
         clearTimeout(readerState.saveTimer);
+        readerState.saveTimer = null;
       }
       if (readerState.currentBookId === update.bookId) {
         const data = await api(`/api/books/${update.bookId}?inspect=1`);

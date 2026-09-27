@@ -5,6 +5,9 @@ __pycache__/
 config/app_config.json
 config/service_config.json
 config/secret_key
+config/security.json
+config/security.json.*
+config/security.lock
 config/mimo_balance_state.json
 config/deepseek_cache.sqlite3
 config/deepseek_cache.sqlite3-*

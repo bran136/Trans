@@ -21,6 +21,7 @@
           <h1>Trans</h1>
         </div>
         <div class="home-actions">
+          <button class="ghost" id="settingsBtn" type="button">设置</button>
           <button class="ghost" id="monitorBtn" type="button">监控</button>
           <button class="ghost" id="aboutBtn" type="button">关于</button>
           <button class="ghost" id="logoutBtn" type="button">退出</button>
@@ -63,9 +64,9 @@
         </a>
       </section>
       <footer class="home-footer">
-        <a class="project-credit" href="https://github.com/bran136/Trans/blob/master/LICENSE" target="_blank" rel="noopener noreferrer">Trans · AGPL-3.0</a>
+        <a class="project-credit" href="https://github.com/bran136/Trans/blob/master/LICENSE" target="_blank" rel="noopener noreferrer">{{ current_year }} · AGPL-3.0</a>
         <div class="version-badge app-version">
-          <span>v{{ app_version() }}</span>
+          <a class="version-link" href="https://github.com/bran136/Trans/blob/master/CHANGELOG.md" target="_blank" rel="noopener noreferrer" title="查看更新日志">v{{ app_version() }}</a>
           <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">
             <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
           </a>
@@ -76,14 +77,14 @@
     <dialog id="homeAboutDialog" class="home-about-dialog" aria-labelledby="homeAboutTitle">
       <div class="home-about-head"><h2 id="homeAboutTitle" tabindex="-1" autofocus>关于 Trans</h2><button class="ghost" id="closeAboutBtn" type="button">关闭</button></div>
       <div class="home-about-content">
-        <div class="home-about-brand"><img src="{{ asset_url('site-icon.svg') }}" alt="" aria-hidden="true"><div><strong>Trans</strong><span>v{{ app_version() }}</span></div></div>
-        <p class="home-about-intro">面向电脑与手机的自部署工具，集在线翻译、阅读与听书于一体。</p>
+        <div class="home-about-brand"><img src="{{ asset_url('site-icon.svg') }}" alt="" aria-hidden="true"><div><strong>Trans</strong><a class="version-link" href="https://github.com/bran136/Trans/blob/master/CHANGELOG.md" target="_blank" rel="noopener noreferrer" title="查看更新日志">v{{ app_version() }}</a></div></div>
+        <p class="home-about-intro">集翻译、阅读与听书于一体的个人工具，电脑与手机均可使用。</p>
         <dl class="home-about-features">
-          <div><dt>在线翻译</dt><dd>支持 DeepSeek 与谷歌翻译，提供双引擎对比、原文高亮与历史记录。内含 PDF 中英互译，可管理任务、预览和下载译文及左右对照 PDF。</dd></div>
-          <div><dt>在线读书</dt><dd>支持导入 TXT、EPUB 与 PDF，提供书架管理、目录与正文搜索、阅读进度同步及外观设置。电脑端支持 TXT 全文编辑。</dd></div>
-          <div><dt>听书</dt><dd>通过 Xiaomi MiMo 朗读正文，支持多种音色、倍速播放、定时暂停和音频缓存。</dd></div>
+          <div><dt>在线翻译</dt><dd>支持 DeepSeek 与谷歌双引擎翻译、原文对照与历史查询；支持 PDF 论文中英互译，生成译文或左右对照 PDF。</dd></div>
+          <div><dt>在线读书</dt><dd>阅读 TXT、EPUB 与 PDF，管理书架、搜索正文、同步进度，自由调整阅读外观。电脑端可编辑 TXT 全文。</dd></div>
+          <div><dt>听书</dt><dd>使用 MiMo 多种音色朗读书籍，支持倍速播放、定时暂停与离线缓存。</dd></div>
         </dl>
-        <p class="home-about-note">DeepSeek 翻译与 MiMo 听书需配置对应的大模型服务；谷歌翻译无需 API Key。PDF 翻译另需连接独立部署的 Zotero PDF2zh 服务。</p>
+        <p class="home-about-note"><em>DeepSeek 翻译与 MiMo 听书需配置对应的大模型服务；PDF 翻译另需连接独立部署的 Zotero PDF2zh 服务。</em></p>
         <div class="home-about-links"><a href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer">GitHub 项目</a><a href="https://github.com/bran136/Trans/blob/master/CHANGELOG.md" target="_blank" rel="noopener noreferrer">更新日志</a><a href="https://github.com/bran136/Trans/blob/master/LICENSE" target="_blank" rel="noopener noreferrer">AGPL-3.0</a></div>
       </div>
     </dialog>
@@ -91,14 +92,16 @@
     <dialog id="monitorDialog">
       <section class="monitor-panel">
         <div class="dialog-head">
-          <h2 tabindex="-1" autofocus>服务监控</h2>
+          <div class="monitor-heading">
+            <h2 tabindex="-1" autofocus>服务监控</h2>
+            <div id="monitorMessage" class="config-message" hidden></div>
+          </div>
           <div class="dialog-actions compact-actions">
             <button class="ghost" id="refreshStatusBtn" type="button">刷新</button>
             <button class="danger-btn" id="restartServiceBtn" type="button">重启服务</button>
             <button class="ghost" id="closeMonitorBtn" type="button">关闭</button>
           </div>
         </div>
-        <div id="monitorMessage" class="config-message" hidden></div>
         <div class="monitor-sections">
           <section class="monitor-section">
             <h3>应用服务</h3>
@@ -151,15 +154,93 @@
               </div>
             </div>
           </section>
-          <section class="monitor-section">
-            <h3>访问密码</h3>
-            <div class="monitor-password-row">
-              <input id="currentPassword" type="password" maxlength="256" autocomplete="current-password" aria-label="当前访问密码" placeholder="输入当前密码">
-              <input id="newPassword" type="password" minlength="12" maxlength="256" autocomplete="new-password" aria-label="新的总入口访问密码" placeholder="输入新密码（至少 12 位）">
-              <button class="primary" id="savePasswordBtn" type="button">修改密码</button>
-              <small>验证当前密码后才能修改；其他浏览器需要重新登录</small>
+        </div>
+      </section>
+    </dialog>
+
+    <dialog id="securityDialog" aria-labelledby="securityTitle">
+      <section class="monitor-panel security-panel">
+        <div class="dialog-head">
+          <h2 id="securityTitle" tabindex="-1" autofocus>设置</h2>
+          <p id="securityMessage" class="config-message" role="status" hidden></p>
+          <button class="ghost" id="closeSecurityBtn" type="button">关闭</button>
+        </div>
+        <section class="security-section" aria-labelledby="mfaTitle">
+          <div class="security-section-head"><h3 id="mfaTitle">2FA 双重验证</h3><span id="mfaStatus" class="security-status">正在读取</span></div>
+          <p id="mfaSummary" class="security-hint">使用验证器生成动态验证码，为密码登录增加一层保护。</p>
+          <div class="security-actions">
+            <button class="primary" id="setupMfaBtn" type="button" disabled>绑定验证器</button>
+            <button class="ghost" id="recoveryMfaBtn" type="button" hidden>重新生成恢复码</button>
+            <button class="danger-btn" id="disableMfaBtn" type="button" hidden>关闭双重验证</button>
+          </div>
+        </section>
+        <section class="security-section" aria-labelledby="passwordTitle">
+          <div class="security-section-head">
+            <h3 id="passwordTitle">修改密码</h3>
+            <button class="primary" id="savePasswordBtn" type="submit" form="passwordForm" disabled>修改密码</button>
+          </div>
+          <p class="security-hint">安全设置或密码变更后，其他浏览器需要重新登录。</p>
+          <form id="passwordForm" class="security-form">
+            <div class="security-password-field">
+              <label for="currentPassword">当前密码</label>
+              <div class="security-password-input">
+                <input id="currentPassword" type="password" maxlength="256" autocomplete="current-password" required>
+                <button class="ghost password-visibility-btn" id="currentPasswordToggle" type="button" aria-controls="currentPassword" aria-label="显示当前密码" aria-pressed="false" title="显示当前密码">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/><path class="password-eye-slash" d="m3 3 18 18"/></svg>
+                </button>
+              </div>
             </div>
-          </section>
+            <div class="security-password-field">
+              <label for="newPassword">新密码</label>
+              <div class="security-password-input">
+                <input id="newPassword" type="password" minlength="12" maxlength="256" autocomplete="new-password" placeholder="至少 12 位" required>
+                <button class="ghost password-visibility-btn" id="newPasswordToggle" type="button" aria-controls="newPassword" aria-label="显示新密码" aria-pressed="false" title="显示新密码">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/><path class="password-eye-slash" d="m3 3 18 18"/></svg>
+                </button>
+              </div>
+            </div>
+          </form>
+        </section>
+        <section class="security-section" aria-labelledby="clientsTitle">
+          <div class="security-section-head">
+            <h3 id="clientsTitle">已登录设备</h3>
+            <button class="ghost" id="refreshClientsBtn" type="button" disabled>刷新</button>
+          </div>
+          <div id="loginClients" class="login-clients" aria-live="polite"><p class="security-hint">正在读取…</p></div>
+        </section>
+      </section>
+    </dialog>
+
+    <dialog id="mfaDialog" aria-labelledby="mfaDialogTitle">
+      <section class="monitor-panel security-panel">
+        <div class="dialog-head">
+          <h2 id="mfaDialogTitle" tabindex="-1" autofocus>绑定验证器</h2>
+          <p id="mfaMessage" class="config-message" role="status" hidden></p>
+          <button class="ghost" id="closeMfaBtn" type="button">关闭</button>
+        </div>
+        <p id="mfaDialogHint" class="security-hint">请先验证当前访问密码。</p>
+        <form id="mfaForm" class="security-form">
+          <label id="mfaPasswordField">当前密码<input id="mfaPassword" type="password" maxlength="256" autocomplete="current-password" required></label>
+          <div id="mfaSetup" class="security-setup" hidden>
+            <img id="mfaQr" alt="使用验证器扫描此二维码" width="180" height="180">
+            <div><p>用验证器扫描二维码，或手动添加下方密钥。</p><code id="mfaSecret"></code><small>TOTP · 30 秒 · 6 位数字<br>绑定有效期 10 分钟，确认后才会启用。</small></div>
+          </div>
+          <label id="mfaCodeField" hidden><span id="mfaCodeLabel">验证码或恢复码</span><input id="mfaCode" type="text" maxlength="64" autocomplete="one-time-code" autocapitalize="off" spellcheck="false"></label>
+          <div class="security-actions">
+            <button class="primary" id="confirmMfaBtn" type="submit">验证密码</button>
+            <button class="ghost" id="restartMfaBtn" type="button" hidden>重新开始</button>
+          </div>
+        </form>
+        <div id="recoveryPanel" class="security-recovery" hidden>
+          <div class="security-section-head">
+            <h3>请保存恢复码</h3>
+            <div class="security-actions">
+              <button class="ghost" id="copyRecoveryBtn" type="button">复制</button>
+              <button class="ghost" id="downloadRecoveryBtn" type="button">下载</button>
+            </div>
+          </div>
+          <p>仅本次显示，每个限用一次。手机丢失时可代替验证码；请与密码分开保管。</p>
+          <pre id="recoveryCodes" tabindex="0" aria-label="一次性恢复码"></pre>
         </div>
       </section>
     </dialog>

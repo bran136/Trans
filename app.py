@@ -23,7 +23,8 @@ import threading
 import time
 import uuid
 import zipfile
-from functools import wraps
+from functools import lru_cache, wraps
+from contextlib import contextmanager
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -39,6 +40,8 @@ from xml.etree import ElementTree
 import reader_search
 import pdf_translation
 import requests
+import pyotp
+import segno
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 from werkzeug.utils import secure_filename
@@ -48,6 +51,12 @@ BASE_DIR = Path(__file__).resolve().parent
 VERSION_FILE = BASE_DIR / "VERSION"
 CONFIG_DIR = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "app_config.json"
+SECURITY_FILE = CONFIG_DIR / "security.json"
+SECURITY_LOCK = threading.RLock()
+CLIENT_ACTIVITY_INTERVAL = 60
+CLIENT_LOCATION_CACHE = OrderedDict()
+CLIENT_LOCATION_LOCK = threading.Lock()
+CLIENT_LOCATION_PENDING = {}
 SERVICE_CONFIG_FILE = CONFIG_DIR / "service_config.json"
 SERVICE_CONFIG_EXAMPLE_FILE = CONFIG_DIR / "service_config.example.json"
 MIMO_BALANCE_STATE_FILE = CONFIG_DIR / "mimo_balance_state.json"
@@ -97,6 +106,7 @@ BUILD_VERSION_FILES = (
     BASE_DIR / "templates" / "pdf_translation.html",
     BASE_DIR / "static" / "pdf-translation.css",
     BASE_DIR / "static" / "pdf-translation.js",
+    BASE_DIR / "static" / "pdf-metadata-worker.js",
     BASE_DIR / "templates" / "home.html",
     BASE_DIR / "templates" / "index.html",
     BASE_DIR / "templates" / "login.html",
@@ -150,7 +160,7 @@ TTS_PACK_PRUNE_INTERVAL_SECONDS = 60
 TTS_CACHE_STATS_MAX_AGE_SECONDS = 60
 TTS_PACK_PREFETCH_HINT_LIMIT = 16
 TTS_OFFLINE_STATUS_SNAPSHOT_VERSION = 1
-CHAPTER_CACHE_VERSION = 5
+CHAPTER_CACHE_VERSION = 6
 TTS_SENTENCE_INDEX_VERSION = 1
 OFFICIAL_DEEPSEEK_HOSTS = {"api.deepseek.com"}
 OFFICIAL_MIMO_TTS_HOSTS = {"api.xiaomimimo.com"}
@@ -184,9 +194,7 @@ BOOK_IMPORT_JOBS = OrderedDict()
 BOOK_IMPORT_LOCK = threading.RLock()
 LOGIN_FAILURE_WINDOW_SECONDS = 5 * 60
 LOGIN_FAILURE_LIMIT = 8
-LOGIN_FAILURES = {}
-LOGIN_FAILURE_LOCK = threading.Lock()
-LOGIN_FAILURE_MAX_IPS = 10_000
+LOGIN_FAILURE_MAX_IPS = 1000
 TTS_CACHE_LOCK = threading.RLock()
 TTS_CACHE_KEY_LOCKS = tuple(threading.Lock() for _ in range(64))
 TTS_PACK_KEY_LOCKS = tuple(threading.Lock() for _ in range(32))
@@ -1860,7 +1868,7 @@ def parse_epub_spine(path, fallback_title):
         opf_path = zip_path_join(root_prefix, rootfile.attrib["full-path"])
         opf_base = posixpath.dirname(opf_path)
         opf = parse_epub_xml(read_zip_text(zf, opf_path), "OPF 文件")
-        title = xml_find_text(opf, ["title"]) or fallback_title
+        book_title = xml_find_text(opf, ["title"]) or fallback_title
         author = xml_find_text(opf, ["creator"])
         manifest = {}
         for item in opf.findall(".//{*}manifest/{*}item"):
@@ -1897,6 +1905,7 @@ def parse_epub_spine(path, fallback_title):
 
         chapters = []
         used_sources = set()
+        legacy_title = book_title
         if nav_entries:
             for entry in nav_entries:
                 doc = spine_by_key.get(epub_href_key(entry["href"]))
@@ -1906,6 +1915,7 @@ def parse_epub_spine(path, fallback_title):
                 if analysis["kind"] in {"cover", "image", "toc"}:
                     continue
                 title = normalize_title_text(entry.get("title") or analysis["title"], 120)
+                legacy_title = title
                 chapters.append({
                     "title": title,
                     "kind": analysis["kind"],
@@ -1919,15 +1929,6 @@ def parse_epub_spine(path, fallback_title):
                     "cached": False,
                 })
                 used_sources.add(epub_href_key(doc["item"]["href"]))
-
-            for index, chapter in enumerate(chapters):
-                next_chapter = chapters[index + 1] if index + 1 < len(chapters) else None
-                if (
-                    next_chapter
-                    and next_chapter.get("href") == chapter.get("href")
-                    and next_chapter.get("fragment")
-                ):
-                    chapter["end_fragment"] = next_chapter["fragment"]
 
         for doc in spine_docs:
             item = doc["item"]
@@ -1949,7 +1950,31 @@ def parse_epub_spine(path, fallback_title):
             })
         if not chapters:
             raise ValueError("EPUB 中没有识别到可阅读章节")
-        return {"title": title, "author": author, "chapters": chapters, "lazy": True, "cover": cover}
+        # The spine defines reading order. Documents omitted from the TOC still
+        # belong in their original position, not after the final TOC entry.
+        spine_order = {epub_href_key(doc["item"]["href"]): index for index, doc in enumerate(spine_docs)}
+        chapters.sort(key=lambda chapter: spine_order[epub_href_key(chapter["href"])])
+        for index, chapter in enumerate(chapters[:-1]):
+            following = chapters[index + 1]
+            if following["href"] == chapter["href"] and following.get("fragment"):
+                chapter["end_fragment"] = following["fragment"]
+        # Several TOC anchors can share one document; do not count its full text
+        # once for every anchor when calculating the book's reading progress.
+        chapters_by_href = {}
+        for chapter in chapters:
+            if not chapter.get("fragment") and not chapter.get("end_fragment"):
+                continue
+            chapters_by_href.setdefault(chapter["href"], []).append(chapter)
+        archive_names = set(zf.namelist())
+        for href, document_chapters in chapters_by_href.items():
+            # Release each document before parsing the next, including large EPUBs.
+            document_blocks = extract_html_content_blocks(read_zip_text(zf, href), href, archive_names)
+            for chapter in document_chapters:
+                blocks = slice_content_blocks(document_blocks, chapter.get("fragment"), chapter.get("end_fragment"))
+                chapter["char_count"] = len(normalize_book_text("\n\n".join(b["text"] for b in blocks if b.get("type") == "text" and b.get("text"))))
+                chapter["image_count"] = sum(b.get("type") == "image" for b in blocks)
+            del document_blocks, blocks
+        return {"title": book_title, "legacy_title": legacy_title, "author": author, "chapters": chapters, "lazy": True, "cover": cover}
 
 
 def parse_epub_chapter_content(path, href, fragment="", end_fragment=""):
@@ -1968,6 +1993,39 @@ def parse_epub_chapter_content(path, href, fragment="", end_fragment=""):
         return {"text": text, "images": images, "blocks": blocks}
 
 
+def pdf_text_paragraphs(text):
+    """Reflow ordinary prose, keeping short headings, lists and math rows separate."""
+    lines = str(text or "").replace("\r", "").splitlines()
+    widths = sorted(len(line.strip()) for line in lines if len(line.strip()) >= 45)
+    width = widths[len(widths) // 2] if widths else 80
+    indents = [len(line) - len(line.lstrip()) for line in lines if len(line.strip()) >= width * .7]
+    baseline = sorted(indents)[len(indents) // 2] if indents else 0
+    paragraphs, previous = [], ""
+
+    def prose(line):
+        return len(re.findall(r"[A-Za-z]{2,}", line)) >= 4 or len(re.findall(r"[\u3400-\u9fff]", line)) >= 15
+
+    for raw in lines:
+        line = re.sub(r"[ \t\u00a0]+", " ", raw).strip()
+        if not line:
+            previous = ""
+            continue
+        indented = len(raw) - len(raw.lstrip()) > baseline + 2
+        table_row = bool(re.search(r"\S {3,}\S", raw)) and len(re.findall(r"\b\d+(?:\.\d+)?\b", line)) >= 3
+        numbered = bool(re.match(r"(?:\d+[.)]|[•●▪])\s", line))
+        sentence_end = bool(re.search(r"[A-Za-z\u3400-\u9fff].*[.!?。！？][\"”’')]*$", line))
+        continuation = (prose(line) and len(line) >= width * .7) or sentence_end
+        join = (previous and prose(previous) and continuation and not indented and not table_row and not numbered
+                and (len(previous) >= width * .7 or previous.endswith(("-", "\u00ad"))))
+        if join:
+            separator = "" if previous.endswith(("-", "\u00ad")) or re.search(r"[\u3400-\u9fff]$", previous) and re.match(r"[\u3400-\u9fff]", line) else " "
+            paragraphs[-1] = paragraphs[-1].rstrip("\u00ad") + separator + line
+        else:
+            paragraphs.append(line)
+        previous = "" if table_row else line
+    return normalize_book_text("\n\n".join(paragraphs))
+
+
 def parse_pdf_book(path, fallback_title):
     try:
         from pypdf import PdfReader
@@ -1981,7 +2039,15 @@ def parse_pdf_book(path, fallback_title):
     start_page = 1
     total_chars = 0
     for index, page in enumerate(reader.pages, start=1):
-        text = normalize_book_text(page.extract_text() or "")
+        # Use physical line positions instead of PDF drawing-command order.
+        # Do not retain alignment padding or a hard break for every printed line.
+        try:
+            extracted = page.extract_text(extraction_mode="layout", layout_mode_space_vertically=False)
+        except (TypeError, ValueError, NotImplementedError):
+            extracted = page.extract_text()
+        if not (extracted or "").strip():
+            extracted = page.extract_text()
+        text = pdf_text_paragraphs(extracted or "")
         if text:
             remaining = MAX_BOOK_TEXT_CHARS - total_chars
             if remaining <= 0:
@@ -2048,6 +2114,7 @@ def parse_book_file(path, original_name):
         raise ValueError("没有识别到可阅读章节")
     return {
         "title": clean_display_text(parsed.get("title") or title, 160),
+        "legacy_title": clean_display_text(parsed.get("legacy_title") or "", 160),
         "author": clean_display_text(parsed.get("author") or "", 120),
         "lazy": bool(parsed.get("lazy")),
         "cover": parsed.get("cover"),
@@ -2152,6 +2219,7 @@ def invalidate_book_search(book):
     token = uuid.uuid4().hex
     write_private_text_atomic(book_dir(book["id"]) / "search-revision", token)
     book["content_revision"] = token
+    book.get("progress", {}).pop("percent", None)
 
 
 def search_chapter_paragraphs(book, chapter_index):
@@ -2208,14 +2276,11 @@ def reparse_book_record(book_id):
     if book.get("format") == "epub":
         new_cover = save_epub_cover(source_path, book_id, parsed.get("cover"))
         cover_name = new_cover or cover_name
-    progress = book.get("progress") or {"chapter": 0, "sentence": 0}
-    chapter_count = len(parsed["chapters"])
-    progress["chapter"] = max(0, min(int(progress.get("chapter") or 0), max(chapter_count - 1, 0)))
-    progress["sentence"] = max(0, int(progress.get("sentence") or 0))
+    progress = remap_book_progress(book, parsed)
     now = int(time.time())
     updated = {
         **book,
-        "title": book.get("title") or parsed["title"],
+        "title": refreshed_book_title(book, parsed),
         "author": book.get("author", "") if book.get("author_manually_set") else parsed.get("author", ""),
         "cover_name": cover_name,
         "lazy": bool(parsed.get("lazy")),
@@ -2395,8 +2460,46 @@ def split_txt_chapter_at_line(book_id, chapter_index, line_index, title=""):
     return book
 
 
-def refresh_epub_chapter_metadata(book):
-    if book.get("format") != "epub" or book.get("metadata_version") == CHAPTER_CACHE_VERSION:
+def refreshed_book_title(book, parsed):
+    if (book.get("format") == "epub" and not book.get("title_manually_set")
+            and book.get("title") == parsed.get("legacy_title")):
+        return parsed["title"]
+    return book.get("title") or parsed["title"]
+
+
+def remap_book_progress(book, parsed):
+    progress = dict(book.get("progress") or {"chapter": 0, "sentence": 0})
+    old_chapters = book.get("chapters", [])
+    old_index = max(0, min(int(progress.get("chapter") or 0), max(len(old_chapters) - 1, 0)))
+    if book.get("format") == "epub" and old_chapters:
+        old = old_chapters[old_index]
+        for index, chapter in enumerate(parsed["chapters"]):
+            if (chapter.get("href"), chapter.get("fragment", "")) == (old.get("href"), old.get("fragment", "")):
+                progress["chapter"] = index
+                break
+    elif book.get("format") == "pdf" and old_chapters and progress.get("sentence", 0) > 0:
+        # Reflow changes sentence boundaries. Prefer the same passage over the
+        # old sentence number when upgrading an already imported PDF.
+        old_sentences = [s for p in fallback_display_paragraphs(book, old_chapters[old_index].get("text", "")) for s in split_sentences(p)]
+        new_index = min(old_index, len(parsed["chapters"]) - 1)
+        new_sentences = [s for p in fallback_display_paragraphs(book, parsed["chapters"][new_index].get("text", "")) for s in split_sentences(p)]
+        normalized = [re.sub(r"\s+", "", s).casefold() for s in new_sentences]
+        start = int(progress["sentence"])
+        for old_sentence in old_sentences[start:start + 6]:
+            anchor = re.sub(r"\s+", "", old_sentence).casefold()[:48]
+            match = next((i for i, text in enumerate(normalized) if len(anchor) >= 16 and anchor in text), None)
+            if match is not None:
+                progress["sentence"] = match
+                break
+        else:
+            progress["sentence"] = min(start, max(0, len(new_sentences) - 1))
+    progress["chapter"] = max(0, min(int(progress.get("chapter") or 0), max(len(parsed["chapters"]) - 1, 0)))
+    progress["sentence"] = max(0, int(progress.get("sentence") or 0))
+    return progress
+
+
+def refresh_book_chapter_metadata(book):
+    if book.get("format") not in {"epub", "pdf"} or book.get("metadata_version") == CHAPTER_CACHE_VERSION:
         return book
     stored_name = book.get("stored_name")
     if not stored_name:
@@ -2409,9 +2512,8 @@ def refresh_epub_chapter_metadata(book):
     cache_dir = book_chapter_cache_dir(book["id"])
     if cache_dir.exists():
         shutil.rmtree(cache_dir)
-    progress = book.get("progress") or {"chapter": 0, "sentence": 0}
-    progress["chapter"] = max(0, min(int(progress.get("chapter") or 0), max(len(parsed["chapters"]) - 1, 0)))
-    progress["sentence"] = max(0, int(progress.get("sentence") or 0))
+    progress = remap_book_progress(book, parsed)
+    book["title"] = refreshed_book_title(book, parsed)
     if not book.get("author_manually_set"):
         book["author"] = parsed.get("author", book.get("author", ""))
     book["lazy"] = bool(parsed.get("lazy"))
@@ -2632,6 +2734,7 @@ def chapter_payload(book, chapter_index, include_book=True):
             "title": chapter.get("title") or f"第 {chapter_index + 1} 章",
             "paragraphs": paragraphs,
             "sentence_count": sentence_counter,
+            "char_count": int(chapter.get("char_count") or len(chapter.get("text", ""))),
         },
     }
     if include_book:
@@ -2680,45 +2783,359 @@ def request_host_matches(url_value):
     return bool(parsed.netloc) and parsed.netloc == request.host
 
 
+@lru_cache(maxsize=1)
+def trusted_proxy_networks():
+    # In-app restarts inherit the old process environment. This locally managed
+    # setting must honor the current .env, including an explicitly empty value.
+    # Environment-only deployments remain supported when the key is absent.
+    configured = os.getenv("TRUSTED_PROXY_CIDRS", "")
+    try:
+        lines = (BASE_DIR / ".env").read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError:
+        return ()  # An unreadable trust configuration must not broaden trust.
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "TRUSTED_PROXY_CIDRS":
+            configured = parse_env_value(value)
+            break
+    return tuple(ipaddress.ip_network(value.strip(), strict=False)
+                 for value in configured.split(",") if value.strip())
+
+
 def client_ip():
-    return request.remote_addr or "unknown"
+    peer = request.remote_addr or "unknown"
+    # Only explicitly trusted proxies may supply forwarding headers. Walk from
+    # the nearest hop so a client cannot forge its IP by prepending an address.
+    try:
+        trusted = trusted_proxy_networks()
+        address = ipaddress.ip_address(peer)
+        if not any(address in network for network in trusted):
+            return peer
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if not forwarded or len(forwarded) > 1024:
+            return peer
+        chain = [ipaddress.ip_address(value.strip()) for value in forwarded.split(",")]
+        for address in reversed(chain):
+            if not any(address in network for network in trusted):
+                return str(address)
+    except ValueError:
+        pass
+    return peer
 
 
-def login_failures_for_ip(ip):
+def client_ip_location(value):
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return "未知地区"
+    if address.is_loopback:
+        return "本机"
+    if address in ipaddress.ip_network("100.64.0.0/10"):
+        return "专用网络"
+    if address.is_private:
+        return "内网"
+    if not address.is_global or address.is_multicast:
+        return "保留地址"
+    try:
+        if any(address in network for network in trusted_proxy_networks()):
+            return "代理服务器"  # Old records are corrected when that client next connects.
+    except ValueError:
+        pass
+    ip = str(address)
+    now = time.monotonic()
+    with CLIENT_LOCATION_LOCK:
+        cached = CLIENT_LOCATION_CACHE.get(ip)
+        if cached and cached[1] > now:
+            CLIENT_LOCATION_CACHE.move_to_end(ip)
+            return cached[0]
+        pending = CLIENT_LOCATION_PENDING.get(ip)
+        owner = pending is None
+        if owner:
+            if len(CLIENT_LOCATION_PENDING) >= 2:
+                return "未知地区"
+            pending = CLIENT_LOCATION_PENDING[ip] = threading.Event()
+    if not owner:
+        pending.wait(5)
+        with CLIENT_LOCATION_LOCK:
+            return CLIENT_LOCATION_CACHE.get(ip, ("未知地区", 0))[0]
+    location = "未知地区"
+    try:
+        # Fixed HTTPS destination; only an active session's validated public IP
+        # is sent. This lookup never runs inside the authentication lock.
+        with requests.get("https://ip9.com.cn/get",
+                          params={"ip": ip},
+                          timeout=(2, 3), allow_redirects=False) as response:
+            if response.status_code == 200:
+                payload = response.json()
+                data = payload.get("data") if isinstance(payload, dict) and payload.get("ret") == 200 else None
+                if isinstance(data, dict):
+                    parts = [clean_display_text(data[key], 48) for key in ("country", "prov", "city", "area")
+                             if isinstance(data.get(key), str) and data[key].strip()]
+                    location = " · ".join(dict.fromkeys(part for part in parts if part)) or location
+    except (requests.RequestException, ValueError):
+        pass
+    finally:
+        with CLIENT_LOCATION_LOCK:
+            CLIENT_LOCATION_CACHE[ip] = (location, time.monotonic() + (7 * 86400 if location != "未知地区" else 600))
+            CLIENT_LOCATION_CACHE.move_to_end(ip)
+            while len(CLIENT_LOCATION_CACHE) > 512:
+                CLIENT_LOCATION_CACHE.popitem(last=False)
+            CLIENT_LOCATION_PENDING.pop(ip, None)
+            pending.set()
+    return location
+
+
+# Shared-password authentication and optional TOTP. Secrets stay on the server;
+# atomic private storage + flock make one-time codes safe across workers/restarts.
+def read_security_state():
+    try:
+        state = json.loads(SECURITY_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(state, dict) or not isinstance(state.get("revision", ""), str):
+        raise RuntimeError("安全配置损坏，请检查服务器上的安全配置备份")
+    if state.get("enabled") and not re.fullmatch(r"[A-Z2-7]{32}", str(state.get("secret", ""))):
+        raise RuntimeError("双重验证配置损坏，请检查服务器上的安全配置备份")
+    if not isinstance(state.get("clients", {}), dict) or not isinstance(state.get("revoked_clients", {}), dict):
+        raise RuntimeError("登录设备记录损坏，请检查服务器上的安全配置备份")
+    return state
+
+
+@contextmanager
+def security_transaction():
+    with SECURITY_LOCK:
+        ensure_private_directory(CONFIG_DIR)
+        descriptor = os.open(CONFIG_DIR / "security.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(descriptor, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = read_security_state()
+            before = json.dumps(state, sort_keys=True)
+            try:
+                yield state
+                if json.dumps(state, sort_keys=True) != before:
+                    write_private_text_atomic(SECURITY_FILE, json.dumps(state, ensure_ascii=False))
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def security_limited(state, factor=False):
     now = time.time()
-    with LOGIN_FAILURE_LOCK:
-        failures = [
-            timestamp for timestamp in LOGIN_FAILURES.get(ip, [])
-            if now - timestamp < LOGIN_FAILURE_WINDOW_SECONDS
-        ]
-        if failures:
-            LOGIN_FAILURES[ip] = failures
-        else:
-            LOGIN_FAILURES.pop(ip, None)
-        return failures
+    failures = state.setdefault("failures", {})
+    for key in list(failures):
+        failures[key] = [stamp for stamp in failures[key] if now - stamp < LOGIN_FAILURE_WINDOW_SECONDS]
+        if not failures[key]:
+            del failures[key]
+    return (len(failures.get("ip:" + client_ip(), [])) >= LOGIN_FAILURE_LIMIT
+            or (factor and len(failures.get("factor", [])) >= 32))
 
 
-def login_is_limited(ip):
-    return len(login_failures_for_ip(ip)) >= LOGIN_FAILURE_LIMIT
+def security_failure(state, factor=False):
+    failures = state.setdefault("failures", {})
+    failures.setdefault("ip:" + client_ip(), []).append(time.time())
+    if factor:
+        failures.setdefault("factor", []).append(time.time())
+    if len(failures) > LOGIN_FAILURE_MAX_IPS:
+        oldest = min((key for key in failures if key != "factor"), key=lambda key: failures[key][-1])
+        failures.pop(oldest, None)
 
 
-def record_login_failure(ip):
+def security_success(state):
+    state.get("failures", {}).pop("ip:" + client_ip(), None)
+
+
+def password_matches(value, expected):
+    return (isinstance(value, str) and 0 < len(value) <= 256
+            and secrets.compare_digest(value.encode("utf-8"), expected.encode("utf-8")))
+
+
+def verify_second_factor(state, value, *, recovery=True):
+    if not isinstance(value, str) or len(value) > 64:
+        return False
+    value = value.strip()
+    if re.fullmatch(r"[0-9]{6}", value):
+        current = int(time.time() // 30)
+        totp = pyotp.TOTP(state["secret"])
+        for step in (current, current - 1, current + 1):
+            if step > state.get("last_step", -1) and secrets.compare_digest(totp.at(step * 30), value):
+                state["last_step"] = step
+                return "totp"
+    if recovery:
+        normalized = value.replace("-", "").replace(" ", "").lower()
+        if re.fullmatch(r"[0-9a-f]{24}", normalized):
+            digest = hashlib.sha256(normalized.encode("ascii")).hexdigest()
+            for saved in state.get("recovery_hashes", []):
+                if secrets.compare_digest(saved, digest):
+                    state["recovery_hashes"].remove(saved)
+                    return "recovery"
+    return False
+
+
+def new_recovery_codes(state):
+    raw = [secrets.token_hex(12) for _ in range(8)]
+    state["recovery_hashes"] = [hashlib.sha256(code.encode("ascii")).hexdigest() for code in raw]
+    return ["-".join(code[index:index + 6] for index in range(0, 24, 6)) for code in raw]
+
+
+def active_login_clients(state, version, now=None):
+    now = time.time() if now is None else now
+    return {key: value for key, value in state.get("clients", {}).items()
+            if isinstance(value, dict) and value.get("version") == version
+            and value.get("expires_at", 0) > now}
+
+
+def legacy_client_identifier(version):
+    token = session.get("csrf_token")
+    if not isinstance(token, str) or len(token) < 32:
+        return None
+    return hmac.new(str(app.secret_key).encode("utf-8"),
+                    ("client\0" + version + "\0" + token).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def active_client_revocations(state, version):
     now = time.time()
-    with LOGIN_FAILURE_LOCK:
-        failures = [
-            timestamp for timestamp in LOGIN_FAILURES.get(ip, [])
-            if now - timestamp < LOGIN_FAILURE_WINDOW_SECONDS
-        ]
-        failures.append(now)
-        LOGIN_FAILURES[ip] = failures
-        if len(LOGIN_FAILURES) > LOGIN_FAILURE_MAX_IPS:
-            oldest_ip = min(LOGIN_FAILURES, key=lambda key: LOGIN_FAILURES[key][-1])
-            LOGIN_FAILURES.pop(oldest_ip, None)
+    return {key: value for key, value in state.get("revoked_clients", {}).items()
+            if isinstance(value, dict) and value.get("version") == version and value.get("expires_at", 0) > now}
 
 
-def clear_login_failures(ip):
-    with LOGIN_FAILURE_LOCK:
-        LOGIN_FAILURES.pop(ip, None)
+def public_client_id(client_id):
+    # A management reference, separate from the signed cookie's identifier.
+    return hashlib.sha256(("client-list\0" + client_id).encode("ascii")).hexdigest()[:32]
+
+
+def revoke_login_client(state, client_id, version):
+    state.get("clients", {}).pop(client_id, None)
+    revoked = active_client_revocations(state, version)
+    # Retain a small tombstone so an older cookie without client_id cannot
+    # migrate again and resurrect a session that was explicitly signed out.
+    revoked[client_id] = {"version": version,
+                          "expires_at": time.time() + app.permanent_session_lifetime.total_seconds() + CLIENT_ACTIVITY_INTERVAL}
+    state["revoked_clients"] = revoked
+
+
+def record_login_client(state, password, *, new_login=False):
+    now = time.time()
+    version = authentication_version(password, state)
+    clients = active_login_clients(state, version, now)
+    client_id = session.get("client_id")
+    if not isinstance(client_id, str) or not re.fullmatch(r"[0-9a-f]{64}", client_id):
+        # A stable, signed-cookie CSRF token also keeps concurrent first visits
+        # from older browsers from creating a separate row for every tab.
+        csrf_token()
+        client_id = legacy_client_identifier(version)
+        session["client_id"] = client_id
+    previous = clients.get(client_id, {})
+    clients[client_id] = {
+        "version": version,
+        "created_at": previous.get("created_at", now if new_login else None),
+        "last_seen": now,
+        "expires_at": now + app.permanent_session_lifetime.total_seconds() + CLIENT_ACTIVITY_INTERVAL,
+        "ip": client_ip(),
+        "user_agent": clean_display_text(request.headers.get("User-Agent", ""), 512),
+    }
+    state["clients"] = clients
+    state["revoked_clients"] = active_client_revocations(state, version)
+
+
+def describe_login_client(user_agent):
+    browser = "未知浏览器"
+    for name, pattern in (
+        ("Edge", r"(?:Edg|EdgA|EdgiOS)/([\d.]+)"),
+        ("Opera", r"(?:OPR|OPiOS)/([\d.]+)"),
+        ("Samsung Internet", r"SamsungBrowser/([\d.]+)"),
+        ("Firefox", r"(?:Firefox|FxiOS)/([\d.]+)"),
+        ("Chrome", r"(?:Chrome|CriOS)/([\d.]+)"),
+        ("Safari", r"Version/([\d.]+).*Safari/"),
+    ):
+        match = re.search(pattern, user_agent)
+        if match:
+            browser = f"{name} {match.group(1)}"
+            break
+    platform = "未知系统"
+    if "Android" in user_agent:
+        match = re.search(r"Android\s+([\d.]+)", user_agent)
+        platform = "Android" + (" " + match.group(1) if match else "")
+    elif "iPhone" in user_agent or "iPad" in user_agent:
+        match = re.search(r"(?:CPU(?: iPhone)? OS|iPhone OS) ([\d_]+)", user_agent)
+        platform = ("iPadOS" if "iPad" in user_agent else "iOS") + (" " + match.group(1).replace("_", ".") if match else "")
+    elif "Windows" in user_agent:
+        platform = "Windows"
+    elif "Macintosh" in user_agent:
+        platform = "macOS"
+    elif "Linux" in user_agent:
+        platform = "Linux"
+    return browser, platform
+
+
+def authenticated_session(password, state, *, fresh=False):
+    if fresh:
+        session.clear()
+        app.logger.info("login success ip=%s second_factor=%s", client_ip(), bool(state.get("enabled")))
+    session.permanent = True
+    session["authenticated"] = True
+    session["auth_version"] = authentication_version(password, state)
+    session.pop("pending_login", None)
+    session.pop("security_setup_id", None)
+    session.pop("recovery_verified_until", None)
+    # A revision/password change excludes every previous client record; only
+    # the browser that completed reauthentication receives the new version.
+    record_login_client(state, password, new_login=True)
+
+
+def security_session_matches(password, state):
+    version = authentication_version(password, state)
+    if not session.get("authenticated") or not secrets.compare_digest(
+            str(session.get("auth_version", "")).encode("utf-8"), version.encode("ascii")):
+        return False
+    client_id = session.get("client_id")
+    identifier = client_id if client_id is not None else legacy_client_identifier(version)
+    if identifier is None:
+        return False
+    revoked = state.get("revoked_clients", {}).get(identifier, {})
+    if revoked.get("version") == version and revoked.get("expires_at", 0) > time.time():
+        return False
+    if client_id is None:
+        return True  # Signed sessions issued before device tracking are migrated on access.
+    record = state.get("clients", {}).get(client_id, {})
+    return isinstance(record, dict) and record.get("version") == version and record.get("expires_at", 0) > time.time()
+
+
+def security_reauthenticate(state, password, payload):
+    if security_limited(state, bool(state.get("enabled"))):
+        return jsonify({"error": "尝试次数过多，请在 5 分钟后重试"}), 429
+    if not password_matches(payload.get("current_password"), password):
+        security_failure(state)
+        return jsonify({"error": "当前密码不正确"}), 403
+    # A recovery login grants a short, password-protected repair window. This
+    # also lets the final recovery code repair 2FA instead of stranding its user.
+    recovered = not payload.get("code") and session.get("recovery_verified_until", 0) > time.time()
+    if state.get("enabled") and not recovered:
+        factor = verify_second_factor(state, payload.get("code"))
+        if not factor:
+            security_failure(state, True)
+            return jsonify({"error": "验证码无效或已使用"}), 403
+        if factor == "recovery":
+            session["recovery_verified_until"] = time.time() + 300
+    return None
+
+
+def public_security_state(state):
+    clients = []
+    version = authentication_version(load_config()["app_password"], state)
+    for key, value in active_login_clients(state, version).items():
+        browser, platform = describe_login_client(value.get("user_agent", ""))
+        clients.append({"id": public_client_id(key), "current": key == session.get("client_id"), "browser": browser,
+                        "platform": platform, "ip": value.get("ip", "unknown"),
+                        "user_agent": value.get("user_agent", ""),
+                        "created_at": value["created_at"], "last_seen": value["last_seen"]})
+    clients.sort(key=lambda client: (not client["current"], -client["last_seen"]))
+    return {"enabled": bool(state.get("enabled")),
+            "recovery_remaining": len(state.get("recovery_hashes", [])),
+            "recovery_verified_until": session.get("recovery_verified_until", 0), "clients": clients}
 
 
 def csrf_token():
@@ -2729,9 +3146,13 @@ def csrf_token():
     return token
 
 
-def authentication_version(password):
+def authentication_version(password, state=None):
+    state = read_security_state() if state is None else state
     key = str(app.secret_key).encode("utf-8")
-    return hmac.new(key, str(password or "").encode("utf-8"), hashlib.sha256).hexdigest()
+    value = str(password or "")
+    if state.get("revision"):
+        value += "\0" + state["revision"]
+    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def request_json_object():
@@ -2794,7 +3215,7 @@ def reject_cross_site_writes():
     if not supplied_token and request.path not in {"/api/books", "/api/pdf/jobs"}:
         supplied_token = request.form.get("csrf_token", "")
     expected_token = csrf_token()
-    if not supplied_token or not secrets.compare_digest(supplied_token, expected_token):
+    if not supplied_token or not secrets.compare_digest(supplied_token.encode("utf-8"), expected_token.encode("utf-8")):
         app.logger.warning("blocked write without valid csrf token ip=%s path=%s", request.remote_addr, request.path)
         if request.path.startswith("/api/") or request.path == "/logout":
             return jsonify({"error": "CSRF token 无效，请刷新页面后重试"}), 403
@@ -2850,22 +3271,37 @@ def inject_asset_url():
         )
         return f"{APP_VERSION}+{build_version}"
 
-    return {"asset_url": asset_url, "app_version": app_version, "csrf_token": csrf_token}
+    return {"asset_url": asset_url, "app_version": app_version, "csrf_token": csrf_token,
+            "current_year": time.strftime("%Y")}
 
 
 def require_auth():
     authenticated = bool(session.get("authenticated"))
     if authenticated:
         try:
-            expected = authentication_version(load_config().get("app_password", ""))
+            password = load_config().get("app_password", "")
+            state = read_security_state()
+            authenticated = security_session_matches(password, state)
+            record = state.get("clients", {}).get(session.get("client_id"), {})
+            if authenticated and (not record or record.get("ip") != client_ip()
+                                  or time.time() - record.get("last_seen", 0) >= CLIENT_ACTIVITY_INTERVAL):
+                with security_transaction() as latest:
+                    # Recheck under the same lock as revocation: an in-flight
+                    # old request must never re-register itself after 2FA changes.
+                    password = load_config().get("app_password", "")
+                    authenticated = security_session_matches(password, latest)
+                    record = latest.get("clients", {}).get(session.get("client_id"), {})
+                    if authenticated and (not record or record.get("ip") != client_ip()
+                                          or time.time() - record.get("last_seen", 0) >= CLIENT_ACTIVITY_INTERVAL):
+                        record_login_client(latest, password)
         except Exception:
             return False
-        authenticated = secrets.compare_digest(str(session.get("auth_version", "")), expected)
     if authenticated:
         session.permanent = True
     else:
         session.pop("authenticated", None)
         session.pop("auth_version", None)
+        session.pop("client_id", None)
     return authenticated
 
 
@@ -6150,32 +6586,69 @@ def login():
     if require_auth():
         return redirect(url_for("index"))
     error = ""
-    config = load_config()
-    if request.method == "POST":
-        password = request.form.get("password", "")
-        target = request.form.get("target") if request.form.get("target") in LOGIN_TARGETS else "translate"
-        ip = client_ip()
-        if login_is_limited(ip):
-            app.logger.warning("login limited ip=%s", ip)
-            error = "尝试次数过多，请稍后再试"
-            return render_template("login.html", error=error), 429
-        if secrets.compare_digest(password, config["app_password"]):
-            session.permanent = True
-            session["authenticated"] = True
-            session["auth_version"] = authentication_version(config["app_password"])
-            clear_login_failures(ip)
-            if target == "reader":
-                schedule_tts_cache_stats_refresh()
-            app.logger.info("login success ip=%s", ip)
-            return redirect(url_for(LOGIN_TARGETS[target]))
-        record_login_failure(ip)
-        app.logger.warning("login failed ip=%s", ip)
-        error = "密码不正确"
-    return render_template("login.html", error=error)
+    status = 200
+    if request.method == "GET" and request.args.get("back") == "1":
+        session.pop("pending_login", None)
+    with security_transaction() as state:
+        password = load_config()["app_password"]
+        now = time.time()
+        logins = state.setdefault("logins", {})
+        for key in list(logins):
+            if logins[key]["expires"] < now or logins[key]["version"] != authentication_version(password, state):
+                del logins[key]
+        pending_id = session.get("pending_login")
+        pending = logins.get(pending_id)
+        if pending_id and not pending:
+            session.pop("pending_login", None)
+            error = "验证已过期，请重新输入密码"
+        if request.method == "POST":
+            otp_step = request.form.get("step") == "otp"
+            if security_limited(state, otp_step):
+                error, status = "尝试次数过多，请在 5 分钟后重试", 429
+            elif otp_step:
+                if not pending or not state.get("enabled"):
+                    error = "验证已过期，请重新输入密码"
+                elif (factor := verify_second_factor(state, request.form.get("code"))):
+                    target = pending["target"]
+                    del logins[pending_id]
+                    security_success(state)
+                    authenticated_session(password, state, fresh=True)
+                    if factor == "recovery":
+                        session["recovery_verified_until"] = now + 300
+                    return redirect(url_for(LOGIN_TARGETS[target]))
+                else:
+                    security_failure(state, True)
+                    error = "验证码无效或已使用"
+            elif password_matches(request.form.get("password"), password):
+                target = request.form.get("target")
+                target = target if target in LOGIN_TARGETS else "home"
+                if state.get("enabled"):
+                    if pending_id:
+                        logins.pop(pending_id, None)
+                    if len(logins) >= 100:
+                        del logins[min(logins, key=lambda key: logins[key]["expires"])]
+                    pending_id = secrets.token_urlsafe(32)
+                    pending = {"expires": now + 300, "version": authentication_version(password, state), "target": target}
+                    logins[pending_id] = pending
+                    session.clear()
+                    session["pending_login"] = pending_id
+                else:
+                    security_success(state)
+                    authenticated_session(password, state, fresh=True)
+                    return redirect(url_for(LOGIN_TARGETS[target]))
+            else:
+                security_failure(state)
+                error = "密码不正确"
+    return render_template("login.html", error=error, otp_step=bool(pending)), status
 
 
 @app.route("/logout", methods=["POST"])
 def logout():
+    with security_transaction() as state:
+        password = load_config()["app_password"]
+        if security_session_matches(password, state):
+            version = authentication_version(password, state)
+            revoke_login_client(state, session.get("client_id") or legacy_client_identifier(version), version)
     app.logger.info("logout ip=%s", request.remote_addr)
     session.clear()
     return jsonify({"ok": True})
@@ -7024,7 +7497,7 @@ def api_book_detail(book_id):
     try:
         book = read_book_record(book_id)
         needs_metadata_refresh = (
-            book.get("format") == "epub"
+            book.get("format") in {"epub", "pdf"}
             and book.get("metadata_version") != CHAPTER_CACHE_VERSION
         )
         if needs_metadata_refresh:
@@ -7035,7 +7508,7 @@ def api_book_detail(book_id):
                         "error": "该书正在生成离线缓存，请等待任务完成后重新打开",
                         "job": active,
                     }), 409
-                book = refresh_epub_chapter_metadata(book)
+                book = refresh_book_chapter_metadata(book)
         if request.args.get("inspect") != "1" and not read_txt_edit_lease(book_id) and not book.get("txt_pending_parse"):
             now = int(time.time())
             book["last_opened_at"] = now
@@ -7065,6 +7538,7 @@ def api_book_update(book_id):
             book = read_book_record(book_id)
             if has_title:
                 book["title"] = title
+                book["title_manually_set"] = True
             if has_author:
                 book["author"] = author
                 book["author_manually_set"] = True
@@ -7317,6 +7791,11 @@ def api_book_progress(book_id):
             sentence = max(0, sentence)
             now = int(time.time())
             book["progress"] = {"chapter": chapter, "sentence": sentence}
+            if "percent" in payload:
+                percent = payload["percent"]
+                if type(percent) not in (int, float) or not 0 <= percent <= 100:
+                    raise ValueError("阅读进度无效")
+                book["progress"]["percent"] = round(percent, 1)
             book["updated_at"] = now
             book["last_opened_at"] = now
             write_book_progress(book)
@@ -7383,11 +7862,9 @@ def api_config():
         config = load_config()
         payload = request_json_object()
         if "app_password" in payload:
-            raise ValueError("访问密码只能通过监控页的专用接口修改")
+            raise ValueError("访问密码只能通过设置页的专用接口修改")
         updated = update_nested_config(config, payload)
         save_config(updated)
-        session["authenticated"] = True
-        session["auth_version"] = authentication_version(updated["app_password"])
         app.logger.info("config updated ip=%s", request.remote_addr)
         return jsonify({"ok": True, "config": public_config(updated)})
     except Exception as exc:
@@ -7395,39 +7872,136 @@ def api_config():
         return jsonify({"error": str(exc)}), 400
 
 
+@app.route("/api/security/clients/<client_ref>", methods=["DELETE"])
+def api_logout_client(client_ref):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    if not re.fullmatch(r"[0-9a-f]{32}", client_ref):
+        return jsonify({"error": "客户端标识无效"}), 400
+    with security_transaction() as state:
+        password = load_config()["app_password"]
+        if not security_session_matches(password, state):
+            return jsonify({"error": "登录状态已更新，请重新登录"}), 401
+        version = authentication_version(password, state)
+        selected = next((key for key in active_login_clients(state, version)
+                         if secrets.compare_digest(public_client_id(key), client_ref)), None)
+        current = selected is not None and selected == session.get("client_id")
+        if selected is not None:
+            revoke_login_client(state, selected, version)
+            app.logger.info("client signed out ip=%s current=%s", client_ip(), current)
+        if current:
+            session.clear()
+            return jsonify({"ok": True, "signed_out_current": True})
+        return jsonify({"ok": True, "signed_out_current": False, **public_security_state(state)})
+
+
+@app.route("/api/security/client-location")
+def api_client_location():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    state = read_security_state()
+    version = authentication_version(load_config()["app_password"], state)
+    ip = request.args.get("ip", "")
+    if ip not in {value.get("ip") for value in active_login_clients(state, version).values()}:
+        return jsonify({"error": "登录设备不存在"}), 404
+    return jsonify({"ip": ip, "location": client_ip_location(ip)})
+
+
+@app.route("/api/security", methods=["GET", "POST"])
+def api_security():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == "GET":
+        state = read_security_state()
+        return jsonify(public_security_state(state))
+    payload = request_json_object()
+    action = payload.get("action")
+    if not isinstance(action, str) or action not in {"setup", "enable", "disable", "recovery"}:
+        return jsonify({"error": "未知的安全设置操作"}), 400
+    with security_transaction() as state:
+        password = load_config()["app_password"]
+        if not security_session_matches(password, state):
+            return jsonify({"error": "登录状态已更新，请重新登录"}), 401
+        if action in {"setup", "enable"} and state.get("enabled"):
+            return jsonify({"error": "双重验证已启用；更换验证器请先关闭，再重新绑定"}), 409
+        if action in {"disable", "recovery"} and not state.get("enabled"):
+            return jsonify({"error": "双重验证尚未启用"}), 409
+        error = security_reauthenticate(state, password, payload)
+        if error:
+            return error
+        if action == "setup":
+            setup_id = secrets.token_urlsafe(32)
+            secret = pyotp.random_base32()
+            state["setup"] = {"id": setup_id, "secret": secret, "expires": time.time() + 600,
+                              "version": authentication_version(password, state)}
+            session["security_setup_id"] = setup_id
+            uri = pyotp.TOTP(secret).provisioning_uri(name=request.host, issuer_name="Trans")
+            qr = BytesIO()
+            segno.make_qr(uri).save(qr, kind="png", scale=5, border=4)
+            return jsonify({"secret": secret, "qr": "data:image/png;base64," + base64.b64encode(qr.getvalue()).decode("ascii")})
+        if action == "enable":
+            setup = state.get("setup", {})
+            if (not setup or setup.get("id") != session.get("security_setup_id")
+                    or setup.get("expires", 0) < time.time()
+                    or setup.get("version") != authentication_version(password, state)):
+                return jsonify({"error": "绑定已过期，请重新开始绑定"}), 409
+            candidate = {"secret": setup["secret"]}
+            if security_limited(state, True):
+                return jsonify({"error": "尝试次数过多，请在 5 分钟后重试"}), 429
+            if not verify_second_factor(candidate, payload.get("code"), recovery=False):
+                security_failure(state, True)
+                return jsonify({"error": "验证码不正确，请检查验证器及设备时间"}), 403
+            state.update(candidate)
+            state["enabled"] = True
+            codes = new_recovery_codes(state)
+        elif action == "recovery":
+            codes = new_recovery_codes(state)
+        else:
+            codes = []
+            for key in ("secret", "last_step", "recovery_hashes"):
+                state.pop(key, None)
+            state["enabled"] = False
+        state.pop("setup", None)
+        state.pop("logins", None)
+        state["revision"] = secrets.token_hex(16)
+        security_success(state)
+        authenticated_session(password, state)
+        app.logger.info("security settings updated action=%s ip=%s", action, client_ip())
+        return jsonify({"ok": True, **public_security_state(state), "recovery_codes": codes})
+
+
 @app.route("/api/password", methods=["PUT"])
 def api_password():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
-    try:
-        payload = request_json_object()
-        current_password = payload.get("current_password")
-        new_password = payload.get("new_password")
-        if not isinstance(current_password, str) or not current_password:
-            raise ValueError("请输入当前访问密码")
-        if not isinstance(new_password, str) or not new_password:
-            raise ValueError("请输入新的访问密码")
-        ip = client_ip()
-        if login_is_limited(ip):
-            return jsonify({"error": "密码验证失败次数过多，请稍后再试"}), 429
+    payload = request_json_object()
+    new_password = payload.get("new_password")
+    if not isinstance(new_password, str):
+        return jsonify({"error": "请输入新的访问密码"}), 400
+    new_password = clean_single_line_value(new_password)
+    if not 12 <= len(new_password) <= 256 or new_password.lower() in UNSAFE_APP_PASSWORDS:
+        return jsonify({"error": "访问密码至少需要 12 位，且不能使用示例或常见弱密码"}), 400
+    with security_transaction() as state:
         config = load_config()
-        expected_password = str(config.get("app_password", ""))
-        if len(current_password) > 256 or not secrets.compare_digest(current_password, expected_password):
-            record_login_failure(ip)
-            app.logger.warning("access password verification failed ip=%s", ip)
-            return jsonify({"error": "当前密码不正确"}), 403
-        clear_login_failures(ip)
-        normalized_new_password = clean_single_line_value(new_password)
-        if secrets.compare_digest(normalized_new_password, expected_password):
-            raise ValueError("新密码不能与当前密码相同")
-        updated = update_app_password(config, normalized_new_password)
-        session["authenticated"] = True
-        session["auth_version"] = authentication_version(updated["app_password"])
-        app.logger.info("access password updated ip=%s", ip)
-        return jsonify({"ok": True})
-    except Exception as exc:
-        app.logger.warning("access password update failed ip=%s error=%s", request.remote_addr, exc)
-        return jsonify({"error": str(exc)}), 400
+        password = config["app_password"]
+        if not security_session_matches(password, state):
+            return jsonify({"error": "登录状态已更新，请重新登录"}), 401
+        if password_matches(new_password, password):
+            return jsonify({"error": "新密码不能与当前密码相同"}), 400
+        error = security_reauthenticate(state, password, payload)
+        if error:
+            return error
+        update_app_password(config, new_password)
+        security_success(state)
+        state["revision"] = secrets.token_hex(16)
+        state.pop("setup", None)
+        state.pop("logins", None)
+        recovery_until = session.get("recovery_verified_until", 0)
+        authenticated_session(new_password, state)
+        if recovery_until > time.time():
+            session["recovery_verified_until"] = recovery_until
+        app.logger.info("access password updated ip=%s", client_ip())
+        return jsonify({"ok": True, **public_security_state(state)})
 
 
 @app.route("/api/ready")
@@ -7504,17 +8078,25 @@ def api_translate():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     payload = request_json_object()
-    text = (payload.get("text") or "").strip()
-    source = payload.get("source") or "auto"
-    target = payload.get("target") or "en"
+    text = payload.get("text", "")
+    if not isinstance(text, str):
+        return jsonify({"error": "翻译文本必须是字符串"}), 400
+    text = text.strip()
+    source = payload.get("source", "auto")
+    target = payload.get("target", "en")
+    # Keep empty-string defaults, but reject malformed JSON values before
+    # they can accidentally trigger a translation with default languages.
+    source = "auto" if source == "" or source is None else source
+    target = "en" if target == "" or target is None else target
     engine = payload.get("engine")
-    if engine not in ENGINES:
+    if not isinstance(engine, str) or engine not in ENGINES:
         return jsonify({"error": "翻译引擎无效"}), 400
     if not text:
         return jsonify({"error": "请输入要翻译的文本"}), 400
     if len(text) > MAX_TRANSLATE_CHARS:
         return jsonify({"error": f"单次翻译最多 {MAX_TRANSLATE_CHARS} 字符"}), 400
-    if source not in LANGUAGE_CODES or target not in LANGUAGE_CODES or target == "auto":
+    if (not isinstance(source, str) or not isinstance(target, str)
+            or source not in LANGUAGE_CODES or target not in LANGUAGE_CODES or target == "auto"):
         return jsonify({"error": "语言参数无效"}), 400
     config = load_config()
     if not config[engine].get("enabled"):

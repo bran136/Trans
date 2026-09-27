@@ -1,4 +1,33 @@
 (() => {
+  // Opt in only on entry pages: reject restored input focus until the user
+  // chooses a field or navigates with the keyboard. Keep this guard active
+  // after pageshow because browsers may restore focus later.
+  if (document.body.hasAttribute("data-no-entry-input-focus")) {
+    let inputFocusRequested = false;
+    const isEditable = (node) => node instanceof Element && node.matches(
+      'textarea, input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="submit"]):not([type="button"]), [contenteditable="true"]'
+    );
+    const dismissRestoredFocus = () => {
+      if (!inputFocusRequested && isEditable(document.activeElement)) document.activeElement.blur();
+    };
+    document.addEventListener("pointerdown", (event) => {
+      const target = event.target;
+      if (isEditable(target) || isEditable(target.closest?.("label")?.control)) inputFocusRequested = true;
+    }, true);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Tab") inputFocusRequested = true;
+    }, true);
+    // Explicit form validation is allowed to focus a field needing correction.
+    document.addEventListener("invalid", () => { inputFocusRequested = true; }, true);
+    document.addEventListener("focusin", dismissRestoredFocus, true);
+    window.addEventListener("pagehide", () => {
+      inputFocusRequested = false;
+      dismissRestoredFocus();
+    });
+    window.addEventListener("pageshow", dismissRestoredFocus);
+    dismissRestoredFocus();
+  }
+
   // Limit the larger editable text to iPhone Safari; other browsers stay compact.
   const browserAgent = navigator.userAgent;
   const isIPhoneSafari = /iPhone/.test(browserAgent)

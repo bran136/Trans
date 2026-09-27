@@ -12,7 +12,7 @@
     <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
     <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
   </head>
-  <body class="login-body">
+  <body class="login-body" data-no-entry-input-focus>
     <main class="login-shell">
       <section class="login-panel">
         <img class="brand-mark" src="{{ asset_url('site-icon.svg') }}" alt="" aria-hidden="true">
@@ -20,22 +20,31 @@
         <form method="post" class="login-form">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="target" value="home">
+          {% if otp_step %}
+          <input type="hidden" name="step" value="otp">
+          <p class="login-factor-hint">输入验证器中的 6 位验证码，或一次性恢复码</p>
+          {% endif %}
           <div class="login-password-field">
-            <input class="login-password" type="password" name="password" placeholder="访问密码" aria-label="访问密码" autocomplete="current-password" autofocus required>
+            {% if otp_step %}
+            <input class="login-password" type="text" name="code" placeholder="验证码或恢复码" aria-label="验证码或恢复码" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="64" required>
+            {% else %}
+            <input class="login-password" type="password" name="password" placeholder="访问密码" aria-label="访问密码" autocomplete="current-password" required>
+            {% endif %}
             <button class="login-submit" type="submit" aria-label="登录" title="登录">
               <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12h8m-4-4 4 4-4 4"/></svg>
             </button>
           </div>
         </form>
+        {% if otp_step %}<a class="login-back" href="{{ url_for('login', back=1) }}">返回密码登录</a>{% endif %}
         {% if error %}
         <div class="form-error" role="alert">{{ error }}</div>
         {% endif %}
       </section>
     </main>
     <footer class="login-footer">
-      <a class="project-credit" href="https://github.com/bran136/Trans/blob/master/LICENSE" target="_blank" rel="noopener noreferrer">Trans · AGPL-3.0</a>
+      <a class="project-credit" href="https://github.com/bran136/Trans/blob/master/LICENSE" target="_blank" rel="noopener noreferrer">{{ current_year }} · AGPL-3.0</a>
       <div class="version-badge app-version">
-        <span>v{{ app_version() }}</span>
+        <a class="version-link" href="https://github.com/bran136/Trans/blob/master/CHANGELOG.md" target="_blank" rel="noopener noreferrer" title="查看更新日志">v{{ app_version() }}</a>
         <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">
           <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
         </a>

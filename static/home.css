@@ -101,7 +101,7 @@
 /* Fit the two mobile entry points in the available screen height. */
 @media (max-width: 760px) {
   .home-body { padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
-  .home-shell { display: grid; grid-template-rows: 44px minmax(0, 1fr) auto; gap: 12px; height: calc(100svh - max(16px, env(safe-area-inset-top)) - max(16px, env(safe-area-inset-bottom))); min-height: 480px; padding: 0; }
+  .home-shell { display: grid; grid-template-rows: minmax(44px, auto) minmax(0, 1fr) auto; gap: 12px; height: calc(100svh - max(16px, env(safe-area-inset-top)) - max(16px, env(safe-area-inset-bottom))); min-height: 480px; padding: 0; }
   .home-head { margin: 0; gap: 8px; }
   .tool-grid { min-height: 0; grid-template-rows: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .tool-card { display: grid; grid-template-rows: minmax(0, 1fr) 68px; gap: 0; }
@@ -135,13 +135,13 @@
 .home-about-brand { display:flex; align-items:center; gap:12px; }
 .home-about-brand img { width:44px; height:44px; }
 .home-about-brand strong { display:block; font-size:24px; font-weight:650; letter-spacing:-.5px; }
-.home-about-brand span { display:block; font-size:12px; color:var(--muted); overflow-wrap:anywhere; }
+.home-about-brand .version-link { display:block; font-size:12px; color:var(--muted); overflow-wrap:anywhere; }
 .home-about-intro { margin:14px 0 20px; font-size:14px; line-height:1.7; color:var(--muted); }
 .home-about-features { margin:0; }
 .home-about-features > div { padding:12px 0; border-top:1px solid var(--line); }
 .home-about-features dt { margin-bottom:5px; font-size:14px; font-weight:600; }
 .home-about-features dd { margin:0; font-size:13px; line-height:1.7; color:var(--muted); }
-.home-about-note { margin:12px 0; color:var(--muted); font-size:12px; line-height:1.7; }
+.home-about-note { margin:12px 0; padding-top:12px; border-top:1px solid var(--line); color:var(--muted); font-size:12px; line-height:1.7; }
 .home-about-links { display:flex; flex-wrap:wrap; gap:12px 18px; padding-top:12px; border-top:1px solid var(--line); }
 .home-about-links a { font-size:12px; color:var(--accent); }
 html.home-about-open { overflow:hidden; }
@@ -158,3 +158,103 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
  .home-head .home-actions { gap:2px; }
  .home-head .home-actions .ghost { padding-inline:7px; font-size:14px; }
 }
+
+/* Monitor messages share the heading row without reserving empty space. */
+#monitorDialog .monitor-heading { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; min-width:0; }
+#monitorDialog .monitor-heading h2 { flex-shrink:0; margin:0; }
+#monitorDialog .compact-actions { flex-shrink:0; align-self:start; }
+#monitorDialog #monitorMessage { min-width:0; max-width:100%; margin:0; overflow-wrap:anywhere; }
+#monitorDialog #monitorMessage[hidden] { display:none !important; }
+@media (max-width:760px) {
+  #monitorDialog .dialog-head { flex-wrap:wrap; }
+  #monitorDialog .monitor-heading { display:contents; }
+  #monitorDialog .compact-actions { margin-left:auto; }
+  #monitorDialog #monitorMessage { order:1; flex-basis:100%; }
+}
+
+/* Account security stays local to the homepage. */
+#securityDialog, #mfaDialog { width:min(650px, calc(100vw - 24px)); background:var(--panel); color:var(--ink); border:1px solid var(--line); box-shadow:var(--dialog-shadow); }
+.security-panel { padding:22px; }
+.security-panel .dialog-head { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:12px; margin-bottom:16px; }
+.security-panel .dialog-head h2 { grid-column:1; grid-row:1; margin:0; font-size:21px; white-space:nowrap; }
+.security-panel .dialog-head > button { grid-column:3; grid-row:1; white-space:nowrap; }
+.security-panel .dialog-head .config-message { grid-column:2; grid-row:1; justify-self:end; min-width:0; max-width:100%; min-height:0; margin:0; overflow-wrap:anywhere; }
+.security-section + .security-section { margin-top:20px; padding-top:20px; border-top:1px solid var(--line); }
+.security-section h3 { margin:0; font-size:16px; font-weight:600; }
+.security-section-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.security-hint { margin:8px 0 12px; color:var(--muted); font-size:13px; line-height:1.65; }
+.security-status { padding:3px 9px; border:1px solid var(--line); border-radius:6px; font-size:12px; color:var(--muted); white-space:nowrap; }
+.security-status.enabled { color:#28744d; background:#eaf4ed; border-color:#c7dece; }
+.security-form { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:12px; margin-top:12px; }
+.security-form label { display:grid; gap:6px; min-width:0; color:var(--muted); font-size:13px; }
+.security-form input { width:100%; min-width:0; height:38px; padding:7px 10px; border:1px solid var(--line); border-radius:8px; background:var(--panel); color:var(--ink); font-size:14px; }
+.security-form input:focus { outline:none; border-color:var(--accent); }
+.security-password-field { display:grid; gap:6px; min-width:0; }
+.security-password-input { position:relative; min-width:0; }
+.security-password-input input { padding-right:42px; }
+.security-panel .password-visibility-btn { position:absolute; top:3px; right:3px; display:grid; place-items:center; width:32px; min-width:32px; height:32px; min-height:32px; padding:0; border:1px solid transparent; border-radius:6px; background:transparent; color:var(--muted); box-shadow:none; }
+.security-panel .password-visibility-btn:hover { color:var(--accent); border-color:var(--accent); }
+.password-visibility-btn svg { width:19px; height:19px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
+.password-visibility-btn[aria-pressed="true"] .password-eye-slash { display:none; }
+.security-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; grid-column:1 / -1; }
+.security-panel button { min-height:34px; padding:6px 12px; font-size:13px; }
+.security-setup { display:grid; grid-template-columns:180px minmax(0,1fr); align-items:center; gap:16px; grid-column:1 / -1; padding:12px; border:1px solid var(--line); border-radius:10px; background:var(--subtle); }
+.security-setup img { width:180px; height:auto; max-width:100%; border-radius:6px; }
+.security-setup p, .security-recovery p { font-size:13px; line-height:1.6; margin:0 0 8px; }
+.security-setup small { display:block; color:var(--muted); font-size:12px; line-height:1.6; }
+.security-setup code { display:block; margin:8px 0; font-size:13px; line-height:1.7; overflow-wrap:anywhere; user-select:all; }
+.security-recovery { padding:14px; margin-top:14px; border:1px solid var(--line); border-radius:10px; background:var(--subtle); }
+.security-recovery h3 { margin:0; font-size:14px; }
+.security-recovery p { margin-top:8px; color:var(--muted); }
+.security-recovery pre { margin:8px 0 0; font-size:13px; line-height:1.8; white-space:pre-wrap; overflow-wrap:anywhere; }
+.login-clients { display:grid; gap:8px; }
+.login-client { min-width:0; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--subtle); }
+.login-client-head { display:grid; grid-template-columns:minmax(0, 1fr) auto; align-items:start; gap:6px 10px; }
+.login-client-head strong { min-width:0; padding-top:3px; font-size:13px; line-height:20px; font-weight:600; overflow-wrap:anywhere; }
+.login-client-actions { display:flex; flex-wrap:nowrap; align-items:center; gap:6px; white-space:nowrap; }
+.login-client-actions .security-status { display:inline-flex; align-items:center; height:26px; padding:0 8px; line-height:1; }
+.security-panel .login-client-logout { display:inline-flex; align-items:center; justify-content:center; height:26px; min-height:26px; padding:0 8px; border-radius:6px; font-size:12px; line-height:1; }
+.login-client-meta { display:flex; flex-wrap:wrap; gap:4px 16px; margin-top:6px; font-size:12px; line-height:1.6; color:var(--muted); }
+.login-client-meta span { overflow-wrap:anywhere; }
+.login-client details { margin-top:6px; font-size:12px; color:var(--muted); }
+.login-client summary { cursor:pointer; width:fit-content; }
+.login-client summary:hover { color:var(--accent); }
+.login-client details p { margin:6px 0 0; line-height:1.5; overflow-wrap:anywhere; }
+#securityDialog .security-panel { padding:18px; }
+#securityDialog .dialog-head { margin-bottom:12px; }
+#securityDialog .security-section + .security-section { margin-top:12px; padding-top:12px; }
+#securityDialog .security-hint { margin:6px 0 8px; line-height:1.5; }
+#securityDialog .security-form { margin-top:8px; gap:10px; }
+#securityDialog .login-clients { margin-top:8px; gap:6px; }
+#securityDialog .login-client { padding:9px 10px; }
+.login-client-location { flex-basis:100%; color:var(--ink); }
+@media (min-width:561px) {
+  #securityDialog .security-section[aria-labelledby="mfaTitle"] { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:0 12px; align-items:center; }
+  #securityDialog .security-section[aria-labelledby="mfaTitle"] .security-section-head { grid-column:1; grid-row:1; justify-content:flex-start; gap:8px; }
+  #securityDialog .security-section[aria-labelledby="mfaTitle"] .security-actions { grid-column:2; grid-row:1; }
+  #securityDialog #mfaSummary { grid-column:1 / -1; margin-bottom:0; }
+}
+#securityDialog [hidden], #mfaDialog [hidden] { display:none !important; }
+@media (max-width:760px) {
+  .home-head { flex-wrap:wrap; }
+  .home-head .home-actions { gap:2px; margin-left:auto; }
+  .home-head .home-actions .ghost { padding-inline:8px; font-size:15px; min-height:40px; }
+  .security-panel { padding:14px; }
+  #securityDialog .security-panel { padding:14px; }
+  .security-panel .dialog-head h2 { font-size:17px; }
+  .security-section + .security-section { margin-top:16px; padding-top:16px; }
+  .security-form { gap:10px; }
+  .security-form input { font-size:var(--mobile-input-size,13px); }
+  .security-setup { grid-template-columns:1fr; justify-items:center; gap:10px; }
+  .security-setup > div { width:100%; }
+}
+@media (max-width:380px) {
+  .home-brand { gap:6px; }
+  .home-head h1 { font-size:27px; }
+  .home-logo { width:30px; height:30px; }
+  .home-head .home-actions .ghost { padding-inline:5px; }
+  .security-form { grid-template-columns:1fr; }
+}
+
+#mfaDialog { width:min(540px, calc(100vw - 24px)); }
+#mfaForm { grid-template-columns:minmax(0,1fr); }

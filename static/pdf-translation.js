@@ -2,18 +2,11 @@
   'use strict';
   const $ = (id) => document.getElementById(id);
   const csrf = document.querySelector('meta[name="csrf-token"]').content;
-  // Use a non-editable entry focus, including browser history restoration.
-  // Do not steal focus if the user starts interacting before the page finishes loading.
-  let interacted = false;
-  for (const event of ['pointerdown', 'keydown']) document.addEventListener(event, () => { interacted = true; }, {capture:true});
-  window.addEventListener('pagehide', () => { interacted = false; });
-  window.addEventListener('pageshow', () => {
-    if (!interacted && !document.querySelector('dialog[open]')) $('pdfTitle').focus({preventScroll:true});
-  });
   const activeStates = new Set(['queued', 'submitting', 'running', 'fetching', 'unknown']);
-  const labels = {queued:'排队中', submitting:'提交中', running:'翻译中', fetching:'保存中', completed:'已完成', failed:'翻译失败', download_failed:'获取失败', unknown:'待核对', interrupted:'已结束', cancelled:'已取消'};
+  const labels = {queued:'排队中', submitting:'提交中', running:'翻译中', fetching:'取回结果中', completed:'已完成', failed:'翻译失败', download_failed:'获取失败', unknown:'待核对', interrupted:'已结束', cancelled:'已取消'};
   const languages = new Map([...$('sourceLang').options].map((o) => [o.value, o.text]));
   let config = null, file = null, uploadId = '', uploading = false;
+  let localPreviewUrl = '', metadataWorker = null, metadataTimer = 0;
   let page = 1, generation = 0, timer = 0, searchTimer = 0, messageTimer = 0, scrollTop = 0;
   let currentJobs = new Map();
   let retentionDays = 0;
@@ -83,9 +76,60 @@
     $('uploadBtn').textContent = uploading ? '正在上传…' : '开始翻译';
   }
   for (const id of ['outputMono', 'outputDual']) $(id).addEventListener('change', updateUpload);
+  function stopMetadata() {
+    clearTimeout(metadataTimer);
+    metadataWorker?.terminate();
+    metadataWorker = null;
+  }
+  function clearLocalFile() {
+    stopMetadata();
+    if (localPreviewUrl) URL.revokeObjectURL(localPreviewUrl);
+    localPreviewUrl = '';
+    $('previewLocal').removeAttribute('href');
+    $('previewLocal').hidden = true;
+    $('localFileInfo').hidden = true;
+  }
+  async function inspectLocalFile(selected) {
+    $('localFileInfo').hidden = false;
+    $('localFileMeta').textContent = `${size(selected.size)} · 正在读取页数…`;
+    try {
+      const header = new TextDecoder().decode(await selected.slice(0, 1024).arrayBuffer());
+      if (file !== selected) return;
+      if (!/^\s*%PDF-/.test(header)) {
+        file = null;
+        $('pdfFile').value = '';
+        clearLocalFile();
+        $('fileName').textContent = '选择 PDF 文件';
+        $('fileDetail').textContent = '点击上传或拖放到这里';
+        message('文件不是有效的 PDF', true);
+        updateUpload();
+        return;
+      }
+      // Force PDF MIME even if the operating system supplies an empty/wrong type.
+      localPreviewUrl = URL.createObjectURL(selected.slice(0, selected.size, 'application/pdf'));
+      $('previewLocal').href = localPreviewUrl;
+      $('previewLocal').hidden = false;
+      const finish = (pages) => {
+        if (file !== selected) return;
+        $('localFileMeta').textContent = `${size(selected.size)} · ${Number.isInteger(pages) && pages > 0 ? `${pages} 页` : '页数暂不可用'}`;
+        stopMetadata();
+      };
+      metadataWorker = new Worker($('uploadForm').dataset.metadataWorker);
+      metadataWorker.onmessage = (event) => finish(event.data.pages);
+      metadataWorker.onerror = () => finish(null);
+      metadataTimer = setTimeout(() => finish(null), 30000);
+      metadataWorker.postMessage(selected);
+    } catch {
+      if (file === selected) {
+        stopMetadata();
+        $('localFileMeta').textContent = `${size(selected.size)} · 页数暂不可用`;
+      }
+    }
+  }
   function setFile(selected) {
     if (uploading) return;
     if (!selected) return;
+    clearLocalFile();
     if (!selected.name.toLowerCase().endsWith('.pdf') || !selected.size) {
       message('请选择有效的 PDF 文件', true);
       $('pdfFile').value = '';
@@ -96,7 +140,8 @@
       message('');
     }
     $('fileName').textContent = file ? file.name : '选择 PDF 文件';
-    $('fileDetail').textContent = file ? `${size(file.size)} · 点击重新选择` : '点击上传或拖放到这里';
+    $('fileDetail').textContent = file ? '点击重新选择' : '点击上传或拖放到这里';
+    if (file) inspectLocalFile(file);
     updateUpload();
   }
   $('pdfFile').addEventListener('change', () => setFile($('pdfFile').files[0]));
@@ -158,6 +203,7 @@
     try {
       await upload(body);
       file = null;
+      clearLocalFile();
       $('pdfFile').value = '';
       $('fileName').textContent = '选择 PDF 文件';
       $('fileDetail').textContent = '点击上传或拖放到这里';
@@ -266,7 +312,7 @@
     try {
       const result = await api(force ? '/api/pdf/health?refresh=1' : '/api/pdf/health');
       if (sequence !== healthGeneration) return;
-      $('connectionState').textContent = result.ok ? `已连接 · PDF2zh ${result.version}` : '未连接';
+      $('connectionState').textContent = result.ok ? `已连接 · ${result.version}` : '未连接';
       $('connectionState').dataset.state = result.ok ? 'connected' : 'disconnected';
       $('connectionState').title = result.ok ? `PDF2zh 服务 v${result.version}` : '请检查服务地址与运行状态';
     } catch {
@@ -335,17 +381,20 @@
     const status = node('span', 'pdf-job-state', labels[job.status] || job.status);
     status.dataset.state = job.status;
     const badges = node('div', 'pdf-job-badges');
-    badges.append(status);
+    const statusActions = node('div', 'pdf-job-status-actions');
+    statusActions.append(status);
+    badges.append(statusActions);
     head.append(node('h3', '', job.filename), badges);
     card.append(head, node('p', 'pdf-job-meta', `${languages.get(job.source) || job.source} → ${languages.get(job.target) || job.target} · ${job.pages} 页 · ${size(job.input_bytes)}`));
-    const percent = !job.poll_warning && typeof job.progress === 'number' && activeStates.has(job.status) ? ` · ${Math.round(job.progress)}%` : '';
+    const hasProgress = !job.poll_warning && Number.isFinite(job.progress) && job.progress >= 0 && job.progress <= 100;
+    const percent = hasProgress && activeStates.has(job.status) ? ` · ${job.status === 'running' ? '总进度 ' : ''}${Math.round(job.progress * 10) / 10}%` : '';
     if (job.status !== 'completed') card.append(node('p', 'pdf-job-phase', (job.poll_warning ? '上次状态：' : '') + (job.delete_requested ? `${job.phase} · 结束后删除` : job.phase) + percent));
     if (job.poll_warning) card.append(node('p', 'pdf-job-sync-warning', job.poll_warning));
     if (activeStates.has(job.status) && job.status !== 'unknown') {
       const bar = node('progress', '');
       bar.max = 100;
-      bar.setAttribute('aria-label', job.status === 'submitting' ? '发送到翻译服务的进度' : '任务进度');
-      if (!job.poll_warning && typeof job.progress === 'number') bar.value = job.progress;
+      bar.setAttribute('aria-label', job.status === 'submitting' ? '发送到翻译服务的进度' : job.status === 'fetching' ? '当前 PDF 下载到 Trans 的进度' : '翻译总体进度');
+      if (hasProgress) bar.value = job.progress;
       card.append(bar);
     }
     const detail = node('details', 'pdf-task-details');
@@ -437,7 +486,7 @@
       const control = node('button', action === 'delete' ? 'danger-btn pdf-delete' : 'ghost', label);
       control.type = 'button'; control.dataset.action = action; control.dataset.id = job.id;
       control.disabled = busyJobs.has(job.id);
-      actions.append(control);
+      (action === 'delete' ? statusActions : actions).append(control);
       return control;
     };
     if (activeStates.has(job.status) && job.upstream_url) {
@@ -455,7 +504,7 @@
     }
     if (!job.delete_requested && (['download_failed', 'unknown'].includes(job.status) || (job.status === 'completed' && (job.outputs || ['mono', 'dual']).some((kind) => !job.files[kind])))) button('retry_download', '取回结果');
     if (!activeStates.has(job.status) && !job.delete_requested) button('delete', '删除');
-    card.append(actions);
+    if (actions.childElementCount) card.append(actions);
     return card;
   }
   async function loadJobs() {
@@ -488,8 +537,8 @@
       $('pageInfo').textContent = `${page} / ${Math.max(1, Math.ceil(data.total / 20))}`;
       $('prevPage').disabled = page <= 1;
       $('nextPage').disabled = page * 20 >= data.total;
-      delay = data.active_jobs.length ? 3000 : 30000;
-    } catch (error) { if (sequence === generation) message(error.message, true); delay = 15000; }
+      delay = data.active_jobs.length ? 2000 : 30000;
+    } catch (error) { if (sequence === generation) message(error.message, true); delay = 10000; }
     finally { if (sequence === generation && !document.hidden) timer = setTimeout(loadJobs, delay); }
   }
   function selectTaskTab(name) {
