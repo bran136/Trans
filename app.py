@@ -6018,6 +6018,12 @@ def restart_process_later(delay=0.35):
                 # Let the Gunicorn master replace this worker with the same command.
                 app.logger.info("restart worker exiting pid=%s", os.getpid())
                 os._exit(0)
+            if os.environ.get("INVOCATION_ID"):
+                # Keep systemd's main PID and journal streams. A detached child
+                # still belongs to the unit and is killed when its parent exits.
+                app.logger.info("restart systemd process in place pid=%s", os.getpid())
+                os.execv(sys.executable, [sys.executable, str(BASE_DIR / "app.py"), *sys.argv[1:]])
+                return
             replacement = subprocess.Popen(
                 [
                     sys.executable,

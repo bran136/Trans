@@ -3,6 +3,12 @@
 本项目的正式版本变更记录在此文件中。版本号采用 `主版本.次版本` 格式，
 Git 标签在版本号前添加 `v`，例如版本 `1.0` 对应标签 `v1.0`。
 
+## [1.7] - Unreleased
+
+### 改进与修复
+
+- 修复 systemd 托管时`重启服务`执行失败的问题。
+
 ## [1.6] - 2026-09-28
 
 ### 新功能
@@ -113,6 +119,7 @@ Trans 的首个正式版本。
 - 静态资源 URL 使用内容哈希自动更新，避免浏览器继续使用旧缓存。
 - 版本角标提供 GitHub 项目入口。
 
+[1.7]: https://github.com/bran136/Trans/compare/v1.6...HEAD
 [1.6]: https://github.com/bran136/Trans/releases/tag/v1.6
 [1.5]: https://github.com/bran136/Trans/releases/tag/v1.5
 [1.4]: https://github.com/bran136/Trans/releases/tag/v1.4

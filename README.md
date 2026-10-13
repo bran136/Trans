@@ -549,7 +549,7 @@ tail -f logs/app.log
 gunicorn --workers 1 --threads 6 --bind 127.0.0.1:31000 app:app
 ```
 
-也可以直接运行 `python3 app.py`，但这是 Flask 自带服务器，适合开发或单机临时使用。管理页面的“重启服务”会沿用当前启动方式：直接启动时创建替代进程，Gunicorn 模式由 Gunicorn 自动替换 worker；不会改成另一种启动方式。重启会中断当前请求，包括尚未完成的 PDF 上传；已被上游接收的 PDF 任务继续由独立服务处理，Trans 恢复后核对其状态，不会自动重复提交。
+也可以直接运行 `python3 app.py`，但这是 Flask 自带服务器，适合开发或单机临时使用。管理页面的“重启服务”会沿用当前启动方式：直接启动时创建替代进程，systemd 托管时在原进程中重新加载程序，Gunicorn 模式由 Gunicorn 自动替换 worker。重启会中断当前请求，包括尚未完成的 PDF 上传；已被上游接收的 PDF 任务继续由独立服务处理，Trans 恢复后核对其状态，不会自动重复提交。
 
 ## 开发检查
 
