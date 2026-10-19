@@ -7,6 +7,7 @@ const readerState = {
   currentBook: null,
   chapters: [],
   currentChapter: 0,
+  currentChapterData: null,
   currentSentence: 0,
   progressSentence: 0,
   progressFollowsAudio: false,
@@ -24,15 +25,10 @@ const readerState = {
   playbackRate: 1,
   ttsConfig: null,
   ttsAudio: null,
+  ttsStream: null,
   ttsToken: 0,
-  ttsScope: 0,
-  ttsPacks: new Map(),
-  ttsPackPending: new Map(),
-  ttsPackOrder: [],
-  ttsPackPrepareMs: 0,
-  activeTtsPackKey: "",
   ttsPlaybackSegments: [],
-  nextChapterPrefetch: null,
+  ttsDiagnosticTimer: null,
   mediaMetadataSignature: "",
   saveTimer: null,
   importJobs: [],
@@ -99,13 +95,11 @@ const TTS_OFFLINE_PACK_STORE = "packs";
 const TTS_OFFLINE_PACK_META_STORE = "pack-meta";
 const TTS_OFFLINE_DOWNLOAD_WORKERS = 6;
 const TTS_OFFLINE_MAX_CHAPTERS = 300;
-const TTS_PACK_PREFETCH_WORKERS = 4;
 const TTS_PACK_SCHEMA_VERSION = 2;
 const TTS_MAX_PACK_BYTES = 32 * 1024 * 1024;
 let ttsOfflineDbPromise = null;
 let ttsCacheStatsRetryTimer = null;
 let mediaVolumeAdjustmentSupported = null;
-const TTS_BROWSER_PACK_CACHE_LIMIT = 20;
 const TTS_SLEEP_FADE_SECONDS = 7;
 const TTS_AUDIO_READY_TIMEOUT_MS = 3 * 60 * 1000;
 const BOOK_DATE_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
@@ -2000,17 +1994,7 @@ async function loadChapter(chapterIndex, sentenceIndex = 0) {
   const bookId = readerState.currentBookId;
   const isCurrent = () => readerState.currentBookId === bookId && navigationRequest === readerState.navigationRequest;
   const normalizedChapterIndex = Number(chapterIndex);
-  const preparedEntry = readerState.nextChapterPrefetch;
-  const canUsePrepared = preparedEntry
-    && preparedEntry.bookId === bookId
-    && preparedEntry.chapterIndex === normalizedChapterIndex
-    && preparedEntry.scope === readerState.ttsScope;
-  let prepared = canUsePrepared ? preparedEntry.prepared : null;
-  if (!prepared && canUsePrepared && readerState.reading) {
-    prepared = await preparedEntry.promise;
-  }
-  if (!isCurrent()) return false;
-  const data = prepared?.data || await api(`/api/books/${bookId}/chapters/${normalizedChapterIndex}`).catch((error) => {
+  const data = await api(`/api/books/${bookId}/chapters/${normalizedChapterIndex}`).catch((error) => {
     if (isCurrent()) throw error;
     return null;
   });
@@ -2019,7 +2003,7 @@ async function loadChapter(chapterIndex, sentenceIndex = 0) {
   readerState.currentChapter = data.chapter.index;
   readerState.currentSentence = sentenceIndex;
   syncChapterSelection();
-  renderChapter(data.chapter, prepared?.packs || []);
+  renderChapter(data.chapter);
   highlightSentence(sentenceIndex, false);
   readerState.progressSentence = readerState.currentSentence;
   scrollActiveSentence("instant");
@@ -2031,8 +2015,8 @@ async function loadChapter(chapterIndex, sentenceIndex = 0) {
   return true;
 }
 
-function renderChapter(chapter, prefetchedPacks = []) {
-  clearTtsBrowserCache();
+function renderChapter(chapter) {
+  readerState.currentChapterData = chapter;
   readerState.displayedBookId = readerState.currentBookId;
   const content = $("bookContent");
   content.classList.remove("empty");
@@ -2090,15 +2074,6 @@ function renderChapter(chapter, prefetchedPacks = []) {
   for (const sentence of readerState.sentences) {
     readerState.sentenceOffsets.push(readerState.sentenceOffsets[readerState.sentenceOffsets.length - 1] + sentence.text.length);
   }
-  prefetchedPacks.forEach((pack) => {
-    if (!(pack?.blob instanceof Blob) || !validPackSegments(pack.segments)) return;
-    const textByIndex = new Map(readerState.sentences.map((sentence) => [
-      Number(sentence.index),
-      normalizedOfflineTtsText(sentence.text),
-    ]));
-    if (!pack.segments.every((segment) => textByIndex.get(Number(segment.index)) === segment.text)) return;
-    rememberTtsPack(pack, pack.blob);
-  });
 }
 
 function handleSentenceTap(event, index) {
@@ -2257,6 +2232,127 @@ async function saveProgress(snapshot = null, keepalive = false) {
   }
 }
 
+const PLAYBACK_DIAGNOSTIC_KEY = "transPlaybackDiagnostics";
+const PLAYBACK_DIAGNOSTIC_EVENTS = new Set([
+  "start", "playing", "ended", "waiting", "stalled", "pause", "stop", "user_pause", "user_resume",
+  "sleep_due", "sleep_stop", "hidden", "visible", "pagehide", "freeze", "resume", "buffer_wait",
+  "buffer_ready", "buffer_error", "play_error", "media_error", "heartbeat",
+]);
+function validPlaybackEvent(entry) {
+  if (!entry || typeof entry !== "object" || !PLAYBACK_DIAGNOSTIC_EVENTS.has(entry.event)) return false;
+  const book = entry.book === undefined ? "" : entry.book;
+  if (typeof book !== "string" || (book && !/^[0-9a-f]{32}$/.test(book))) return false;
+  return ["at", "chapter", "sentence", "position", "buffer_seconds", "ready_state", "network_state",
+    "rate", "sleep_left", "media_error"].every((key) => {
+    const value = entry[key] === undefined ? 0 : entry[key];
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1e14;
+  });
+}
+let playbackEvents = [];
+let playbackEventFlushTimer = null;
+let playbackEventSending = null;
+let playbackEventUploadError = "";
+let playbackHeartbeatAt = 0;
+try {
+  const saved = JSON.parse(window.localStorage.getItem(PLAYBACK_DIAGNOSTIC_KEY) || "[]");
+  if (Array.isArray(saved)) playbackEvents = saved.filter(validPlaybackEvent).slice(-48);
+} catch { /* Diagnostics must never prevent playback. */ }
+
+function persistPlaybackEvents() {
+  try { window.localStorage.setItem(PLAYBACK_DIAGNOSTIC_KEY, JSON.stringify(playbackEvents)); } catch { /* Storage is optional. */ }
+}
+
+function recordPlaybackEvent(event, error = null) {
+  const audio = readerState.ttsAudio;
+  const number = (value) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
+  playbackEvents.push({
+    event, at: Date.now(), book: readerState.currentBookId || "",
+    transport: readerState.ttsStream?.transport || "",
+    chapter: number(readerState.currentChapter), sentence: number(readerState.currentSentence),
+    position: number(audio?.currentTime), ready_state: number(audio?.readyState),
+    network_state: number(audio?.networkState), media_error: number(audio?.error?.code),
+    buffer_seconds: number(audio?.buffered.length
+      ? audio.buffered.end(audio.buffered.length - 1) - audio.currentTime : 0), rate: number(readerState.playbackRate),
+    sleep_left: Math.max(0, (readerState.sleepDeadline || 0) - Date.now()) / 1000,
+    sleep_pending: !!readerState.sleepPausePending, hidden: document.visibilityState !== "visible",
+    paused: !!audio?.paused, reading: !!readerState.reading,
+    error: error?.name || "",
+  });
+  playbackEvents = playbackEvents.slice(-48);
+  persistPlaybackEvents();
+  const urgent = ["play_error", "media_error", "buffer_error", "stop", "sleep_stop", "hidden", "visible", "pagehide", "freeze"].includes(event);
+  if (urgent) flushPlaybackEvents();
+  else if (!playbackEventFlushTimer) playbackEventFlushTimer = window.setTimeout(flushPlaybackEvents, 10000);
+}
+
+async function flushPlaybackEvents() {
+  window.clearTimeout(playbackEventFlushTimer);
+  playbackEventFlushTimer = null;
+  if (playbackEventSending) {
+    // A background request may still be pending when the page becomes visible.
+    if (Date.now() - playbackEventSending.started >= 8000) {
+      playbackEventSending.retryImmediately = document.visibilityState === "visible";
+      playbackEventSending.cancel();
+    }
+    return;
+  }
+  if (!playbackEvents.length) return;
+  const batch = playbackEvents.slice(0, 12);
+  const controller = new AbortController();
+  const sending = { started: Date.now(), retryImmediately: false };
+  const expired = new Promise((_, reject) => {
+    sending.cancel = () => {
+      reject(new Error("播放诊断上传超时"));
+      controller.abort();
+    };
+  });
+  playbackEventSending = sending;
+  const timeout = window.setTimeout(sending.cancel, 8000);
+  let failed = false;
+  try {
+    const upload = async () => {
+      const response = await fetch("/api/reader/playback-events", {
+        method: "POST", credentials: "same-origin", keepalive: true, signal: controller.signal,
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": CSRF_TOKEN },
+        body: JSON.stringify({ events: batch }),
+      });
+      if (!response.ok) throw new Error(`播放诊断上传失败：HTTP ${response.status}`);
+      const result = await response.json();
+      if (result.ok !== true) throw new Error("播放诊断响应无效");
+    };
+    // Abort alone does not guarantee a suspended fetch settles promptly.
+    await Promise.race([upload(), expired]);
+    playbackEvents = playbackEvents.filter((entry) => !batch.includes(entry));
+    persistPlaybackEvents();
+    playbackEventUploadError = "";
+  } catch (error) {
+    failed = true;
+    const message = error.message || "播放诊断上传失败";
+    if (message !== playbackEventUploadError) console.warn(message);
+    playbackEventUploadError = message;
+  } finally {
+    window.clearTimeout(timeout);
+    playbackEventSending = null;
+    if (playbackEvents.length && !playbackEventFlushTimer) {
+      const delay = sending.retryImmediately ? 0 : failed ? 30000 : 10000;
+      playbackEventFlushTimer = window.setTimeout(flushPlaybackEvents, delay);
+    }
+  }
+}
+
+function startPlaybackDiagnostics() {
+  window.clearInterval(readerState.ttsDiagnosticTimer);
+  playbackHeartbeatAt = Date.now();
+  readerState.ttsDiagnosticTimer = window.setInterval(() => {
+    if (!readerState.reading || readerState.paused) return;
+    if (Date.now() - playbackHeartbeatAt >= 30000) {
+      recordPlaybackEvent("heartbeat");
+      playbackHeartbeatAt = Date.now();
+    }
+    pumpContinuousListening();
+  }, 10000);
+}
+
 function setListenStatus(text) {
   const status = $("listenStatus");
   if (!status) return;
@@ -2274,40 +2370,6 @@ function audioErrorMessage(audio) {
     4: "浏览器不支持该音频格式",
   };
   return messages[code] || "音频播放失败";
-}
-
-function waitForAudioReady(audio, token, scope) {
-  if (audio.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const timeoutId = window.setTimeout(() => {
-      cleanup();
-      reject(new Error("浏览器加载播放包超时，请重试"));
-    }, TTS_AUDIO_READY_TIMEOUT_MS);
-    const cancelId = window.setInterval(() => {
-      if (token === readerState.ttsToken && scope === readerState.ttsScope) return;
-      cleanup();
-      reject(new Error("播放准备已取消"));
-    }, 100);
-    const cleanup = () => {
-      window.clearTimeout(timeoutId);
-      window.clearInterval(cancelId);
-      audio.removeEventListener("canplay", handleReady);
-      audio.removeEventListener("loadeddata", handleReady);
-      audio.removeEventListener("error", handleError);
-    };
-    const handleReady = () => {
-      cleanup();
-      resolve();
-    };
-    const handleError = () => {
-      cleanup();
-      reject(new Error(audioErrorMessage(audio)));
-    };
-    audio.addEventListener("canplay", handleReady, { once: true });
-    audio.addEventListener("loadeddata", handleReady, { once: true });
-    audio.addEventListener("error", handleError, { once: true });
-    audio.load();
-  });
 }
 
 function updateListenButtons() {
@@ -2329,16 +2391,8 @@ function updatePlaybackRate() {
   $("playbackRateSelect").value = String(readerState.playbackRate);
   window.localStorage.setItem("readerPlaybackRate", String(readerState.playbackRate));
   applyAudioPlaybackRate(readerState.ttsAudio);
+  pumpContinuousListening();
   if (readerState.sleepPausePending) scheduleSleepBoundaryPause();
-  if (readerState.reading) {
-    const segments = readerState.ttsPlaybackSegments;
-    const lastSegment = segments.length ? segments[segments.length - 1] : null;
-    const lastPreparedIndex = lastSegment
-      && Number(lastSegment.chapterIndex) === Number(readerState.currentChapter)
-      ? lastSegment.index
-      : readerState.currentSentence;
-    prefetchUpcomingTtsAudio(lastPreparedIndex, readerState.ttsToken, readerState.ttsScope);
-  }
 }
 
 function ttsReady(config = readerState.ttsConfig || {}) {
@@ -2386,9 +2440,11 @@ function clearSleepTimer(resetInput = false) {
   if (readerState.ttsAudio) readerState.ttsAudio.volume = 1;
   if (resetInput && $("sleepCustomMinutes")) $("sleepCustomMinutes").value = "";
   updateSleepTimerButton();
+  pumpContinuousListening();
 }
 
 function armSleepPause() {
+  recordPlaybackEvent("sleep_due");
   window.clearTimeout(readerState.sleepTimerId);
   window.clearInterval(readerState.sleepCountdownId);
   readerState.sleepTimerId = null;
@@ -2413,6 +2469,7 @@ function scheduleSleepTimer(minutes) {
   readerState.sleepCountdownId = window.setInterval(updateSleepTimerButton, 1000);
   updateSleepTimerButton();
   setListenStatus(`${normalized} 分钟后自动暂停`);
+  pumpContinuousListening();
 }
 
 function openSleepTimerDialog() {
@@ -2437,7 +2494,7 @@ function startSleepFadeIfNeeded(audio, stopAt = audio?.duration) {
   if (!canAdjustMediaVolume()
     || !readerState.sleepPausePending
     || !audio
-    || !Number.isFinite(audio.duration)) return;
+    || !Number.isFinite(Number(stopAt))) return;
   const normalizedStopAt = Number.isFinite(Number(stopAt)) ? Number(stopAt) : audio.duration;
   const secondsLeft = () => Math.max(
     0,
@@ -2463,22 +2520,15 @@ function startSleepFadeIfNeeded(audio, stopAt = audio?.duration) {
 }
 
 function finishSleepPause(index) {
-  window.clearTimeout(readerState.sleepBoundaryTimerId);
-  stopSleepFade();
-  readerState.sleepBoundaryTimerId = null;
+  recordPlaybackEvent("sleep_stop");
   const finishedChapter = readerState.currentChapter;
   const currentBookId = readerState.currentBookId;
   const nextIndex = nextReadableSentenceIndex(Number(index) + 1);
   if (nextIndex >= 0) highlightSentence(nextIndex, false);
-  readerState.reading = false;
+  saveProgressSoon();
+  stopListening(false);
   readerState.paused = true;
-  readerState.sleepPausePending = false;
-  readerState.sleepFadeStarted = false;
-  readerState.sleepPauseTarget = null;
-  if (readerState.ttsAudio) readerState.ttsAudio.volume = 1;
-  clearSleepTimer(false);
   updateListenButtons();
-  syncReaderWakeLock();
   setMediaSessionPlaybackState("paused");
   setListenStatus("定时已暂停");
   if (nextIndex < 0 && finishedChapter + 1 < readerState.chapters.length) {
@@ -2500,18 +2550,6 @@ function finishSleepPause(index) {
   }
 }
 
-function clearTtsBrowserCache() {
-  readerState.ttsScope += 1;
-  readerState.nextChapterPrefetch = null;
-  readerState.ttsPackPending.clear();
-  readerState.ttsPacks.forEach((pack) => {
-    if (pack?.url) URL.revokeObjectURL(pack.url);
-  });
-  readerState.ttsPacks.clear();
-  readerState.ttsPackOrder = [];
-  readerState.activeTtsPackKey = "";
-}
-
 function sentenceText(index) {
   const sentence = readerState.sentences.find((item) => Number(item.index) === Number(index));
   return sentence?.text || "";
@@ -2528,42 +2566,6 @@ function nextReadableSentenceIndex(startIndex) {
     if (hasReadableText(sentenceText(index))) return index;
   }
   return -1;
-}
-
-function rememberedTtsPack(chapterIndex, sentenceIndex, bookId = readerState.currentBookId) {
-  for (const pack of readerState.ttsPacks.values()) {
-    if (pack.bookId !== bookId
-      || pack.profileKey !== readerState.ttsConfig?.offline_profile_key
-      || Number(pack.chapterIndex) !== Number(chapterIndex)) continue;
-    if (pack.segments.some((segment) => Number(segment.index) === Number(sentenceIndex))) return pack;
-  }
-  return null;
-}
-
-function trimTtsPackBrowserCache() {
-  while (readerState.ttsPackOrder.length > TTS_BROWSER_PACK_CACHE_LIMIT) {
-    const removable = readerState.ttsPackOrder.find((key) => key !== readerState.activeTtsPackKey);
-    if (!removable) break;
-    readerState.ttsPackOrder = readerState.ttsPackOrder.filter((key) => key !== removable);
-    const stale = readerState.ttsPacks.get(removable);
-    if (stale?.url) URL.revokeObjectURL(stale.url);
-    readerState.ttsPacks.delete(removable);
-  }
-}
-
-function rememberTtsPack(manifest, blob) {
-  const existing = readerState.ttsPacks.get(manifest.packKey);
-  if (existing) {
-    readerState.ttsPackOrder = readerState.ttsPackOrder.filter((key) => key !== manifest.packKey);
-    readerState.ttsPackOrder.push(manifest.packKey);
-    return existing;
-  }
-  const pack = { ...manifest, blob, url: URL.createObjectURL(blob) };
-  readerState.ttsPacks.set(pack.packKey, pack);
-  readerState.ttsPackOrder = readerState.ttsPackOrder.filter((key) => key !== pack.packKey);
-  readerState.ttsPackOrder.push(pack.packKey);
-  trimTtsPackBrowserCache();
-  return pack;
 }
 
 function normalizedPackManifest(raw, blob, textByIndex, expected = {}) {
@@ -2653,100 +2655,29 @@ function normalizedPackManifest(raw, blob, textByIndex, expected = {}) {
   };
 }
 
-async function fetchPackBlob(url) {
-  const response = await fetch(url, { credentials: "same-origin" });
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || `播放包下载失败：${response.status}`);
-  }
-  const blob = await response.blob();
-  if (!blob.size || blob.size > TTS_MAX_PACK_BYTES) {
-    throw new Error("播放包音频大小无效");
-  }
-  return blob;
-}
-
-async function requestTtsPackForChapter(
-  bookId,
-  chapterIndex,
-  sentenceIndex,
-  textByIndex,
-  scope,
-) {
-  const remembered = rememberedTtsPack(chapterIndex, sentenceIndex, bookId);
-  if (remembered) return remembered;
-  const pendingKey = `${scope}:${bookId}:${Number(chapterIndex)}:${Number(sentenceIndex)}`;
-  if (readerState.ttsPackPending.has(pendingKey)) return readerState.ttsPackPending.get(pendingKey);
-  const pending = (async () => {
-    const local = await promiseWithTimeout(
-      localOfflinePackForChapter(
-        bookId,
-        readerState.ttsConfig?.offline_profile_key,
-        chapterIndex,
-        sentenceIndex,
-        textByIndex,
-      ),
-      8000,
-      "读取本机播放包超时，请关闭其他读书页面后重试",
-    ).catch(() => null);
-    if (local) {
-      if (scope !== readerState.ttsScope) return null;
-      const manifest = normalizedPackManifest(local, local.blob, textByIndex, {
-        bookId,
-        chapterIndex,
-        profileKey: readerState.ttsConfig?.offline_profile_key,
-      });
-      manifest.source = "local";
-      return rememberTtsPack(manifest, local.blob);
+async function fetchPackBlob(url, signal) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+  const timeout = window.setTimeout(abort, TTS_AUDIO_READY_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { credentials: "same-origin", signal: controller.signal });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      const error = new Error(data.error || `播放包下载失败：${response.status}`);
+      error.status = response.status;
+      throw error;
     }
-    const serverStartedAt = performance.now();
-    const raw = await api("/api/reader/tts-pack", {
-      method: "POST",
-      body: JSON.stringify({
-        book_id: bookId,
-        chapter_index: Number(chapterIndex),
-        sentence_index: Number(sentenceIndex),
-      }),
-    });
-    const blob = await fetchPackBlob(raw.url);
-    const prepareMs = Math.max(0, performance.now() - serverStartedAt);
-    readerState.ttsPackPrepareMs = Math.max(prepareMs, Number(readerState.ttsPackPrepareMs || 0) * 0.75);
-    if (scope !== readerState.ttsScope) return null;
-    const manifest = normalizedPackManifest(raw, blob, textByIndex, {
-      bookId,
-      chapterIndex,
-      profileKey: readerState.ttsConfig?.offline_profile_key,
-    });
-    manifest.source = "server";
-    return rememberTtsPack(manifest, blob);
-  })().finally(() => readerState.ttsPackPending.delete(pendingKey));
-  readerState.ttsPackPending.set(pendingKey, pending);
-  return pending;
-}
-
-async function fetchTtsPack(
-  index,
-  token = readerState.ttsToken,
-  scope = readerState.ttsScope,
-) {
-  const normalizedIndex = Number(index);
-  if (!Number.isFinite(normalizedIndex) || normalizedIndex < 0 || normalizedIndex >= readerState.sentences.length) {
-    throw new Error("没有可朗读文本");
+    const blob = await response.blob();
+    if (!blob.size || blob.size > TTS_MAX_PACK_BYTES) {
+      throw new Error("播放包音频大小无效");
+    }
+    return blob;
+  } finally {
+    window.clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
   }
-  const textByIndex = new Map(readerState.sentences.map((sentence) => [
-    Number(sentence.index),
-    normalizedOfflineTtsText(sentence.text),
-  ]));
-  const pack = await requestTtsPackForChapter(
-    readerState.currentBookId,
-    readerState.currentChapter,
-    normalizedIndex,
-    textByIndex,
-    scope,
-  );
-  if (token !== readerState.ttsToken || scope !== readerState.ttsScope) return null;
-  if (pack?.source === "local") setListenStatus("本机离线播放包命中｜正在准备播放");
-  return pack;
 }
 
 function playbackSegmentAtTime(segments, currentTime) {
@@ -2768,10 +2699,12 @@ function scheduleSleepBoundaryPause() {
   const rate = Math.max(0.8, Math.min(Number(audio.playbackRate) || 1, 2));
   const delay = Math.max(0, (Number(target.time) - audio.currentTime) / rate * 1000);
   readerState.sleepBoundaryTimerId = window.setTimeout(() => {
-    if (!readerState.sleepPausePending || readerState.ttsAudio !== audio || readerState.sleepPauseTarget !== target) return;
-    audio.pause();
-    audio.volume = 1;
-    finishSleepPause(target.index);
+    if (!readerState.sleepPausePending || readerState.ttsAudio !== audio || readerState.sleepPauseTarget !== target || audio.paused) return;
+    if (audio.currentTime < Number(target.time) - 0.03) {
+      scheduleSleepBoundaryPause();
+      return;
+    }
+    if (readerState.ttsStream) finishListeningSleep(readerState.ttsStream, target);
   }, delay);
 }
 
@@ -2788,256 +2721,10 @@ function setSleepPauseTargetForCurrentAudio() {
   scheduleSleepBoundaryPause();
 }
 
-function adoptPrefetchedChapterForPlayback(chapterIndex) {
-  const entry = readerState.nextChapterPrefetch;
-  const prepared = entry?.prepared;
-  if (!entry
-    || !prepared
-    || entry.bookId !== readerState.currentBookId
-    || entry.chapterIndex !== Number(chapterIndex)
-    || entry.scope !== readerState.ttsScope) return false;
-  const data = prepared.data;
-  readerState.currentBook = data.book;
-  readerState.currentChapter = data.chapter.index;
-  readerState.currentSentence = 0;
-  syncChapterSelection();
-  renderChapter(data.chapter, [...(prepared.packs || [])]);
-  saveProgressSoon();
-  setStatus(readerState.currentBook.title);
-  updateMediaSessionMetadata();
-  setMediaSessionPlaybackState("playing");
-  return true;
-}
-
-function syncTtsPlaybackSegment(audio, token) {
-  const segment = playbackSegmentAtTime(readerState.ttsPlaybackSegments, audio.currentTime);
-  if (!segment) return readerState.ttsScope;
-  const chapterChanged = Number(segment.chapterIndex) !== Number(readerState.currentChapter);
-  if (chapterChanged && !adoptPrefetchedChapterForPlayback(segment.chapterIndex)) {
-    return readerState.ttsScope;
-  }
-  if (!chapterChanged && Number(segment.index) === Number(readerState.currentSentence)) {
-    return readerState.ttsScope;
-  }
-  highlightSentence(segment.index, true);
-  updateMediaSessionMetadata();
-  saveProgressSoon();
-  setListenStatus(`正在朗读：第 ${Number(segment.index) + 1} 句`);
-  if (chapterChanged) {
-    prefetchUpcomingTtsAudio(segment.index, token, readerState.ttsScope);
-  }
-  return readerState.ttsScope;
-}
-
-function releaseActiveTtsPlaybackUrl() {
-  readerState.activeTtsPackKey = "";
-  readerState.ttsPlaybackSegments = [];
-}
-
-function ttsPrefetchPackCount(rate = readerState.playbackRate) {
-  const normalizedRate = Math.max(0.8, Math.min(Number(rate) || 1, 2));
-  const baseCount = Math.max(2, Math.ceil(normalizedRate * 2));
-  const minimumWallSeconds = 5 / normalizedRate;
-  const measuredPrepareSeconds = Math.max(0, Number(readerState.ttsPackPrepareMs || 0) / 1000);
-  const latencyCount = measuredPrepareSeconds > minimumWallSeconds * 0.5
-    ? Math.ceil(measuredPrepareSeconds / minimumWallSeconds) + 2
-    : baseCount;
-  return Math.min(8, Math.max(baseCount, latencyCount));
-}
-
-async function prefetchChapterPackStarts(
-  bookId,
-  chapterIndex,
-  sentenceIndexes,
-  textByIndex,
-  token = readerState.ttsToken,
-  scope = readerState.ttsScope,
-) {
-  const indexes = [...new Set(sentenceIndexes.map(Number).filter(Number.isFinite))];
-  const results = new Array(indexes.length);
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < indexes.length) {
-      if (token !== readerState.ttsToken
-        || scope !== readerState.ttsScope
-        || readerState.currentBookId !== bookId
-        || !readerState.reading) return;
-      const position = cursor;
-      cursor += 1;
-      results[position] = await requestTtsPackForChapter(
-        bookId,
-        chapterIndex,
-        indexes[position],
-        textByIndex,
-        scope,
-      );
-    }
-  };
-  const workerCount = Math.min(TTS_PACK_PREFETCH_WORKERS, indexes.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-  if (results.some((pack) => !pack)) return null;
-  return results;
-}
-
-async function prefetchNextChapterIfNeeded(pack, preparedCount, token, scope) {
-  if (pack.remainingPackCount === null || pack.remainingPackCount > preparedCount) return;
-  const nextChapter = await prefetchNextChapterAudio(token, scope);
-  if (Number(readerState.currentChapter) + 1 < readerState.chapters.length && !nextChapter) {
-    throw new Error("下一章播放缓冲准备失败");
-  }
-}
-
-async function prefetchFollowingTtsPacks(pack, token = readerState.ttsToken, scope = readerState.ttsScope) {
-  if (!pack || token !== readerState.ttsToken || scope !== readerState.ttsScope || !readerState.reading) return;
-  const desiredPacks = ttsPrefetchPackCount();
-  const hintedIndexes = Array.isArray(pack.nextStartSentenceIndexes)
-    ? pack.nextStartSentenceIndexes.slice(0, desiredPacks)
-    : [];
-  if (pack.remainingPackCount !== null) {
-    const textByIndex = new Map(readerState.sentences.map((sentence) => [
-      Number(sentence.index),
-      normalizedOfflineTtsText(sentence.text),
-    ]));
-    const prepared = await prefetchChapterPackStarts(
-      readerState.currentBookId,
-      readerState.currentChapter,
-      hintedIndexes,
-      textByIndex,
-      token,
-      scope,
-    );
-    if (prepared === null) return;
-    await prefetchNextChapterIfNeeded(pack, hintedIndexes.length, token, scope);
-    return;
-  }
-
-  let nextIndex = nextReadableSentenceIndex(Number(pack.endSentenceIndex) + 1);
-  let prepared = 0;
-  while (nextIndex >= 0 && prepared < desiredPacks) {
-    if (token !== readerState.ttsToken || scope !== readerState.ttsScope || !readerState.reading) return;
-    const nextPack = await fetchTtsPack(nextIndex, token, scope);
-    if (!nextPack) return;
-    prepared += 1;
-    nextIndex = nextReadableSentenceIndex(Number(nextPack.endSentenceIndex) + 1);
-  }
-  if (nextIndex < 0 && token === readerState.ttsToken && scope === readerState.ttsScope && readerState.reading) {
-    const nextChapter = await prefetchNextChapterAudio(token, scope);
-    if (Number(readerState.currentChapter) + 1 < readerState.chapters.length && !nextChapter) {
-      throw new Error("下一章播放缓冲准备失败");
-    }
-  }
-}
-
-async function prefetchUpcomingTtsAudio(index, token = readerState.ttsToken, scope = readerState.ttsScope) {
-  if (token !== readerState.ttsToken || scope !== readerState.ttsScope || !readerState.reading) return;
-  try {
-    const pack = rememberedTtsPack(readerState.currentChapter, Number(index), readerState.currentBookId)
-      || await fetchTtsPack(Number(index), token, scope);
-    await prefetchFollowingTtsPacks(pack, token, scope);
-  } catch {
-    // Playback performs the authoritative retry when a prefetched pack is needed.
-  }
-}
-
-function readableChapterSentences(chapter) {
-  const sentences = [];
-  for (const paragraph of chapter?.paragraphs || []) {
-    if (paragraph?.type === "image") continue;
-    for (const sentence of paragraph?.sentences || []) {
-      if (hasReadableText(sentence?.text)) sentences.push(sentence);
-    }
-  }
-  return sentences;
-}
-
-function prefetchNextChapterAudio(
-  token = readerState.ttsToken,
-  scope = readerState.ttsScope,
-) {
-  const bookId = readerState.currentBookId;
-  const chapterIndex = Number(readerState.currentChapter) + 1;
-  if (!bookId || chapterIndex >= readerState.chapters.length) return Promise.resolve(null);
-  const existing = readerState.nextChapterPrefetch;
-  if (existing
-    && existing.bookId === bookId
-    && existing.chapterIndex === chapterIndex
-    && existing.scope === scope) return existing.promise;
-  const entry = {
-    bookId,
-    chapterIndex,
-    scope,
-    prepared: null,
-    promise: null,
-  };
-  entry.promise = (async () => {
-    const data = await api(`/api/books/${bookId}/chapters/${chapterIndex}`);
-    const chapterSentences = readableChapterSentences(data.chapter);
-    const firstSentence = chapterSentences[0];
-    const prepared = { data, packs: [] };
-    if (!firstSentence) {
-      entry.prepared = prepared;
-      return prepared;
-    }
-    if (token !== readerState.ttsToken
-      || scope !== readerState.ttsScope
-      || readerState.currentBookId !== bookId
-      || !readerState.reading) return null;
-    const textByIndex = chapterSentenceTextMap(data.chapter);
-    const firstPack = await requestTtsPackForChapter(
-      bookId,
-      chapterIndex,
-      Number(firstSentence.index),
-      textByIndex,
-      scope,
-    );
-    if (!firstPack) return null;
-    const desiredPacks = ttsPrefetchPackCount();
-    const hintedIndexes = Array.isArray(firstPack.nextStartSentenceIndexes)
-      ? firstPack.nextStartSentenceIndexes.slice(0, Math.max(0, desiredPacks - 1))
-      : [];
-    let following = [];
-    if (firstPack.remainingPackCount !== null) {
-      following = await prefetchChapterPackStarts(
-        bookId,
-        chapterIndex,
-        hintedIndexes,
-        textByIndex,
-        token,
-        scope,
-      );
-    } else {
-      let nextSentence = chapterSentences.find(
-        (sentence) => Number(sentence.index) > Number(firstPack.endSentenceIndex),
-      );
-      while (nextSentence && following.length < Math.max(0, desiredPacks - 1)) {
-        const pack = await requestTtsPackForChapter(
-          bookId,
-          chapterIndex,
-          Number(nextSentence.index),
-          textByIndex,
-          scope,
-        );
-        if (!pack) return null;
-        following.push(pack);
-        nextSentence = chapterSentences.find(
-          (sentence) => Number(sentence.index) > Number(pack.endSentenceIndex),
-        );
-      }
-    }
-    if (following === null
-      || token !== readerState.ttsToken
-      || scope !== readerState.ttsScope
-      || readerState.currentBookId !== bookId
-      || !readerState.reading) return null;
-    prepared.packs = [firstPack, ...following];
-    entry.prepared = prepared;
-    return prepared;
-  })().catch(() => null);
-  readerState.nextChapterPrefetch = entry;
-  return entry.promise;
-}
-
 function stopListening(resetStatus = true, clearTimer = true) {
+  closeContinuousListening();
+  if (readerState.reading || readerState.paused) recordPlaybackEvent("stop");
+  window.clearInterval(readerState.ttsDiagnosticTimer);
   readerState.ttsToken += 1;
   readerState.reading = false;
   readerState.paused = false;
@@ -3049,6 +2736,10 @@ function stopListening(resetStatus = true, clearTimer = true) {
     window.clearTimeout(readerState.sleepBoundaryTimerId);
     readerState.sleepBoundaryTimerId = null;
     readerState.ttsAudio.autoplay = false;
+    readerState.ttsAudio.onloadedmetadata = null;
+    readerState.ttsAudio.onpause = null;
+    readerState.ttsAudio.onwaiting = null;
+    readerState.ttsAudio.onstalled = null;
     readerState.ttsAudio.onplaying = null;
     readerState.ttsAudio.onended = null;
     readerState.ttsAudio.onerror = null;
@@ -3056,7 +2747,7 @@ function stopListening(resetStatus = true, clearTimer = true) {
     readerState.ttsAudio.removeAttribute("src");
     readerState.ttsAudio.load();
   }
-  releaseActiveTtsPlaybackUrl();
+  readerState.ttsPlaybackSegments = [];
   updateListenButtons();
   syncReaderWakeLock();
   setMediaSessionPlaybackState("none");
@@ -3080,10 +2771,23 @@ async function startListeningFrom(index = readerState.currentSentence) {
   readerState.paused = false;
   readerState.ttsPreparing = true;
   const token = readerState.ttsToken;
+  recordPlaybackEvent("start");
+  startPlaybackDiagnostics();
   updateListenButtons();
   syncReaderWakeLock();
   try {
-    await playSentence(nextReadableSentenceIndex(index), token);
+    const first = nextReadableSentenceIndex(index);
+    if (first < 0) {
+      if (readerState.currentChapter + 1 < readerState.chapters.length) {
+        const loaded = await loadChapter(readerState.currentChapter + 1, 0);
+        if (loaded && token === readerState.ttsToken && readerState.reading) await startListeningFrom(0);
+      } else {
+        stopListening(false);
+        setListenStatus("没有后续可朗读文本");
+      }
+      return;
+    }
+    await startContinuousListening(first, token);
   } finally {
     if (token === readerState.ttsToken) {
       readerState.ttsPreparing = false;
@@ -3092,146 +2796,8 @@ async function startListeningFrom(index = readerState.currentSentence) {
   }
 }
 
-async function playSentence(index, token = readerState.ttsToken, continuous = false) {
-  if (!readerState.reading || token !== readerState.ttsToken) return;
-  const readableIndex = nextReadableSentenceIndex(index);
-  if (readableIndex < 0 || readableIndex >= readerState.sentences.length) {
-    if (readerState.currentChapter + 1 < readerState.chapters.length) {
-      setListenStatus("正在切换下一章");
-      setMediaSessionPlaybackState("playing");
-      try {
-        if (!await loadChapter(readerState.currentChapter + 1, 0)) return;
-        await playSentence(nextReadableSentenceIndex(0), token, true);
-      } catch (error) {
-        if (readerState.reading && token === readerState.ttsToken) {
-          setListenStatus(error.message || "切换下一章失败");
-          stopListening(false);
-        }
-      }
-      return;
-    }
-    stopListening(false);
-    readerState.chapterComplete = true;
-    saveProgressSoon();
-    setListenStatus("本书朗读完成");
-    return;
-  }
-
-  index = readableIndex;
-  highlightSentence(index, true);
-  updateMediaSessionMetadata();
-  setMediaSessionPlaybackState("playing");
-  let scope = readerState.ttsScope;
-  saveProgressSoon();
-  const remembered = rememberedTtsPack(readerState.currentChapter, index, readerState.currentBookId);
-  setListenStatus(remembered ? "播放包内存缓存命中｜正在准备播放" : "正在准备当前句音频");
-
-  try {
-    const pack = remembered || await fetchTtsPack(index, token, scope);
-    if (!pack || !readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
-    const startSegment = pack.segments.find((segment) => Number(segment.index) === Number(index));
-    if (!startSegment) throw new Error("播放包不包含当前句");
-
-    if (!continuous) {
-      setListenStatus(`正在准备连续播放缓冲（后续 ${ttsPrefetchPackCount()} 个播放包）`);
-      await prefetchFollowingTtsPacks(pack, token, scope);
-      if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
-    } else {
-      prefetchFollowingTtsPacks(pack, token, scope).catch(() => {});
-    }
-    const audio = readerState.ttsAudio || new Audio();
-    if (!continuous) audio.pause();
-    audio.onplaying = null;
-    audio.onended = null;
-    audio.onerror = null;
-    audio.ontimeupdate = null;
-    releaseActiveTtsPlaybackUrl();
-    readerState.activeTtsPackKey = pack.packKey;
-    readerState.ttsPlaybackSegments = pack.segments;
-    if (readerState.sleepPausePending) readerState.sleepPauseTarget = null;
-    audio.volume = 1;
-    applyAudioPlaybackRate(audio);
-    audio.autoplay = continuous;
-    audio.src = pack.url;
-    audio.preload = "auto";
-    readerState.ttsAudio = audio;
-
-    audio.onplaying = () => {
-      if (token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
-      applyAudioPlaybackRate(audio);
-      setMediaSessionPlaybackState("playing");
-      if (readerState.sleepPausePending) scheduleSleepBoundaryPause();
-      const segment = playbackSegmentAtTime(pack.segments, audio.currentTime) || startSegment;
-      setListenStatus(`正在朗读：第 ${Number(segment.index) + 1} 句`);
-    };
-    audio.ontimeupdate = () => {
-      if (token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
-      let sleepTarget = readerState.sleepPauseTarget;
-      if (readerState.sleepPausePending && sleepTarget && Number.isFinite(sleepTarget.time)
-        && audio.currentTime >= sleepTarget.time - 0.03) {
-        audio.pause();
-        audio.volume = 1;
-        finishSleepPause(sleepTarget.index);
-        return;
-      }
-      scope = syncTtsPlaybackSegment(audio, token);
-      if (readerState.sleepPausePending && !readerState.sleepPauseTarget) {
-        setSleepPauseTargetForCurrentAudio();
-        sleepTarget = readerState.sleepPauseTarget;
-      }
-      startSleepFadeIfNeeded(audio, sleepTarget?.time);
-    };
-    audio.onended = () => {
-      if (token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
-      stopSleepFade();
-      audio.volume = 1;
-      if (readerState.sleepPausePending) {
-        finishSleepPause(readerState.sleepPauseTarget?.index ?? pack.endSentenceIndex);
-        return;
-      }
-      const nextIndex = nextReadableSentenceIndex(Number(pack.endSentenceIndex) + 1);
-      if (nextIndex < 0
-        && readerState.currentChapter + 1 < readerState.chapters.length
-        && adoptPrefetchedChapterForPlayback(readerState.currentChapter + 1)) {
-        scope = readerState.ttsScope;
-        playSentence(nextReadableSentenceIndex(0), token, true);
-        return;
-      }
-      playSentence(nextIndex, token, true);
-    };
-    audio.onerror = () => {
-      if (token === readerState.ttsToken && scope === readerState.ttsScope) {
-        setListenStatus(audioErrorMessage(audio));
-        stopListening(false);
-      }
-    };
-
-    await waitForAudioReady(audio, token, scope);
-    if (!readerState.reading || token !== readerState.ttsToken || scope !== readerState.ttsScope) return;
-    const safeStart = Math.max(0, Math.min(Number(startSegment.start) || 0, Math.max(0, audio.duration - 0.05)));
-    if (safeStart > 0.01) audio.currentTime = safeStart;
-    if (readerState.sleepPausePending && !readerState.sleepPauseTarget) setSleepPauseTargetForCurrentAudio();
-    applyAudioPlaybackRate(audio);
-    try {
-      await audio.play();
-    } catch (error) {
-      if (error?.name === "NotAllowedError") {
-        throw new Error("浏览器阻止了自动播放，请再次点击播放");
-      }
-      throw error;
-    }
-    if (readerState.sleepPausePending) scheduleSleepBoundaryPause();
-  } catch (error) {
-    if (token === readerState.ttsToken && scope === readerState.ttsScope) {
-      setListenStatus(error.message);
-      stopListening(false);
-    }
-  } finally {
-    updateListenButtons();
-  }
-}
-
 async function toggleListeningPause() {
+  recordPlaybackEvent(readerState.paused || !readerState.reading ? "user_resume" : "user_pause");
   if (readerState.ttsPreparing) {
     stopListening(false, false);
     readerState.paused = true;
@@ -3248,7 +2814,15 @@ async function toggleListeningPause() {
   if (readerState.paused) {
     readerState.paused = false;
     applyAudioPlaybackRate(readerState.ttsAudio);
-    await readerState.ttsAudio.play();
+    try {
+      await readerState.ttsAudio.play();
+    } catch (error) {
+      readerState.paused = true;
+      updateListenButtons();
+      setMediaSessionPlaybackState("paused");
+      setListenStatus(error.name === "NotAllowedError" ? "请再次点击继续播放" : error.message);
+      return;
+    }
     if (readerState.sleepPausePending) scheduleSleepBoundaryPause();
     setMediaSessionPlaybackState("playing");
     setListenStatus("继续朗读");
@@ -4770,7 +4344,7 @@ async function saveTtsConfig() {
     showTtsConfigMessage("正在保存");
     const data = await api("/api/reader/tts-config", { method: "PUT", body: JSON.stringify(payload) });
     readerState.ttsConfig = data.config;
-    clearTtsBrowserCache();
+    if (readerState.reading) stopListening(false);
     renderTtsConfig();
     showTtsConfigMessage("听书配置已保存", "success");
   } catch (error) {
@@ -4876,7 +4450,7 @@ async function changeQuickVoice() {
       })),
     });
     readerState.ttsConfig = data.config;
-    clearTtsBrowserCache();
+    if (readerState.reading) stopListening(false);
     renderTtsConfig();
     setListenStatus(wasReading ? "音色已切换，请重新开始朗读" : "音色已切换");
   } catch (error) {
@@ -5001,6 +4575,8 @@ window.addEventListener("keydown", (event) => {
   }
 });
 document.addEventListener("visibilitychange", () => {
+  if (readerState.currentBookId) recordPlaybackEvent(document.visibilityState === "visible" ? "visible" : "hidden");
+  else if (document.visibilityState === "visible") flushPlaybackEvents();
   if (document.visibilityState === "visible") {
     saveProgressSoon();
     refreshSelectedReaderFont();
@@ -5031,6 +4607,8 @@ window.addEventListener("popstate", (event) => {
   showShelfView();
 });
 window.addEventListener("pagehide", () => {
+  if (readerState.ttsStream) stopListening(false);
+  if (readerState.currentBookId) recordPlaybackEvent("pagehide");
   flushPendingProgress(true);
   readerState.wakeLockWanted = false;
   readerState.offlineDownloadWakeLockWanted = false;
@@ -5073,3 +4651,7 @@ ensureReaderFontLoaded("yshi-written").then((loaded) => {
 });
 pruneStoredReaderFonts();
 Promise.all([loadBooks(), loadImportJobs(), loadTtsConfig()]).catch((error) => setStatus(error.message));
+
+document.addEventListener("freeze", () => { if (readerState.reading) recordPlaybackEvent("freeze"); });
+document.addEventListener("resume", () => { if (readerState.reading) recordPlaybackEvent("resume"); flushPlaybackEvents(); });
+if (playbackEvents.length) playbackEventFlushTimer = window.setTimeout(flushPlaybackEvents, 1000);

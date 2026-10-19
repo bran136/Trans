@@ -33,6 +33,7 @@ from logging.handlers import RotatingFileHandler
 import os
 import secrets
 from datetime import timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree
@@ -122,6 +123,8 @@ BUILD_VERSION_FILES = (
     BASE_DIR / "static" / "reader.css",
     BASE_DIR / "static" / "reader-theme.js",
     BASE_DIR / "static" / "reader.js",
+    BASE_DIR / "static" / "reader-stream.js",
+    BASE_DIR / "static" / "reader-audio.js",
     BASE_DIR / "static" / "reader-tools.js",
     BASE_DIR / "static" / "reader-tools.css",
     BASE_DIR / "static" / "txt-editor.js",
@@ -200,7 +203,8 @@ TTS_CACHE_KEY_LOCKS = tuple(threading.Lock() for _ in range(64))
 TTS_PACK_KEY_LOCKS = tuple(threading.Lock() for _ in range(32))
 TTS_SENTENCE_INDEX_LOCKS = tuple(threading.Lock() for _ in range(32))
 TTS_PACK_CACHE_LOCK = threading.RLock()
-TTS_PACK_PRUNE_STATE = {"time": 0.0}
+TTS_CACHE_PRUNE_LOCK = threading.Lock()
+TTS_PACK_PRUNE_STATE = {"time": 0.0, "running": False}
 TTS_CACHE_STATS_LOCK = threading.RLock()
 TTS_CACHE_STATS_READY = threading.Event()
 TTS_CACHE_STATS_STATE = {
@@ -212,7 +216,9 @@ TTS_CACHE_STATS_STATE = {
     "refresh_again": False,
     "snapshot_loaded": False,
 }
-TTS_PACK_BUILD_SEMAPHORE = threading.BoundedSemaphore(2)
+TTS_PACK_BUILD_CONDITION = threading.Condition()
+TTS_PACK_BUILD_STATE = {"active": 0, "sequence": 0, "waiting": []}
+TTS_PACK_BUILD_LIMIT = 3
 TTS_OFFLINE_LOCK = threading.RLock()
 TTS_OFFLINE_STATUS_LOCKS = tuple(threading.Lock() for _ in range(32))
 TTS_OFFLINE_JOB_LOCK = threading.RLock()
@@ -5008,6 +5014,84 @@ def find_cached_tts(cache_path):
         return None
 
 
+def tts_cache_file_stamp(path):
+    try:
+        stat = path.stat()
+        return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+    except FileNotFoundError:
+        return None
+
+
+def tts_pack_reference_identities():
+    # A pending offline download must be protected before its audio is written.
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            return {
+                (row["book_id"], int(row["chapter_index"]), row["chapter_hash"],
+                 row["profile_key"], int(row["sentence_index"]))
+                for row in connection.execute(
+                    "SELECT book_id, chapter_index, chapter_hash, profile_key, sentence_index "
+                    "FROM offline_tts_refs WHERE size_bytes > 0 OR created_at >= ?",
+                    (time.time() - TTS_OFFLINE_JOB_RETENTION_SECONDS,),
+                )
+            }
+        finally:
+            connection.close()
+
+
+def tts_pack_has_reference(manifest, references):
+    try:
+        identity = (manifest["book_id"], int(manifest["chapter_index"]),
+                    manifest["chapter_hash"], manifest["profile_key"])
+        return any(identity + (int(segment["index"]),) in references
+                   for segment in manifest["segments"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def remove_tts_cache_candidate(paths, stamps, cache_key, pack=False, manifest=None):
+    key_lock = tts_pack_key_lock(cache_key) if pack else tts_cache_key_lock(cache_key)
+    # Never wait behind generation or remove a pack currently being built.
+    if not key_lock.acquire(blocking=False):
+        return False
+    try:
+        cache_lock = TTS_PACK_CACHE_LOCK if pack else TTS_CACHE_LOCK
+        with cache_lock, TTS_OFFLINE_LOCK:
+            if any(tts_cache_file_stamp(path) != stamp for path, stamp in zip(paths, stamps)):
+                return False
+            # Allow time for the manifest -> audio request and the next prefetch.
+            if any(stamp and time.time() - stamp[0] / 1e9 < TTS_PACK_PRUNE_INTERVAL_SECONDS
+                   for stamp in stamps):
+                return False
+            if pack:
+                if manifest:
+                    connection = open_tts_offline_db()
+                    try:
+                        row = connection.execute(
+                            "SELECT 1 FROM offline_tts_refs WHERE book_id = ? AND chapter_index = ? "
+                            "AND chapter_hash = ? AND profile_key = ? "
+                            "AND (size_bytes > 0 OR created_at >= ?) LIMIT 1",
+                            (manifest.get("book_id"), manifest.get("chapter_index"),
+                             manifest.get("chapter_hash"), manifest.get("profile_key"),
+                             time.time() - TTS_OFFLINE_JOB_RETENTION_SECONDS),
+                        ).fetchone()
+                        if row is not None:
+                            return False
+                    finally:
+                        connection.close()
+            elif is_tts_cache_pinned(cache_key):
+                return False
+            for path in paths:
+                path.unlink(missing_ok=True)
+        invalidate_tts_cache_stats()
+        return True
+    except OSError:
+        return False
+    finally:
+        key_lock.release()
+
+
 def prune_tts_cache():
     ensure_private_directory(TTS_CACHE_DIR)
     files = []
@@ -5015,32 +5099,26 @@ def prune_tts_cache():
     now = time.time()
     ttl = tts_cache_ttl_seconds()
     pinned_keys = pinned_tts_cache_keys()
-    for path in TTS_CACHE_DIR.glob("*"):
-        if not path.is_file():
+    for path in TTS_CACHE_DIR.glob("*.m4a"):
+        if not re.fullmatch(r"[0-9a-f]{64}", path.stem) or path.stem in pinned_keys:
             continue
         try:
-            stat = path.stat()
+            stamp = tts_cache_file_stamp(path)
         except OSError:
             continue
-        if path.stem in pinned_keys:
+        if stamp is None:
             continue
-        if now - stat.st_mtime > ttl:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            continue
-        files.append((stat.st_mtime, stat.st_size, path))
-        total += stat.st_size
+        if now - stamp[0] / 1e9 > ttl:
+            if remove_tts_cache_candidate([path], [stamp], path.stem):
+                continue
+        files.append((stamp[0], stamp[2], path, stamp))
+        total += stamp[2]
     limit = max(5 * 1024 * 1024, tts_cache_limit_bytes() // 2)
     if total <= limit:
         return
-    for _, size, path in sorted(files):
-        try:
-            path.unlink()
+    for _, size, path, stamp in sorted(files):
+        if remove_tts_cache_candidate([path], [stamp], path.stem):
             total -= size
-        except OSError:
-            continue
         if total <= limit:
             break
 
@@ -5049,99 +5127,150 @@ def prune_tts_pack_cache():
     ensure_private_directory(TTS_PACK_CACHE_DIR)
     now = time.time()
     ttl = tts_cache_ttl_seconds()
+    references = tts_pack_reference_identities()
     candidates = []
     total = 0
-    pinned_keys = pinned_tts_pack_keys()
     for manifest_path in TTS_PACK_CACHE_DIR.glob("*.json"):
         pack_key = manifest_path.stem
-        try:
-            indexed = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            indexed = None
-        if (
-            not isinstance(indexed, dict)
-            or not re.fullmatch(r"[0-9a-f]{64}", pack_key)
-            or indexed.get("pack_key") != pack_key
-        ):
-            for candidate in tts_pack_cache_paths(pack_key):
-                try:
-                    candidate.unlink()
-                except OSError:
-                    pass
+        if not re.fullmatch(r"[0-9a-f]{64}", pack_key):
             continue
-        manifest = load_tts_pack_manifest(pack_key)
+        audio_path, _ = tts_pack_cache_paths(pack_key)
+        paths = [audio_path, manifest_path]
+        try:
+            stamps = [tts_cache_file_stamp(path) for path in paths]
+            manifest = load_tts_pack_manifest(pack_key)
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+        if manifest and tts_pack_has_reference(manifest, references):
+            continue
         if not manifest:
-            for candidate in tts_pack_cache_paths(pack_key):
-                try:
-                    candidate.unlink()
-                except OSError:
-                    pass
+            try:
+                raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raw = None
+            remove_tts_cache_candidate(
+                paths, stamps, pack_key, pack=True,
+                manifest=raw if isinstance(raw, dict) else None,
+            )
             continue
-        if manifest.get("audio_source") != "tts_cache":
+        indexed = manifest.get("audio_source") == "tts_cache"
+        stamp = stamps[1] if indexed else stamps[0]
+        if stamp is None:
             continue
-        if pack_key in pinned_keys:
-            continue
-        try:
-            if now - manifest_path.stat().st_mtime > ttl:
-                manifest_path.unlink()
-        except OSError:
-            pass
-    for audio_path in TTS_PACK_CACHE_DIR.glob("*.m4a"):
-        manifest = load_tts_pack_manifest(audio_path.stem)
-        if not manifest:
-            for candidate in tts_pack_cache_paths(audio_path.stem):
-                try:
-                    candidate.unlink()
-                except OSError:
-                    pass
-            continue
-        try:
-            stat = audio_path.stat()
-        except OSError:
-            continue
-        if audio_path.stem in pinned_keys:
-            continue
-        _, manifest_path = tts_pack_cache_paths(audio_path.stem)
-        if now - stat.st_mtime > ttl:
-            for candidate in (audio_path, manifest_path):
-                try:
-                    candidate.unlink()
-                except OSError:
-                    pass
-            continue
-        candidates.append((stat.st_mtime, stat.st_size, audio_path, manifest_path))
-        total += stat.st_size
+        if now - stamp[0] / 1e9 > ttl:
+            if remove_tts_cache_candidate(paths, stamps, pack_key, pack=True, manifest=manifest):
+                continue
+        if not indexed:
+            candidates.append((stamp[0], stamp[2], paths, stamps, pack_key, manifest))
+            total += stamp[2]
     limit = max(5 * 1024 * 1024, tts_cache_limit_bytes() // 2)
-    for _, size, audio_path, manifest_path in sorted(candidates):
+    for _, size, paths, stamps, pack_key, manifest in sorted(candidates):
         if total <= limit:
             break
-        for candidate in (audio_path, manifest_path):
-            try:
-                candidate.unlink()
-            except OSError:
-                pass
-        total -= size
+        if remove_tts_cache_candidate(paths, stamps, pack_key, pack=True, manifest=manifest):
+            total -= size
+    for audio_path in TTS_PACK_CACHE_DIR.glob("*.m4a"):
+        if not re.fullmatch(r"[0-9a-f]{64}", audio_path.stem):
+            continue
+        _, manifest_path = tts_pack_cache_paths(audio_path.stem)
+        try:
+            stamps = [tts_cache_file_stamp(audio_path), tts_cache_file_stamp(manifest_path)]
+        except OSError:
+            continue
+        if stamps[1] is None:
+            remove_tts_cache_candidate([audio_path, manifest_path], stamps, audio_path.stem, pack=True)
 
 
 def maybe_prune_tts_pack_cache(force=False):
+    # Both caches share one throttled worker. No full-directory scan runs in
+    # the playback request, and scanning does not hold either cache lock.
     now = time.monotonic()
-    with TTS_PACK_CACHE_LOCK:
+    with TTS_CACHE_PRUNE_LOCK:
+        if TTS_PACK_PRUNE_STATE["running"]:
+            return False
         if not force and now - TTS_PACK_PRUNE_STATE["time"] < TTS_PACK_PRUNE_INTERVAL_SECONDS:
             return False
-        TTS_PACK_PRUNE_STATE["time"] = now
+        TTS_PACK_PRUNE_STATE["running"] = True
+
+    def clean():
+        started = time.perf_counter()
         try:
-            prune_tts_pack_cache()
-        except (OSError, sqlite3.Error) as exc:
-            app.logger.warning("tts pack cache prune failed error=%s", exc)
-            return False
+            for prune in (prune_tts_cache, prune_tts_pack_cache):
+                try:
+                    prune()
+                except Exception:
+                    app.logger.exception("tts cache background cleanup failed phase=%s", prune.__name__)
+        finally:
+            with TTS_CACHE_PRUNE_LOCK:
+                TTS_PACK_PRUNE_STATE["time"] = time.monotonic()
+                TTS_PACK_PRUNE_STATE["running"] = False
+            app.logger.info("tts cache background cleanup elapsed=%.3fs", time.perf_counter() - started)
+
+    try:
+        threading.Thread(target=clean, name="tts-cache-prune", daemon=True).start()
+    except Exception:
+        with TTS_CACHE_PRUNE_LOCK:
+            TTS_PACK_PRUNE_STATE["running"] = False
+        app.logger.exception("tts cache cleanup worker could not start")
+        return False
     return True
+
+
+class MimoTTSError(ValueError):
+    def __init__(self, message, code, retryable=False, retry_after=0):
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+        self.retry_after = retry_after
+
+
+def mimo_tts_error(status, detail="", retry_after=0):
+    status = str(status)
+    detail = f"{status} {detail}".lower()
+    if status not in {"401", "402", "421"} and "high risk" in detail:
+        return MimoTTSError("MiMo 暂时拒绝此段音频（高风险请求），请稍后重试", "tts_risk_rejected")
+    if status in {"403", "421"} or any(word in detail for word in ("content_filter", "content filter")):
+        return MimoTTSError("MiMo 拒绝生成此段音频（风控或内容审核），请检查原文或服务账号", "tts_rejected")
+    messages = {
+        "400": "MiMo 请求参数无效，请检查听书设置",
+        "401": "MiMo API Key 无效，请检查听书设置",
+        "402": "MiMo 账户余额不足或服务未开通",
+        "404": "MiMo 服务地址或模型不存在，请检查听书设置",
+        "405": "MiMo 服务地址不支持此请求，请检查听书设置",
+    }
+    if status in {"401", "402"}:
+        return MimoTTSError(messages[status], "tts_request_failed")
+    if status == "429" or any(word in detail for word in (
+            "rate limit", "rate_limit", "too many requests", "too_many_requests", "请求过于频繁", "频率过高")):
+        return MimoTTSError("MiMo 请求过于频繁或额度受限，请稍后重试", "tts_rate_limited", True, retry_after)
+    if status in {"408", "500", "502", "503", "504"}:
+        return MimoTTSError("MiMo 服务暂时不可用，请稍后重试", "tts_unavailable", True, retry_after)
+    if status in messages:
+        return MimoTTSError(messages[status], "tts_request_failed")
+    return MimoTTSError("MiMo 暂未成功生成音频，请稍后重试", "tts_generation_failed")
+
+
+def mimo_diagnostic_token(value):
+    value = str(value or "")
+    return value if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", value) else "-"
+
+
+def mimo_retry_after(value):
+    try:
+        seconds = float(value)
+    except (ValueError, TypeError):
+        try:
+            seconds = parsedate_to_datetime(value).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            return 0
+    return seconds if 0 < seconds < float("inf") else 0
 
 
 def decode_mimo_audio_payload(payload):
     base_resp = payload.get("base_resp") or {}
     status_code = base_resp.get("status_code")
-    if status_code not in (None, 0):
-        raise ValueError(base_resp.get("status_msg") or "MiMo TTS 请求失败")
+    if status_code not in (None, 0, "0"):
+        raise mimo_tts_error(status_code, base_resp.get("status_msg", ""))
     choices = payload.get("choices") or []
     message = choices[0].get("message", {}) if choices else {}
     audio_payload = message.get("audio") or payload.get("audio") or {}
@@ -5153,12 +5282,15 @@ def decode_mimo_audio_payload(payload):
                 error_payload.get("message") if isinstance(error_payload, dict) else error_payload,
                 base_resp.get("status_msg"),
                 message.get("content"),
-                choices[0].get("finish_reason") if choices else "",
+                "content_filter" if choices and choices[0].get("finish_reason") == "content_filter" else "",
             )
             if value
         ), "")
         detail = " ".join(str(detail).split())[:200]
-        raise ValueError("MiMo TTS 未返回音频" + (f"：{detail}" if detail else ""))
+        status = error_payload.get("code") if isinstance(error_payload, dict) else None
+        if detail or status:
+            raise mimo_tts_error(status, detail)
+        raise MimoTTSError("MiMo TTS 暂未返回音频，请稍后重试", "tts_unavailable", True)
     audio = str(audio).strip()
     if re.fullmatch(r"[0-9a-fA-F]+", audio) and len(audio) % 2 == 0:
         if len(audio) // 2 > MAX_TTS_AUDIO_BYTES:
@@ -5618,14 +5750,45 @@ def public_tts_pack_manifest(manifest, audio_url, next_specs=None):
     }
 
 
-def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True):
+@contextmanager
+def tts_pack_build_slot(priority=20):
+    # Prioritize playback over speculative/offline work; FIFO within a priority.
+    # Running model calls are never interrupted or submitted a second time.
+    with TTS_PACK_BUILD_CONDITION:
+        TTS_PACK_BUILD_STATE["sequence"] += 1
+        ticket = (priority, TTS_PACK_BUILD_STATE["sequence"])
+        waiting = TTS_PACK_BUILD_STATE["waiting"]
+        waiting.append(ticket)
+        try:
+            while TTS_PACK_BUILD_STATE["active"] >= TTS_PACK_BUILD_LIMIT or ticket != min(waiting):
+                TTS_PACK_BUILD_CONDITION.wait()
+            waiting.remove(ticket)
+            TTS_PACK_BUILD_STATE["active"] += 1
+            TTS_PACK_BUILD_CONDITION.notify_all()
+        except BaseException:
+            waiting.remove(ticket)
+            TTS_PACK_BUILD_CONDITION.notify_all()
+            raise
+    try:
+        yield
+    finally:
+        with TTS_PACK_BUILD_CONDITION:
+            TTS_PACK_BUILD_STATE["active"] -= 1
+            TTS_PACK_BUILD_CONDITION.notify_all()
+
+
+def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True, timings=None, priority=20):
+    timings = timings if timings is not None else {}
+    started = time.perf_counter()
     pack_key = spec["pack_key"]
     audio_path, manifest_path = tts_pack_cache_paths(pack_key)
     with tts_pack_key_lock(pack_key):
+        timings["key_wait_ms"] = (time.perf_counter() - started) * 1000
         settings = config["reader_tts"]
         profile_key = tts_offline_profile_key(settings)
         cached = load_tts_pack_manifest(pack_key)
         if tts_pack_manifest_matches(cached, book_id, chapter, spec, profile_key):
+            timings["source"] = "pack_cache"
             touch_tts_pack_cache(pack_key, cached)
             return cached
         if cached:
@@ -5635,7 +5798,11 @@ def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True):
                 except OSError:
                     pass
             invalidate_tts_offline_status_snapshot(book_id, profile_key)
-        with TTS_PACK_BUILD_SEMAPHORE:
+        queue_started = time.perf_counter()
+        with tts_pack_build_slot(priority):
+            timings["queue_ms"] = (time.perf_counter() - queue_started) * 1000
+            build_started = time.perf_counter()
+            timings["source"] = "built"
             ensure_private_directory(TTS_PACK_CACHE_DIR)
             try:
                 if settings.get("cache_enabled", True):
@@ -5643,6 +5810,8 @@ def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True):
                         book_id, chapter, spec, profile_key,
                     )
                     if indexed:
+                        timings["source"] = "sentence_cache"
+                        timings["build_ms"] = (time.perf_counter() - build_started) * 1000
                         if prune_cache:
                             maybe_prune_tts_pack_cache()
                         return indexed
@@ -5654,12 +5823,15 @@ def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True):
                     for position, sentence in enumerate(spec["sentences"]):
                         input_path = temporary_root / f"sentence-{position}.m4a"
                         result = synthesize_reader_tts(sentence["text"], config)
+                        for field in ("cache_ms", "generate_ms", "write_ms"):
+                            timings[field] = timings.get(field, 0.0) + result.get(field, 0.0)
                         source_path = result.get("path")
                         if source_path and len(spec["sentences"]) == 1:
                             indexed = index_single_sentence_tts_pack(
                                 book_id, chapter, spec, profile_key,
                             )
                             if indexed:
+                                timings["build_ms"] = (time.perf_counter() - build_started) * 1000
                                 if prune_cache:
                                     maybe_prune_tts_pack_cache()
                                 return indexed
@@ -5764,6 +5936,7 @@ def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True):
                             maybe_prune_tts_pack_cache()
                     invalidate_tts_cache_stats()
                     invalidate_tts_offline_status_snapshot(book_id, profile_key)
+                    timings["build_ms"] = (time.perf_counter() - build_started) * 1000
                     return manifest
             except FileNotFoundError as exc:
                 raise ValueError("服务器未安装 ffmpeg 或 ffprobe，无法生成播放包") from exc
@@ -5772,6 +5945,31 @@ def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True):
 
 
 def request_mimo_tts(text, settings):
+    # Retry unknown generation failures and high-risk rejections within this
+    # request only; the player must not start an endless retry loop for them.
+    retry_delays = (3, 5, 10)
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            return request_mimo_tts_once(text, settings)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            error = MimoTTSError("MiMo 网络连接失败，请稍后重试", "tts_unavailable", True)
+            error.__cause__ = exc
+        except MimoTTSError as exc:
+            error = exc
+        bounded_retry = error.code in {"tts_risk_rejected", "tts_generation_failed"}
+        if not (error.retryable or bounded_retry) or attempt == len(retry_delays):
+            if bounded_retry and attempt == len(retry_delays):
+                reason = "MiMo 高风险拒绝" if error.code == "tts_risk_rejected" else "MiMo 音频生成失败"
+                raise MimoTTSError(f"{reason}，自动重试后仍未生成音频，请稍后重试或检查原文", error.code) from error
+            raise error
+        delay = max(retry_delays[attempt], error.retry_after)
+        if delay > 60:
+            raise error
+        app.logger.warning("tts retry code=%s attempt=%s delay=%.1fs", error.code, attempt + 1, delay)
+        time.sleep(delay)
+
+
+def request_mimo_tts_once(text, settings):
     audio_format = "wav"
     model = settings.get("model", "mimo-v2.5-tts")
     style_prompt = clean_single_line_value(settings.get("style_prompt", ""))
@@ -5799,18 +5997,51 @@ def request_mimo_tts(text, settings):
         timeout=int(settings.get("timeout", 30)),
         allow_redirects=False,
     )
+    payload = None
     try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        detail = response.text[:500] if response.text else str(exc)
-        raise ValueError(f"MiMo TTS 请求失败：{detail}") from exc
-    content_type = response.headers.get("Content-Type", "")
-    if content_type.startswith("audio/"):
-        if len(response.content) > MAX_TTS_AUDIO_BYTES:
-            raise ValueError("MiMo TTS 返回的音频过大")
-        return response.content
-    payload = response.json()
-    return decode_mimo_audio_payload(payload)
+        if not 200 <= response.status_code < 300:
+            detail = ""
+            try:
+                payload = response.json()
+                if isinstance(payload, dict):
+                    upstream_error = payload.get("error")
+                    detail = (upstream_error.get("message") if isinstance(upstream_error, dict) else upstream_error) or payload.get("message", "")
+            except ValueError:
+                pass
+            raise mimo_tts_error(response.status_code, detail, mimo_retry_after(response.headers.get("Retry-After")))
+        content_type = response.headers.get("Content-Type", "")
+        if content_type.startswith("audio/"):
+            if not response.content:
+                raise MimoTTSError("MiMo TTS 暂未返回音频，请稍后重试", "tts_unavailable", True)
+            if len(response.content) > MAX_TTS_AUDIO_BYTES:
+                raise ValueError("MiMo TTS 返回的音频过大")
+            return response.content
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise MimoTTSError("MiMo 返回了无效响应，请稍后重试", "tts_unavailable", True) from exc
+        if not isinstance(payload, dict):
+            raise MimoTTSError("MiMo 返回了无效响应，请稍后重试", "tts_unavailable", True)
+        return decode_mimo_audio_payload(payload)
+    except MimoTTSError as exc:
+        # Keep protocol diagnostics, never the book text, raw response or credentials.
+        data = payload if isinstance(payload, dict) else {}
+        upstream_error = data.get("error")
+        base_resp = data.get("base_resp")
+        provider_code = upstream_error.get("code") if isinstance(upstream_error, dict) else None
+        if provider_code is None and isinstance(base_resp, dict):
+            provider_code = base_resp.get("status_code")
+        choices = data.get("choices")
+        finish = choices[0].get("finish_reason") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+        request_id = response.headers.get("x-request-id") or response.headers.get("request-id") or data.get("id")
+        app.logger.warning(
+            "tts upstream failure http_status=%s code=%s provider_code=%s finish=%s request_id=%s",
+            response.status_code, exc.code, mimo_diagnostic_token(provider_code),
+            mimo_diagnostic_token(finish), mimo_diagnostic_token(request_id),
+        )
+        raise
+    finally:
+        response.close()
 
 
 def prepare_reader_tts_request(text, config):
@@ -5854,7 +6085,15 @@ def synthesize_reader_tts(text, config):
                     }
         cache_ms = (time.perf_counter() - cache_started) * 1000
         generate_started = time.perf_counter()
-        data = transcode_wav_to_aac(request_mimo_tts(text, settings))
+        raw_audio = request_mimo_tts(text, settings)
+        request_ms = (time.perf_counter() - generate_started) * 1000
+        transcode_started = time.perf_counter()
+        data = transcode_wav_to_aac(raw_audio)
+        app.logger.info(
+            "tts generated key=%s key_wait_ms=%.1f cache_ms=%.1f request_ms=%.1f transcode_ms=%.1f",
+            cache_key[:12], (cache_started - total_started) * 1000, cache_ms,
+            request_ms, (time.perf_counter() - transcode_started) * 1000,
+        )
         generate_ms = (time.perf_counter() - generate_started) * 1000
         write_ms = 0.0
         if settings.get("cache_enabled", True) and data:
@@ -5864,7 +6103,7 @@ def synthesize_reader_tts(text, config):
                 try:
                     write_private_bytes_atomic(cache_path, data)
                     os.utime(cache_path, None)
-                    prune_tts_cache()
+                    maybe_prune_tts_pack_cache()
                     invalidate_tts_cache_stats()
                     write_ms = (time.perf_counter() - write_started) * 1000
                     if cache_path.exists():
@@ -6714,6 +6953,48 @@ def api_reader_mimo_balance():
         return jsonify({"error": str(exc), "code": code, "balance": mimo_balance_snapshot()}), mimo_balance_http_status(exc)
 
 
+@app.route("/api/reader/playback-events", methods=["POST"])
+def api_reader_playback_events():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    allowed = {"start", "playing", "ended", "waiting", "stalled", "pause", "stop",
+               "user_pause", "user_resume", "sleep_due", "sleep_stop", "hidden", "visible",
+               "pagehide", "freeze", "resume", "buffer_wait", "buffer_ready", "buffer_error",
+               "play_error", "media_error", "heartbeat"}
+    try:
+        payload = request_json_object()
+        events = payload.get("events")
+        if not isinstance(events, list) or not 1 <= len(events) <= 12:
+            raise ValueError("播放诊断数量无效")
+        clean = []
+        for event in events:
+            if not isinstance(event, dict) or event.get("event") not in allowed:
+                raise ValueError("播放诊断事件无效")
+            book = event.get("book", "")
+            if not isinstance(book, str) or (book and not re.fullmatch(r"[0-9a-f]{32}", book)):
+                raise ValueError("书籍编号无效")
+            item = {"event": event["event"], "book": book}
+            item["transport"] = event.get("transport") if event.get("transport") == "mse" else ""
+            for key in ("at", "chapter", "sentence", "position", "buffer_seconds", "ready_state",
+                        "network_state", "rate", "sleep_left", "media_error"):
+                value = event.get(key, 0)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1e14:
+                    raise ValueError("播放诊断数值无效")
+                item[key] = round(value, 3)
+            for key in ("hidden", "paused", "reading", "sleep_pending"):
+                item[key] = event.get(key) is True
+            error = event.get("error", "")
+            item["error"] = error if error in {"", "NotAllowedError", "AbortError", "NotSupportedError",
+                                               "NetworkError", "Error", "TypeError"} else "Error"
+            clean.append(item)
+        browser, platform = describe_login_client(request.headers.get("User-Agent", ""))
+        app.logger.info("reader playback client=%s platform=%s events=%s", browser, platform,
+                        json.dumps(clean, ensure_ascii=False, separators=(",", ":")))
+        return jsonify({"ok": True})
+    except (ValueError, TypeError):
+        return jsonify({"error": "播放诊断参数无效"}), 400
+
+
 @app.route("/api/reader/tts-pack", methods=["POST"])
 def api_reader_tts_pack():
     if not require_auth():
@@ -6724,6 +7005,9 @@ def api_reader_tts_pack():
         book_id = str(payload.get("book_id") or "")
         chapter_index = int(payload.get("chapter_index"))
         sentence_index = int(payload.get("sentence_index"))
+        distance = payload.get("prefetch_distance", 0)
+        if isinstance(distance, bool) or not isinstance(distance, int) or not 0 <= distance <= 64:
+            raise ValueError("预加载距离无效")
         config = load_config()
         settings = config["reader_tts"]
         if not settings.get("enabled") or not settings.get("api_key"):
@@ -6738,21 +7022,35 @@ def api_reader_tts_pack():
         if spec_position is None:
             raise ValueError("当前句没有可用播放包")
         spec = specs[spec_position]
-        manifest = build_reader_tts_pack(book_id, chapter, spec, config)
+        prepare_ms = (time.perf_counter() - started) * 1000
+        timings = {}
+        manifest = build_reader_tts_pack(
+            book_id, chapter, spec, config, timings=timings, priority=min(distance, 16),
+        )
         app.logger.info(
-            "reader tts pack ready ip=%s book=%s chapter=%s sentence=%s kind=%s elapsed=%.3fs",
+            "reader tts pack ready ip=%s book=%s chapter=%s sentence=%s kind=%s elapsed=%.3fs "
+            "source=%s prepare_ms=%.1f key_wait_ms=%.1f queue_ms=%.1f build_ms=%.1f "
+            "cache_ms=%.1f generate_ms=%.1f write_ms=%.1f",
             request.remote_addr,
             book_id,
             chapter_index,
             sentence_index,
             manifest.get("kind", "chapter"),
             time.perf_counter() - started,
+            timings.get("source", "unknown"), prepare_ms,
+            timings.get("key_wait_ms", 0.0), timings.get("queue_ms", 0.0),
+            timings.get("build_ms", 0.0), timings.get("cache_ms", 0.0),
+            timings.get("generate_ms", 0.0), timings.get("write_ms", 0.0),
         )
         return jsonify(public_tts_pack_manifest(
             manifest,
             url_for("api_reader_tts_pack_audio", pack_key=manifest["pack_key"]),
             specs[spec_position + 1:],
         ))
+    except MimoTTSError as exc:
+        app.logger.warning("reader tts pack failed ip=%s code=%s retryable=%s", request.remote_addr, exc.code, exc.retryable)
+        status = (429 if exc.code == "tts_rate_limited" else 503) if exc.retryable else 400
+        return jsonify({"error": str(exc), "code": exc.code, "retry_after": exc.retry_after}), status
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 404
     except (TypeError, ValueError, IndexError) as exc:
