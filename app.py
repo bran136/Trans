@@ -4,6 +4,7 @@ import gzip
 import zlib
 import fcntl
 import logging
+import math
 import hashlib
 import hmac
 import ipaddress
@@ -43,6 +44,14 @@ import pdf_translation
 import requests
 import pyotp
 import segno
+from webauthn import (generate_registration_options, verify_registration_response,
+                      generate_authentication_options, verify_authentication_response,
+                      options_to_json, base64url_to_bytes)
+from webauthn.helpers import bytes_to_base64url
+from webauthn.helpers.cose import COSEAlgorithmIdentifier
+from webauthn.helpers.exceptions import WebAuthnException
+from webauthn.helpers.structs import (AuthenticatorSelectionCriteria, AuthenticatorTransport, PublicKeyCredentialDescriptor,
+                                     ResidentKeyRequirement, UserVerificationRequirement)
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 from werkzeug.utils import secure_filename
@@ -55,6 +64,15 @@ CONFIG_FILE = CONFIG_DIR / "app_config.json"
 SECURITY_FILE = CONFIG_DIR / "security.json"
 SECURITY_LOCK = threading.RLock()
 CLIENT_ACTIVITY_INTERVAL = 60
+PASSKEY_LIMIT = 10
+PASSKEY_VERIFICATION_SECONDS = 600
+# Match SimpleWebAuthn's common algorithm preference; login verification also
+# keeps accepting existing credentials made with the library's wider defaults.
+PASSKEY_REGISTRATION_ALGORITHMS = [
+    COSEAlgorithmIdentifier.EDDSA,
+    COSEAlgorithmIdentifier.ECDSA_SHA_256,
+    COSEAlgorithmIdentifier.RSASSA_PKCS1_v1_5_SHA_256,
+]
 CLIENT_LOCATION_CACHE = OrderedDict()
 CLIENT_LOCATION_LOCK = threading.Lock()
 CLIENT_LOCATION_PENDING = {}
@@ -120,6 +138,8 @@ BUILD_VERSION_FILES = (
     BASE_DIR / "static" / "app.js",
     BASE_DIR / "static" / "font-cache.js",
     BASE_DIR / "static" / "home.js",
+    BASE_DIR / "static" / "passkeys.js",
+    BASE_DIR / "static" / "login.js",
     BASE_DIR / "static" / "reader.css",
     BASE_DIR / "static" / "reader-theme.js",
     BASE_DIR / "static" / "reader.js",
@@ -136,7 +156,8 @@ BUILD_VERSION_FILES = (
     BASE_DIR / "static" / "github-mark.svg",
 )
 TRANSLATION_CACHE_DB = CONFIG_DIR / "deepseek_cache.sqlite3"
-CACHE_LIMIT = 500
+DEFAULT_CACHE_LIMIT = 5000
+MAX_CACHE_LIMIT = 100000
 CACHE_MAX_TEXT_CHARS = 12000
 MAX_TRANSLATE_CHARS = 20000
 DEEPSEEK_TRANSLATION_PROMPT_VERSION = 4
@@ -160,7 +181,6 @@ TTS_PACK_SCHEMA_VERSION = 2
 TTS_PACK_MIN_SECONDS = 5.1
 TTS_PACK_PAD_SECONDS = TTS_PACK_MIN_SECONDS + 0.25
 TTS_PACK_PRUNE_INTERVAL_SECONDS = 60
-TTS_CACHE_STATS_MAX_AGE_SECONDS = 60
 TTS_PACK_PREFETCH_HINT_LIMIT = 16
 TTS_OFFLINE_STATUS_SNAPSHOT_VERSION = 1
 CHAPTER_CACHE_VERSION = 6
@@ -177,8 +197,9 @@ DEEPSEEK_BALANCE_CACHE = {"time": 0.0, "attempt_time": 0.0, "data": None}
 MIMO_BALANCE_CACHE = {"time": 0.0, "attempt_time": 0.0, "data": None}
 RESTART_STATE = {"time": 0.0}
 PROCESS_START_TIME = time.time()
-CPU_SAMPLE = {"time": time.time(), "cpu": 0.0}
-SYSTEM_CPU_SAMPLE = {"idle": 0, "total": 0}
+PROCESS_IMPORT_PID = os.getpid()
+CPU_SAMPLE_LOCK = threading.Lock()
+CPU_SAMPLE = {"pid": None, "time": None, "process": 0.0, "system": None, "usage": (0.0, 0.0)}
 SERVICE_READY_LOCK = threading.Lock()
 SERVICE_READY_STATE = {"logged": False}
 SUPPORTED_BOOK_EXTENSIONS = {".txt", ".epub", ".pdf"}
@@ -198,6 +219,8 @@ BOOK_IMPORT_LOCK = threading.RLock()
 LOGIN_FAILURE_WINDOW_SECONDS = 5 * 60
 LOGIN_FAILURE_LIMIT = 8
 LOGIN_FAILURE_MAX_IPS = 1000
+LOGIN_COOLDOWN_SECONDS = (60, 180, 300)
+LOGIN_COOLDOWN_RESET_SECONDS = 30 * 60
 TTS_CACHE_LOCK = threading.RLock()
 TTS_CACHE_KEY_LOCKS = tuple(threading.Lock() for _ in range(64))
 TTS_PACK_KEY_LOCKS = tuple(threading.Lock() for _ in range(32))
@@ -206,14 +229,23 @@ TTS_PACK_CACHE_LOCK = threading.RLock()
 TTS_CACHE_PRUNE_LOCK = threading.Lock()
 TTS_PACK_PRUNE_STATE = {"time": 0.0, "running": False}
 TTS_CACHE_STATS_LOCK = threading.RLock()
-TTS_CACHE_STATS_READY = threading.Event()
+TTS_BOOK_STATS_DEBOUNCE_SECONDS = 5
 TTS_CACHE_STATS_STATE = {
     "data": None,
     "revision": 0,
     "data_revision": -1,
-    "refreshed_at": 0.0,
     "refreshing": False,
-    "refresh_again": False,
+    "full_refresh": False,
+    "scanning_full": False,
+    "recheck_pending": False,
+    "rechecking": False,
+    "error": "",
+    "pending_books": set(),
+    "stop_timers": {},
+    "stopped_books": set(),
+    "pruned": False,
+    "listening_events": OrderedDict(),
+    "progress_percent": 0,
     "snapshot_loaded": False,
 }
 TTS_PACK_BUILD_CONDITION = threading.Condition()
@@ -298,6 +330,7 @@ DEFAULT_CONFIG = {
         "reasoning_effort": "medium",
         "timeout": 45,
         "style": "default",
+        "cache_limit": DEFAULT_CACHE_LIMIT,
     },
     "google": {
         "enabled": True,
@@ -1215,13 +1248,17 @@ def load_book_index_or_rebuild():
 def upsert_book_index(book):
     summary = book_summary(book)
     with READER_IO_LOCK:
+        existing = load_book_index()
+        previous = next((item for item in existing if isinstance(item, dict) and item.get("id") == summary["id"]), None)
         books = [
-            item for item in load_book_index()
+            item for item in existing
             if isinstance(item, dict) and item.get("id") != summary["id"]
         ]
         books.append(summary)
         books.sort(key=lambda item: (item.get("last_opened_at", 0), item.get("created_at", 0)), reverse=True)
         save_book_index(books)
+    if previous is None or any(previous.get(key) != summary.get(key) for key in ("content_revision", "chapter_count")):
+        schedule_tts_cache_stats_refresh(book_ids={book["id"]})
     return summary
 
 
@@ -1232,6 +1269,12 @@ def remove_from_book_index(book_id):
             if isinstance(item, dict) and item.get("id") != book_id
         ]
         save_book_index(books)
+    with TTS_CACHE_STATS_LOCK:
+        timer = TTS_CACHE_STATS_STATE["stop_timers"].pop(book_id, None)
+        if timer:
+            timer.cancel()
+        TTS_CACHE_STATS_STATE["stopped_books"].discard(book_id)
+    schedule_tts_cache_stats_refresh(book_ids={book_id})
 
 
 def decode_text_bytes(raw):
@@ -2909,6 +2952,8 @@ def read_security_state():
         raise RuntimeError("双重验证配置损坏，请检查服务器上的安全配置备份")
     if not isinstance(state.get("clients", {}), dict) or not isinstance(state.get("revoked_clients", {}), dict):
         raise RuntimeError("登录设备记录损坏，请检查服务器上的安全配置备份")
+    if not isinstance(state.get("passkeys", {}), dict):
+        raise RuntimeError("通行密钥记录损坏，请检查服务器上的安全配置备份")
     return state
 
 
@@ -2929,29 +2974,58 @@ def security_transaction():
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def security_limited(state, factor=False):
+def security_retry_after(state, factor=False):
     now = time.time()
     failures = state.setdefault("failures", {})
+    cooldowns = state.setdefault("cooldowns", {})
     for key in list(failures):
         failures[key] = [stamp for stamp in failures[key] if now - stamp < LOGIN_FAILURE_WINDOW_SECONDS]
         if not failures[key]:
             del failures[key]
-    return (len(failures.get("ip:" + client_ip(), [])) >= LOGIN_FAILURE_LIMIT
-            or (factor and len(failures.get("factor", [])) >= 32))
+    for key in list(cooldowns):
+        if now - cooldowns[key]["last_failure"] >= LOGIN_COOLDOWN_RESET_SECONDS and cooldowns[key]["until"] <= now:
+            del cooldowns[key]
+    remaining = 0
+    for key, limit in [("ip:" + client_ip(), LOGIN_FAILURE_LIMIT)] + ([("factor", 32)] if factor else []):
+        previous = cooldowns.get(key, {})
+        if previous.get("until", 0) <= now and len(failures.get(key, [])) >= limit:
+            level = min(previous.get("level", -1) + 1, len(LOGIN_COOLDOWN_SECONDS) - 1)
+            previous = cooldowns[key] = {"level": level, "until": now + LOGIN_COOLDOWN_SECONDS[level],
+                                          "last_failure": now}
+            failures.pop(key, None)
+        remaining = max(remaining, previous.get("until", 0) - now)
+    return max(0, math.ceil(remaining))
+
+
+def security_limit_response(retry_after):
+    response = jsonify({"error": "尝试次数过多，请稍后重试", "retry_after": retry_after})
+    response.status_code = 429
+    response.headers["Retry-After"] = str(retry_after)
+    return response
 
 
 def security_failure(state, factor=False):
+    now = time.time()
     failures = state.setdefault("failures", {})
-    failures.setdefault("ip:" + client_ip(), []).append(time.time())
-    if factor:
-        failures.setdefault("factor", []).append(time.time())
-    if len(failures) > LOGIN_FAILURE_MAX_IPS:
-        oldest = min((key for key in failures if key != "factor"), key=lambda key: failures[key][-1])
-        failures.pop(oldest, None)
+    cooldowns = state.setdefault("cooldowns", {})
+    for key in ["ip:" + client_ip()] + (["factor"] if factor else []):
+        failures.setdefault(key, []).append(now)
+        if key in cooldowns:
+            cooldowns[key]["last_failure"] = now
+    retry_after = security_retry_after(state, factor)
+    # Both short-lived counters and escalation history have bounded storage.
+    for records in (failures, cooldowns):
+        while len(records) > LOGIN_FAILURE_MAX_IPS:
+            oldest = min((key for key in records if key != "factor"),
+                         key=lambda key: records[key][-1] if records is failures else records[key]["last_failure"])
+            records.pop(oldest, None)
+    return retry_after
 
 
 def security_success(state):
-    state.get("failures", {}).pop("ip:" + client_ip(), None)
+    key = "ip:" + client_ip()
+    state.get("failures", {}).pop(key, None)
+    state.get("cooldowns", {}).pop(key, None)
 
 
 def password_matches(value, expected):
@@ -3087,6 +3161,7 @@ def authenticated_session(password, state, *, fresh=False):
     session.pop("pending_login", None)
     session.pop("security_setup_id", None)
     session.pop("recovery_verified_until", None)
+    session.pop("passkey_verification", None)
     # A revision/password change excludes every previous client record; only
     # the browser that completed reauthentication receives the new version.
     record_login_client(state, password, new_login=True)
@@ -3111,8 +3186,8 @@ def security_session_matches(password, state):
 
 
 def security_reauthenticate(state, password, payload):
-    if security_limited(state, bool(state.get("enabled"))):
-        return jsonify({"error": "尝试次数过多，请在 5 分钟后重试"}), 429
+    if (retry_after := security_retry_after(state, bool(state.get("enabled")))):
+        return security_limit_response(retry_after)
     if not password_matches(payload.get("current_password"), password):
         security_failure(state)
         return jsonify({"error": "当前密码不正确"}), 403
@@ -3131,7 +3206,8 @@ def security_reauthenticate(state, password, payload):
 
 def public_security_state(state):
     clients = []
-    version = authentication_version(load_config()["app_password"], state)
+    password = load_config()["app_password"]
+    version = authentication_version(password, state)
     for key, value in active_login_clients(state, version).items():
         browser, platform = describe_login_client(value.get("user_agent", ""))
         clients.append({"id": public_client_id(key), "current": key == session.get("client_id"), "browser": browser,
@@ -3141,7 +3217,94 @@ def public_security_state(state):
     clients.sort(key=lambda client: (not client["current"], -client["last_seen"]))
     return {"enabled": bool(state.get("enabled")),
             "recovery_remaining": len(state.get("recovery_hashes", [])),
-            "recovery_verified_until": session.get("recovery_verified_until", 0), "clients": clients}
+            "recovery_verified_until": session.get("recovery_verified_until", 0), "clients": clients,
+            "passkey_limit": PASSKEY_LIMIT,
+            "passkey_verified_until": passkey_verification_until(state, password),
+            "passkeys": [
+                {"id": key, "name": value["name"], "rp_id": value["rp_id"],
+                 "created_at": value["created_at"], "last_used_at": value.get("last_used_at")}
+                for key, value in state.get("passkeys", {}).items()
+            ]}
+
+
+# Passkeys use the existing shared account. Challenges are server-side, single-use,
+# session-bound and invalidated by every password/security revision change.
+def passkey_origin():
+    origin = request.headers.get("Origin", "")
+    parsed = urlparse(origin)
+    if (not request_host_matches(origin) or parsed.username or parsed.password
+            or parsed.path or parsed.query or parsed.fragment or not parsed.hostname
+            or not (parsed.scheme == "https" or (parsed.scheme == "http" and parsed.hostname == "localhost"))):
+        raise ValueError("请通过 HTTPS 域名使用通行密钥")
+    hostname = parsed.hostname
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        if hostname.endswith("."):
+            raise ValueError("请使用不带末尾点号的域名")
+        return origin, hostname
+    raise ValueError("通行密钥需要通过域名访问，不能使用 IP 地址")
+
+
+def passkey_credential(payload):
+    credential = payload.get("credential")
+    if not isinstance(credential, dict) or not isinstance(credential.get("response"), dict):
+        raise ValueError("通行密钥响应无效")
+    # The library validates type, challenge, origin, RP hash, UP/UV and signature.
+    # Reject cross-origin/embed ceremonies explicitly as well.
+    data = json.loads(base64url_to_bytes(credential["response"]["clientDataJSON"]))
+    if not isinstance(data, dict) or data.get("crossOrigin", False) is not False or data.get("topOrigin"):
+        raise ValueError("不支持跨站点验证")
+    return credential
+
+
+def passkey_transports(value):
+    """Optional browser-reported routing hints, never an authentication factor."""
+    if not isinstance(value, list):
+        return None
+    allowed = {item.value for item in AuthenticatorTransport}
+    return [AuthenticatorTransport(item) for item in dict.fromkeys(
+        item for item in value if isinstance(item, str) and item in allowed
+    )] or None
+
+
+def new_passkey_challenge(state, password, kind, origin, rp_id, **extra):
+    now = time.time()
+    version = authentication_version(password, state)
+    challenges = state.setdefault("passkey_challenges", {})
+    for key in list(challenges):
+        if challenges[key]["expires"] <= now or challenges[key]["version"] != version:
+            del challenges[key]
+    challenges.pop(session.pop("passkey_challenge_id", None), None)
+    if len(challenges) >= 100 or sum(item["ip"] == client_ip() for item in challenges.values()) >= 10:
+        raise ValueError("验证请求过多，请稍后重试")
+    key = secrets.token_urlsafe(32)
+    item = {"challenge": bytes_to_base64url(secrets.token_bytes(32)), "kind": kind,
+            "expires": now + 300, "version": version, "origin": origin, "rp_id": rp_id,
+            "ip": client_ip(), **extra}
+    challenges[key] = item
+    session["passkey_challenge_id"] = key
+    return item
+
+
+def consume_passkey_challenge(state, password, kind, origin, rp_id):
+    item = state.get("passkey_challenges", {}).pop(session.pop("passkey_challenge_id", None), None)
+    if (not item or item["kind"] != kind or item["expires"] <= time.time()
+            or item["version"] != authentication_version(password, state)
+            or item["origin"] != origin or item["rp_id"] != rp_id):
+        raise ValueError("验证已过期或已使用，请重新开始")
+    return item
+
+
+def passkey_verification_until(state, password):
+    # Only authorizes adding passkeys in this browser, never password/2FA changes.
+    grant = session.get("passkey_verification", {})
+    if (grant.get("version") == authentication_version(password, state)
+            and grant.get("client_id") == session.get("client_id")
+            and grant.get("host") == request.host
+            and grant.get("expires", 0) > time.time()):
+        return grant["expires"]
+    return 0
 
 
 def csrf_token():
@@ -3199,6 +3362,8 @@ def reject_cross_site_writes():
             return jsonify({"error": "服务拒绝使用默认或弱密码，请先配置至少 12 位的 APP_PASSWORD"}), 503
     if request.method in {"GET", "HEAD", "OPTIONS"}:
         return None
+    if request.path.startswith(("/api/passkeys/", "/api/security/passkeys")):
+        request.max_content_length = 64 * 1024
     if request.endpoint == "api_book_text" and request.method == "PUT":
         request.max_content_length = MAX_TXT_DELTA_BYTES if request.mimetype == TXT_DELTA_MIMETYPE else MAX_TXT_EDIT_REQUEST_BYTES
         if request.content_length is not None and request.content_length > request.max_content_length:
@@ -3406,6 +3571,11 @@ def update_nested_config(config, payload):
     deepseek = payload.get("deepseek", {})
     if deepseek:
         target = config["deepseek"]
+        if "cache_limit" in deepseek:
+            value = str(deepseek["cache_limit"])
+            if not re.fullmatch(r"[0-9]{1,6}", value) or not 1 <= int(value) <= MAX_CACHE_LIMIT:
+                raise ValueError(f"缓存上限须为 1～{MAX_CACHE_LIMIT} 的整数")
+            target["cache_limit"] = int(value)
         target["enabled"] = bool(deepseek.get("enabled"))
         if deepseek.get("api_key"):
             target["api_key"] = clean_single_line_value(deepseek["api_key"])[:1000]
@@ -3516,6 +3686,41 @@ def get_cached_translation(cache_key):
                 connection.close()
 
 
+def translation_cache_limit(config=None):
+    if config is None:
+        config = load_config()
+    try:
+        value = int(config["deepseek"].get("cache_limit", DEFAULT_CACHE_LIMIT))
+        return max(1, min(MAX_CACHE_LIMIT, value))
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_CACHE_LIMIT
+
+
+def trim_translation_cache(connection, limit):
+    excess = int(connection.execute("SELECT COUNT(*) FROM translations").fetchone()[0]) - limit
+    if excess > 0:
+        connection.execute(
+            "DELETE FROM translations WHERE cache_key IN "
+            "(SELECT cache_key FROM translations ORDER BY touched_at LIMIT ?)",
+            (excess,),
+        )
+
+
+def prune_translation_cache():
+    with TRANSLATION_CACHE_LOCK:
+        connection = None
+        try:
+            limit = translation_cache_limit()
+            connection = open_translation_cache()
+            with connection:
+                trim_translation_cache(connection, limit)
+        except sqlite3.Error as exc:
+            app.logger.error("deepseek cache trim failed error=%s", exc)
+        finally:
+            if connection is not None:
+                connection.close()
+
+
 def set_cached_translation(cache_key, value):
     if not re.fullmatch(r"[0-9a-f]{64}", str(cache_key or "")):
         return
@@ -3524,6 +3729,7 @@ def set_cached_translation(cache_key, value):
     with TRANSLATION_CACHE_LOCK:
         connection = None
         try:
+            limit = translation_cache_limit()
             connection = open_translation_cache()
             with connection:
                 connection.execute(
@@ -3531,11 +3737,7 @@ def set_cached_translation(cache_key, value):
                     "ON CONFLICT(cache_key) DO UPDATE SET value = excluded.value, touched_at = excluded.touched_at",
                     (cache_key, value, time.time_ns()),
                 )
-                connection.execute(
-                    "DELETE FROM translations WHERE cache_key NOT IN "
-                    "(SELECT cache_key FROM translations ORDER BY touched_at DESC LIMIT ?)",
-                    (CACHE_LIMIT,),
-                )
+                trim_translation_cache(connection, limit)
         except sqlite3.Error as exc:
             app.logger.error("deepseek cache write failed error=%s", exc)
         finally:
@@ -3553,6 +3755,7 @@ def open_translation_cache():
             "cache_key TEXT PRIMARY KEY, value TEXT NOT NULL, touched_at INTEGER NOT NULL"
             ") WITHOUT ROWID"
         )
+        connection.execute("CREATE INDEX IF NOT EXISTS translations_touched_at ON translations(touched_at)")
         connection.commit()
         os.chmod(TRANSLATION_CACHE_DB, 0o600)
         return connection
@@ -3612,7 +3815,285 @@ def file_allocated_bytes(stat):
     return int(blocks) * 512
 
 
-def scan_tts_cache_stats():
+def book_audio_sentence_counts(summary, settings, previous):
+    """Verify existing counts only when their source changes; never parse a book here."""
+    book_id = summary["id"]
+    path = book_tts_sentence_index_path(book_id)
+    try:
+        book_stat = book_record_path(book_id).stat()
+        stamp = [list(book_file_signature(book_stat)), list(book_file_signature(path.stat())),
+                 int(settings.get("chunk_chars", 260))]
+    except OSError:
+        return None, None
+    if (previous.get("source_stamp") == stamp
+            and previous.get("content_revision", "") == summary.get("content_revision", "")):
+        return previous.get("chapter_sentences"), stamp
+    cached = load_tts_sentence_index(book_id)
+    if (cached.get("version") != TTS_SENTENCE_INDEX_VERSION
+            or cached.get("chunk_chars") != stamp[-1]
+            or not isinstance(cached.get("chapters"), dict)):
+        return None, stamp
+    # Do not evict actively read books or hold the reader lock for a large record.
+    book = json.loads(book_record_path(book_id).read_text(encoding="utf-8"))
+    if not isinstance(book, dict) or book.get("content_revision", "") != summary.get("content_revision", ""):
+        return None, stamp
+    book_key = tts_sentence_index_book_key(book)
+    if cached.get("book_key") != book_key:
+        return None, stamp
+    counts = {}
+    for fallback, chapter in enumerate(book.get("chapters", [])):
+        index = int(chapter.get("index", fallback))
+        entry = cached["chapters"].get(str(index), {})
+        if not isinstance(entry, dict):
+            return None, stamp
+        count = entry.get("sentence_count")
+        if (type(count) is not int or count < 0
+                or entry.get("source_key") != tts_sentence_index_chapter_key(book, chapter, fallback, book_key)):
+            return None, stamp
+        counts[str(index)] = count
+    if len(counts) != int(summary.get("chapter_count", 0)):
+        return None, stamp
+    # A concurrent edit/deletion must not publish counts for a different source.
+    if (list(book_file_signature(book_record_path(book_id).stat())) != stamp[0]
+            or list(book_file_signature(path.stat())) != stamp[1]):
+        return None, None
+    return counts, stamp
+
+
+def prepare_book_audio_statistics(settings, sentence_files, summaries=None, recheck=False):
+    with TTS_CACHE_STATS_LOCK:
+        previous = (TTS_CACHE_STATS_STATE["data"] or {}).get("book_audio", {}).get("books", {})
+    if recheck:
+        previous = {}
+    books = {}
+    profile_key = tts_offline_profile_key(settings)
+    for summary in load_book_index() if summaries is None else summaries:
+        if not isinstance(summary, dict):
+            continue
+        book_id = summary.get("id", "")
+        if not re.fullmatch(r"[0-9a-f]{32}", book_id):
+            continue
+        try:
+            counts, stamp = book_audio_sentence_counts(summary, settings, previous.get(book_id, {}))
+            modified = book_record_path(book_id).stat().st_mtime
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, TypeError, KeyError):
+            counts, stamp, modified = None, None, 0
+        books[book_id] = {
+            "content_revision": summary.get("content_revision", ""),
+            "source_modified_at": modified,
+            "chapter_count": int(summary.get("chapter_count", 0)),
+            "chapter_sentences": counts, "source_stamp": stamp,
+            "_files": {"temporary": {}, "fixed": {}},
+            "_chapters": {},
+            "_coverage_unknown": False,
+        }
+    if not books:
+        return books
+    with TTS_OFFLINE_LOCK:
+        connection = open_tts_offline_db()
+        try:
+            rows = connection.execute(
+                "SELECT book_id, chapter_index, chapter_hash, profile_key, sentence_index, cache_key "
+                "FROM offline_tts_refs WHERE size_bytes > 0 AND audio_format = 'm4a' "
+                "AND book_id IN ({})".format(",".join("?" for _ in books)), tuple(books),
+            ).fetchall()
+        finally:
+            connection.close()
+    for row in rows:
+        book = books.get(row["book_id"])
+        size = sentence_files.get(row["cache_key"])
+        if book is None or size is None:
+            continue
+        book["_files"]["fixed"]["s:" + row["cache_key"]] = size
+        if row["profile_key"] == profile_key:
+            add_book_audio_coverage(book, row["chapter_index"], row["chapter_hash"], "fixed", [row["sentence_index"]])
+    return books
+
+
+def add_book_audio_coverage(book, chapter, chapter_hash, category, indexes):
+    chapter = str(int(chapter))
+    if int(chapter) < 0 or int(chapter) >= book["chapter_count"]:
+        return
+    variants = book["_chapters"].setdefault(chapter, {})
+    coverage = variants.setdefault(chapter_hash, {"temporary": set(), "fixed": set()})
+    coverage[category].update(int(index) for index in indexes if int(index) >= 0)
+
+
+def add_book_audio_pack(books, manifest, pinned, sentence_files, settings, profile_key, manifest_size):
+    book = books.get(manifest.get("book_id"))
+    if book is None or manifest.get("kind", "chapter") != "chapter":
+        return
+    category = "fixed" if pinned else "temporary"
+    files = book["_files"][category]
+    if manifest.get("audio_source") == "tts_cache":
+        key = manifest["audio_cache_key"]
+        if key not in sentence_files:
+            return
+        files["s:" + key] = sentence_files[key]
+    else:
+        try:
+            files["p:" + manifest["pack_key"]] = file_allocated_bytes(tts_pack_audio_path(manifest).stat())
+        except OSError:
+            return
+    files["m:" + manifest["pack_key"]] = manifest_size
+    keys = manifest.get("sentence_cache_keys")
+    current_profile = manifest.get("profile_key") == profile_key
+    if not isinstance(keys, list) and current_profile:
+        keys = [tts_cache_key(segment.get("text", ""), settings) for segment in manifest["segments"]]
+    for key in keys or []:
+        if isinstance(key, str) and key in sentence_files:
+            files["s:" + key] = sentence_files[key]
+    if current_profile:
+        if (("content_revision" in manifest and manifest["content_revision"] != book["content_revision"])
+                or ("chunk_chars" in manifest and manifest["chunk_chars"] != int(settings.get("chunk_chars", 260)))):
+            book["_coverage_unknown"] = True
+            return
+        add_book_audio_coverage(book, manifest["chapter_index"], manifest["chapter_hash"], category,
+                                [segment["index"] for segment in manifest["segments"]])
+
+
+def audio_cache_coverage_percent(covered, total):
+    if not total or not 0 <= covered <= total:
+        return None
+    return 100.0 if covered == total else min(99.9, round(100 * covered / total, 1))
+
+
+def finish_book_audio_statistics(books, profile_key, settings):
+    for book in books.values():
+        files = book.pop("_files")
+        counts = book["chapter_sentences"]
+        total = sum(counts.values()) if counts is not None else None
+        categories = {
+            name: {"size_bytes": sum(size for key, size in values.items()
+                                     if name == "fixed" or key not in files["fixed"]),
+                   "sentences": 0, "chapters": 0, "complete_chapters": 0}
+            for name, values in files.items()
+        }
+        hashes, ambiguous = {}, book.pop("_coverage_unknown")
+        for chapter, variants in book.pop("_chapters").items():
+            if len(variants) != 1:
+                ambiguous = True
+                continue
+            chapter_hash, coverage = next(iter(variants.items()))
+            hashes[chapter] = chapter_hash
+            # A fixed sentence can also occur in a partially fixed playback pack.
+            coverage["temporary"].difference_update(coverage["fixed"])
+            expected = counts.get(chapter) if counts is not None else None
+            for name, indexes in coverage.items():
+                group = categories[name]
+                group["sentences"] += len(indexes)
+                group["chapters"] += bool(indexes)
+                group["complete_chapters"] += bool(expected and len(indexes) == expected)
+            if expected is not None and len(coverage["temporary"] | coverage["fixed"]) > expected:
+                ambiguous = True
+        known = counts is not None and not ambiguous
+        for group in categories.values():
+            group["coverage_percent"] = audio_cache_coverage_percent(group["sentences"], total) if known else None
+            if not known:
+                group["complete_chapters"] = None
+        book.update(categories)
+        book["chapter_hashes"] = hashes
+        book["total_sentences"] = total
+        book["coverage_verified"] = known
+        book["coverage_percent"] = audio_cache_coverage_percent(sum(g["sentences"] for g in categories.values()), total) if known else None
+    return {"schema": 1, "updated_at": time.time(), "profile_key": profile_key,
+            "chunk_chars": int(settings.get("chunk_chars", 260)), "books": books}
+
+
+def scan_book_audio_statistics(book_ids, report_progress):
+    """Reconcile only affected books, using the existing pack ownership index."""
+    settings = load_config()["reader_tts"]
+    profile_key = tts_offline_profile_key(settings)
+    with TTS_CACHE_STATS_LOCK:
+        previous = (TTS_CACHE_STATS_STATE["data"] or {}).get("book_audio", {})
+    summaries = {book["id"]: book for book in load_book_index() if isinstance(book, dict) and book.get("id")}
+    compatible = (previous.get("schema") == 1 and previous.get("profile_key") == profile_key
+                  and previous.get("chunk_chars") == int(settings.get("chunk_chars", 260)))
+    merged = dict(previous.get("books", {})) if compatible else {}
+    if not compatible:
+        book_ids = set(summaries) | set(previous.get("books", {}))
+    for position, book_id in enumerate(sorted(book_ids)):
+        summary = summaries.get(book_id)
+        if summary is None:
+            merged.pop(book_id, None)
+            continue
+        paths = tts_pack_manifests_for_book(book_id)
+        manifests, keys = [], set()
+        with TTS_OFFLINE_LOCK:
+            connection = open_tts_offline_db()
+            try:
+                keys.update(row[0] for row in connection.execute(
+                    "SELECT cache_key FROM offline_tts_refs WHERE book_id=? AND size_bytes>0 AND audio_format='m4a'",
+                    (book_id,),
+                ))
+            finally:
+                connection.close()
+        for path in paths:
+            try:
+                manifest = load_tts_pack_manifest(path.stem)
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+            if not manifest or manifest.get("book_id") != book_id:
+                continue
+            manifests.append((path, manifest))
+            manifest_keys = manifest.get("sentence_cache_keys")
+            if not isinstance(manifest_keys, list):
+                manifest_keys = ([tts_cache_key(segment.get("text", ""), settings) for segment in manifest["segments"]]
+                                 if manifest.get("profile_key") == profile_key else [])
+            keys.update(key for key in manifest_keys if isinstance(key, str))
+            if manifest.get("audio_source") == "tts_cache":
+                keys.add(manifest.get("audio_cache_key", ""))
+        sentence_files = {}
+        for key in keys:
+            if not re.fullmatch(r"[0-9a-f]{64}", key):
+                continue
+            try:
+                path = tts_cache_path(key, "m4a")
+                stat = path.stat()
+                if not path.is_symlink() and 0 < stat.st_size <= MAX_TTS_AUDIO_BYTES:
+                    sentence_files[key] = file_allocated_bytes(stat)
+            except OSError:
+                continue
+        books = prepare_book_audio_statistics(settings, sentence_files, [summary])
+        pinned = pinned_tts_pack_keys(book_id, paths)
+        for index, (path, manifest) in enumerate(manifests):
+            try:
+                add_book_audio_pack(books, manifest, path.stem in pinned, sentence_files, settings,
+                                    profile_key, file_allocated_bytes(path.stat()))
+            except (OSError, KeyError, TypeError, ValueError):
+                continue
+            if index % 100 == 0:
+                report_progress(min(99, int(100 * (position + index / max(1, len(manifests))) / max(1, len(book_ids)))))
+        merged.pop(book_id, None)
+        merged.update(finish_book_audio_statistics(books, profile_key, settings)["books"])
+        report_progress(min(99, int(100 * (position + 1) / max(1, len(book_ids)))))
+    result = finish_book_audio_statistics({}, profile_key, settings)
+    result["books"] = merged
+    return result
+
+
+def scan_tts_cache_stats(report_progress=None, recheck=False):
+    # Enumerate once; progress measures checked files, not estimated elapsed time.
+    if recheck:
+        tts_pack_manifests_for_book(None, rebuild=True)
+    sentence_paths = list(TTS_CACHE_DIR.glob("*.m4a"))
+    pack_paths = list(TTS_PACK_CACHE_DIR.glob("*.m4a"))
+    manifest_paths = list(TTS_PACK_CACHE_DIR.glob("*.json"))
+    total_files = len(sentence_paths) + len(pack_paths) + len(manifest_paths)
+    completed, last_percent = 0, -1
+
+    def scan_paths(paths):
+        nonlocal completed, last_percent
+        for path in paths:
+            yield path
+            completed += 1
+            percent = min(99, completed * 100 // max(1, total_files))
+            if report_progress is not None and percent != last_percent:
+                report_progress(percent)
+                last_percent = percent
+
     now = time.time()
     ttl = tts_cache_ttl_seconds()
     limit = tts_cache_limit_bytes()
@@ -3626,8 +4107,9 @@ def scan_tts_cache_stats():
     pinned_entries = 0
     pinned_size = 0
     pinned_disk_size = 0
+    sentence_files = {}
     if TTS_CACHE_DIR.exists():
-        for path in TTS_CACHE_DIR.glob("*.m4a"):
+        for path in scan_paths(sentence_paths):
             if not path.is_file() or path.is_symlink():
                 continue
             if not re.fullmatch(r"[0-9a-f]{64}", path.stem):
@@ -3639,6 +4121,7 @@ def scan_tts_cache_stats():
             if stat.st_size <= 0 or stat.st_size > MAX_TTS_AUDIO_BYTES:
                 continue
             allocated_size = file_allocated_bytes(stat)
+            sentence_files[path.stem] = allocated_size
             if path.stem in pinned_keys:
                 pinned_entries += 1
                 pinned_size += stat.st_size
@@ -3656,9 +4139,9 @@ def scan_tts_cache_stats():
     pinned_pack_entries = 0
     pinned_pack_size = 0
     pinned_pack_disk_size = 0
-    pinned_pack_keys = pinned_tts_pack_keys()
+    pinned_pack_keys = pinned_tts_pack_keys(manifest_paths=manifest_paths)
     if TTS_PACK_CACHE_DIR.exists():
-        for path in TTS_PACK_CACHE_DIR.glob("*.m4a"):
+        for path in scan_paths(pack_paths):
             try:
                 stat = path.stat()
             except OSError:
@@ -3677,9 +4160,13 @@ def scan_tts_cache_stats():
                 pinned_pack_disk_size += allocated_size
     pack_manifest_disk_size = 0
     pinned_pack_manifest_disk_size = 0
+    settings = load_config()["reader_tts"]
+    profile_key = tts_offline_profile_key(settings)
+    book_audio = prepare_book_audio_statistics(settings, sentence_files, recheck=recheck)
     if TTS_PACK_CACHE_DIR.exists():
-        for path in TTS_PACK_CACHE_DIR.glob("*.json"):
-            if not load_tts_pack_manifest(path.stem):
+        for path in scan_paths(manifest_paths):
+            manifest = load_tts_pack_manifest(path.stem)
+            if not manifest:
                 continue
             try:
                 stat = path.stat()
@@ -3689,6 +4176,11 @@ def scan_tts_cache_stats():
             pack_manifest_disk_size += allocated_size
             if path.stem in pinned_pack_keys:
                 pinned_pack_manifest_disk_size += allocated_size
+            try:
+                add_book_audio_pack(book_audio, manifest, path.stem in pinned_pack_keys,
+                                    sentence_files, settings, profile_key, allocated_size)
+            except (KeyError, TypeError, ValueError):
+                continue
     cache_entries = max(0, entries - pinned_entries)
     cache_disk_size = (
         max(0, total_disk_size - pinned_disk_size)
@@ -3716,6 +4208,7 @@ def scan_tts_cache_stats():
         "pack_size_bytes": pack_size,
         "pinned_pack_entries": pinned_pack_entries,
         "pinned_pack_size_bytes": pinned_pack_size,
+        "book_audio": finish_book_audio_statistics(book_audio, profile_key, settings),
     }
 
 
@@ -3736,6 +4229,53 @@ def valid_tts_cache_stats_snapshot(data):
     )
 
 
+def valid_book_audio_statistics(data):
+    """Validate persisted derived data once, before exposing or reusing it."""
+    def number(value):
+        return type(value) in (int, float) and 0 <= value < float("inf")
+
+    def count(value):
+        return type(value) is int and value >= 0
+
+    def percent(value):
+        return value is None or (number(value) and value <= 100)
+
+    if (not isinstance(data, dict) or data.get("schema") != 1
+            or not number(data.get("updated_at"))
+            or not isinstance(data.get("profile_key"), str)
+            or not count(data.get("chunk_chars")) or not data["chunk_chars"]
+            or not isinstance(data.get("books"), dict)):
+        return False
+    for book_id, book in data["books"].items():
+        if (not isinstance(book_id, str) or not re.fullmatch(r"[0-9a-f]{32}", book_id) or not isinstance(book, dict)
+                or not isinstance(book.get("content_revision"), str)
+                or not count(book.get("chapter_count"))
+                or not number(book.get("source_modified_at"))
+                or type(book.get("coverage_verified")) is not bool
+                or not percent(book.get("coverage_percent"))
+                or not isinstance(book.get("chapter_hashes"), dict)
+                or any(not isinstance(value, str) for value in book["chapter_hashes"].values())):
+            return False
+        counts = book.get("chapter_sentences")
+        if counts is not None and (not isinstance(counts, dict) or len(counts) != book["chapter_count"]
+                                   or not all(key.isdigit() and int(key) < book["chapter_count"] and count(value)
+                                              for key, value in counts.items())):
+            return False
+        if book.get("total_sentences") != (sum(counts.values()) if counts is not None else None):
+            return False
+        for category in ("temporary", "fixed"):
+            group = book.get(category)
+            if (not isinstance(group, dict)
+                    or not all(count(group.get(key)) for key in ("size_bytes", "sentences", "chapters"))
+                    or not (group.get("complete_chapters") is None or count(group["complete_chapters"]))
+                    or not percent(group.get("coverage_percent"))):
+                return False
+        if book["coverage_verified"] and (
+                counts is None or book["temporary"]["sentences"] + book["fixed"]["sentences"] > sum(counts.values())):
+            return False
+    return True
+
+
 def load_tts_cache_stats_snapshot():
     with TTS_CACHE_STATS_LOCK:
         if TTS_CACHE_STATS_STATE["snapshot_loaded"]:
@@ -3748,13 +4288,11 @@ def load_tts_cache_stats_snapshot():
         data = payload.get("data") if isinstance(payload, dict) and payload.get("schema") == 1 else None
         if not valid_tts_cache_stats_snapshot(data):
             return
+        if not valid_book_audio_statistics(data.get("book_audio")):
+            data.pop("book_audio", None)
         TTS_CACHE_STATS_STATE["data"] = data
-        TTS_CACHE_STATS_STATE["data_revision"] = TTS_CACHE_STATS_STATE["revision"]
-        # Return the disk snapshot immediately, then reconcile it in the background.
-        TTS_CACHE_STATS_STATE["refreshed_at"] = (
-            time.monotonic() - TTS_CACHE_STATS_MAX_AGE_SECONDS
-        )
-        TTS_CACHE_STATS_READY.set()
+        # Reconcile once after a process restart, not on an elapsed-time schedule.
+        TTS_CACHE_STATS_STATE["data_revision"] = -1
     app.logger.info(
         "tts cache stats snapshot loaded entries=%s packs=%s",
         data["entries"],
@@ -3774,105 +4312,149 @@ def save_tts_cache_stats_snapshot(data):
         app.logger.warning("tts cache stats snapshot write failed error=%s", exc)
 
 
-def refresh_tts_cache_stats_snapshot(target_revision):
-    started = time.perf_counter()
-    try:
-        data = scan_tts_cache_stats()
-    except Exception as exc:
-        app.logger.warning("tts cache stats refresh failed error=%s", exc)
+def refresh_tts_cache_stats_snapshot():
+    def report_progress(percent):
         with TTS_CACHE_STATS_LOCK:
-            TTS_CACHE_STATS_STATE["refreshing"] = False
-            refresh_again = TTS_CACHE_STATS_STATE["refresh_again"]
-            TTS_CACHE_STATS_STATE["refresh_again"] = False
-            TTS_CACHE_STATS_READY.set()
-        if refresh_again:
-            schedule_tts_cache_stats_refresh(force=True)
-        return
-    with TTS_CACHE_STATS_LOCK:
-        TTS_CACHE_STATS_STATE["data"] = data
-        TTS_CACHE_STATS_STATE["data_revision"] = target_revision
-        TTS_CACHE_STATS_STATE["refreshed_at"] = time.monotonic()
-        TTS_CACHE_STATS_STATE["refreshing"] = False
-        refresh_again = TTS_CACHE_STATS_STATE["refresh_again"]
-        TTS_CACHE_STATS_STATE["refresh_again"] = False
-        TTS_CACHE_STATS_READY.set()
-    save_tts_cache_stats_snapshot(data)
-    app.logger.info(
-        "tts cache stats refreshed entries=%s packs=%s elapsed=%.3fs",
-        data["entries"],
-        data["pack_entries"],
-        time.perf_counter() - started,
-    )
-    if refresh_again:
-        schedule_tts_cache_stats_refresh(force=True)
+            TTS_CACHE_STATS_STATE["progress_percent"] = percent
+
+    while True:
+        with TTS_CACHE_STATS_LOCK:
+            state = TTS_CACHE_STATS_STATE
+            full = state["full_refresh"] or state["data"] is None
+            recheck = state["recheck_pending"]
+            state["recheck_pending"] = False
+            state["rechecking"] = recheck
+            book_ids = set(state["pending_books"])
+            state["full_refresh"] = False
+            state["scanning_full"] = full
+            state["pending_books"].clear()
+            revision = state["revision"]
+            state["progress_percent"] = 0
+            state["error"] = ""
+        started = time.perf_counter()
+        try:
+            if full:
+                data = scan_tts_cache_stats(report_progress, recheck=recheck)
+            else:
+                audio = scan_book_audio_statistics(book_ids, report_progress)
+                with TTS_CACHE_STATS_LOCK:
+                    data = {**state["data"], "book_audio": audio}
+            with TTS_CACHE_STATS_LOCK:
+                state["data"] = data
+                if full:
+                    state["data_revision"] = revision
+                state["progress_percent"] = 100
+            save_tts_cache_stats_snapshot(data)
+            app.logger.info("tts cache stats refreshed scope=%s elapsed=%.3fs",
+                            "all" if full else len(book_ids), time.perf_counter() - started)
+        except Exception:
+            app.logger.exception("tts cache stats refresh failed")
+            # Keep the old snapshot and failed work for the next event/manual retry.
+            # Do not loop immediately on an unreadable file or unavailable database.
+            with TTS_CACHE_STATS_LOCK:
+                state["full_refresh"] |= full
+                state["recheck_pending"] |= recheck
+                state["pending_books"].update(book_ids)
+                state["error"] = "缓存统计更新失败，请点击刷新重试"
+                state["refreshing"] = False
+                state["scanning_full"] = False
+                state["rechecking"] = False
+            return
+        with TTS_CACHE_STATS_LOCK:
+            state["rechecking"] = False
+            if not state["full_refresh"] and not state["pending_books"]:
+                state["refreshing"] = False
+                state["scanning_full"] = False
+                return
 
 
-def schedule_tts_cache_stats_refresh(force=False):
+def schedule_tts_cache_stats_refresh(force=False, book_ids=None, recheck=False):
     load_tts_cache_stats_snapshot()
-    now = time.monotonic()
     with TTS_CACHE_STATS_LOCK:
         state = TTS_CACHE_STATS_STATE
-        fresh = (
-            state["data"] is not None
-            and state["data_revision"] == state["revision"]
-            and now - state["refreshed_at"] < TTS_CACHE_STATS_MAX_AGE_SECONDS
-        )
-        if fresh and not force:
+        if recheck:
+            if state["refreshing"] and (state["rechecking"] or state["recheck_pending"]):
+                return False
+            state["recheck_pending"] = True
+            state["full_refresh"] = True
+        if book_ids is None and not force and not recheck and state["refreshing"] and state["scanning_full"]:
+            return False
+        if book_ids is not None:
+            state["pending_books"].update(book_ids)
+        elif recheck or force or state["data"] is None or state["data_revision"] != state["revision"]:
+            state["full_refresh"] = True
+        else:
             return False
         if state["refreshing"]:
-            if force:
-                state["refresh_again"] = True
             return False
         state["refreshing"] = True
-        target_revision = state["revision"]
-        TTS_CACHE_STATS_READY.clear()
-    threading.Thread(
-        target=refresh_tts_cache_stats_snapshot,
-        args=(target_revision,),
-        name="tts-cache-stats",
-        daemon=True,
-    ).start()
+        state["progress_percent"] = 0
+        state["error"] = ""
+    try:
+        threading.Thread(target=refresh_tts_cache_stats_snapshot, name="tts-cache-stats", daemon=True).start()
+    except Exception:
+        with TTS_CACHE_STATS_LOCK:
+            state["refreshing"] = False
+            state["error"] = "缓存统计更新失败，请点击刷新重试"
+        app.logger.exception("tts cache stats worker could not start")
+        return False
     return True
 
 
-def invalidate_tts_cache_stats(refresh=False):
+def update_listening_statistics(book_id, playing):
+    # Debounce on the server: navigating away can suspend browser timers.
+    with TTS_CACHE_STATS_LOCK:
+        state = TTS_CACHE_STATS_STATE
+        previous = state["stop_timers"].pop(book_id, None)
+        if previous:
+            previous.cancel()
+        if playing:
+            state["stopped_books"].discard(book_id)
+            return
+        state["stopped_books"].add(book_id)
+
+        def stopped():
+            with TTS_CACHE_STATS_LOCK:
+                if state["stop_timers"].get(book_id) is not timer:
+                    return
+                state["stop_timers"].pop(book_id, None)
+            schedule_tts_cache_stats_refresh(book_ids={book_id})
+
+        timer = threading.Timer(TTS_BOOK_STATS_DEBOUNCE_SECONDS, stopped)
+        timer.daemon = True
+        state["stop_timers"][book_id] = timer
+        timer.start()
+
+
+def refresh_finished_book_audio(book_id):
+    # An in-flight audio build can finish after the listener has already stopped.
+    if active_tts_offline_job_for_book(book_id):
+        return
+    with TTS_CACHE_STATS_LOCK:
+        if book_id in TTS_CACHE_STATS_STATE["stopped_books"]:
+            update_listening_statistics(book_id, False)
+
+
+def invalidate_tts_cache_stats(refresh=False, book_id=None):
     with TTS_CACHE_STATS_LOCK:
         TTS_CACHE_STATS_STATE["revision"] += 1
     if refresh:
-        schedule_tts_cache_stats_refresh(force=True)
+        schedule_tts_cache_stats_refresh(force=True, book_ids={book_id} if book_id else None)
 
 
 def tts_cache_stats():
     load_tts_cache_stats_snapshot()
-    with TTS_CACHE_STATS_LOCK:
-        data = TTS_CACHE_STATS_STATE["data"]
-        stale = (
-            data is None
-            or TTS_CACHE_STATS_STATE["data_revision"] != TTS_CACHE_STATS_STATE["revision"]
-            or time.monotonic() - TTS_CACHE_STATS_STATE["refreshed_at"] >= TTS_CACHE_STATS_MAX_AGE_SECONDS
-        )
-    if data is not None:
-        schedule_tts_cache_stats_refresh()
-        result = dict(data)
-        result["refreshing"] = stale
-        return result
     schedule_tts_cache_stats_refresh()
-    TTS_CACHE_STATS_READY.wait(timeout=1.0)
     with TTS_CACHE_STATS_LOCK:
         data = TTS_CACHE_STATS_STATE["data"]
+        refreshing = TTS_CACHE_STATS_STATE["refreshing"]
     if data is not None:
-        result = dict(data)
-        result["refreshing"] = False
+        result = {key: value for key, value in data.items() if key != "book_audio"}
+        result["refreshing"] = refreshing
         return result
-    data = scan_tts_cache_stats()
-    with TTS_CACHE_STATS_LOCK:
-        TTS_CACHE_STATS_STATE["data"] = data
-        TTS_CACHE_STATS_STATE["data_revision"] = TTS_CACHE_STATS_STATE["revision"]
-        TTS_CACHE_STATS_STATE["refreshed_at"] = time.monotonic()
-    save_tts_cache_stats_snapshot(data)
-    result = dict(data)
-    result["refreshing"] = False
-    return result
+    # Initial requests share the background scan, never launch a second full scan.
+    return {"ready": False, "refreshing": refreshing, "limit_bytes": tts_cache_limit_bytes(),
+            "ttl_days": max(1, round(tts_cache_ttl_seconds() / 86400))}
 
 
 def clean_tts_text(value, max_chars):
@@ -3970,6 +4552,8 @@ def tts_offline_chapter_data(book, chapter_index, settings, include_cache_keys=T
     )
     return {
         "book_id": book["id"],
+        "content_revision": book.get("content_revision", ""),
+        "chunk_chars": max_chars,
         "index": int(chapter.get("index", chapter_index)),
         "title": chapter.get("title", f"第 {chapter_index + 1} 章"),
         "hash": hashlib.sha256(chapter_raw.encode("utf-8")).hexdigest(),
@@ -4036,6 +4620,7 @@ def load_tts_sentence_index(book_id):
 def save_tts_sentence_index(book_id, data):
     with READER_IO_LOCK:
         write_json_atomic(book_tts_sentence_index_path(book_id), data)
+    schedule_tts_cache_stats_refresh(book_ids={book_id})
 
 
 def ensure_tts_sentence_counts(book, settings):
@@ -4763,7 +5348,7 @@ def process_tts_offline_job(job_id, book_id, chapter_indexes):
         app.logger.warning("tts offline job failed book=%s error=%s", book_id, exc)
         update_tts_offline_job(job_id, status="error", message="服务器固定缓存失败", error=str(exc))
     finally:
-        invalidate_tts_cache_stats(refresh=True)
+        invalidate_tts_cache_stats(refresh=True, book_id=book_id)
 
 
 def delete_tts_offline_refs(book_id, chapter_indexes=None, profile_key=None, delete_files=False):
@@ -4814,7 +5399,7 @@ def delete_tts_offline_refs(book_id, chapter_indexes=None, profile_key=None, del
             "size_bytes": affected_size + removed_size,
             "removed_size_bytes": removed_size,
         }
-        invalidate_tts_cache_stats(refresh=True)
+        invalidate_tts_cache_stats(refresh=True, book_id=book_id)
         return result
     for row in rows:
         if row["cache_key"] in remaining:
@@ -4831,11 +5416,12 @@ def delete_tts_offline_refs(book_id, chapter_indexes=None, profile_key=None, del
         "size_bytes": affected_size + removed_packs["size_bytes"],
         "removed_size_bytes": removed_size,
     }
+    # Deleted single audio can also back another book's unpinned alias pack.
     invalidate_tts_cache_stats(refresh=True)
     return result
 
 
-def tts_pack_manifests_for_book(book_id):
+def tts_pack_manifests_for_book(book_id, rebuild=False):
     # Pack keys include book identity and are immutable. Reconcile filenames
     # so older caches, new packs and external removals need no write-path hooks.
     # Only previously unseen manifests need to be read in full.
@@ -4859,7 +5445,7 @@ def tts_pack_manifests_for_book(book_id):
             known = {row[0] for row in connection.execute("SELECT pack_key FROM pack_owners")}
             missing = known - paths.keys()
             additions = []
-            for pack_key in paths.keys() - known:
+            for pack_key in paths.keys() if rebuild else paths.keys() - known:
                 try:
                     manifest = json.loads(paths[pack_key].read_text(encoding="utf-8"))
                 except (OSError, ValueError, TypeError):
@@ -4870,8 +5456,10 @@ def tts_pack_manifests_for_book(book_id):
                 if not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner):
                     continue
                 additions.append((pack_key, owner))
-            if missing or additions:
+            if rebuild or missing or additions:
                 with connection:
+                    if rebuild:
+                        connection.execute("DELETE FROM pack_owners")
                     connection.executemany(
                         "DELETE FROM pack_owners WHERE pack_key = ?",
                         ((key,) for key in missing),
@@ -4880,6 +5468,8 @@ def tts_pack_manifests_for_book(book_id):
                         "INSERT OR REPLACE INTO pack_owners(pack_key, book_id) VALUES (?, ?)",
                         additions,
                     )
+            if book_id is None:
+                return list(paths.values())
             return [
                 paths[row[0]] for row in connection.execute(
                     "SELECT pack_key FROM pack_owners WHERE book_id = ?", (book_id,),
@@ -4938,7 +5528,7 @@ def pinned_tts_pack_keys(book_id=None, manifest_paths=None):
             )
             required = {identity + (int(segment["index"]),) for segment in manifest["segments"]}
             pack_key = manifest["pack_key"]
-        except (OSError, KeyError, TypeError, ValueError):
+        except (OSError, KeyError, TypeError, ValueError, OverflowError):
             continue
         if required and required.issubset(references):
             pinned.add(pack_key)
@@ -5085,6 +5675,8 @@ def remove_tts_cache_candidate(paths, stamps, cache_key, pack=False, manifest=No
             for path in paths:
                 path.unlink(missing_ok=True)
         invalidate_tts_cache_stats()
+        with TTS_CACHE_STATS_LOCK:
+            TTS_CACHE_STATS_STATE["pruned"] = True
         return True
     except OSError:
         return False
@@ -5204,6 +5796,11 @@ def maybe_prune_tts_pack_cache(force=False):
             with TTS_CACHE_PRUNE_LOCK:
                 TTS_PACK_PRUNE_STATE["time"] = time.monotonic()
                 TTS_PACK_PRUNE_STATE["running"] = False
+            with TTS_CACHE_STATS_LOCK:
+                pruned = TTS_CACHE_STATS_STATE["pruned"]
+                TTS_CACHE_STATS_STATE["pruned"] = False
+            if pruned:
+                schedule_tts_cache_stats_refresh(force=True)
             app.logger.info("tts cache background cleanup elapsed=%.3fs", time.perf_counter() - started)
 
     try:
@@ -5536,7 +6133,7 @@ def indexed_tts_pack_key_matches(manifest):
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest() == manifest["pack_key"]
-    except (IndexError, KeyError, TypeError, ValueError):
+    except (IndexError, KeyError, TypeError, ValueError, OverflowError):
         return False
 
 
@@ -5578,13 +6175,15 @@ def load_tts_pack_manifest(pack_key):
             return None
         audio_path = tts_pack_audio_path(manifest)
         audio_size = audio_path.stat().st_size
-    except (KeyError, OSError, ValueError, TypeError):
+        schema_version = int(manifest.get("schema_version", 0))
+        sentence_count = int(manifest.get("sentence_count", 0))
+    except (KeyError, OSError, ValueError, TypeError, OverflowError):
         return None
     audio_source = manifest.get("audio_source", "pack_cache")
     size_limit = MAX_TTS_AUDIO_BYTES if audio_source == "tts_cache" else MAX_TTS_PACK_BYTES
     if (
         manifest.get("pack_key") != pack_key
-        or int(manifest.get("schema_version", 0)) != TTS_PACK_SCHEMA_VERSION
+        or schema_version != TTS_PACK_SCHEMA_VERSION
         or not isinstance(manifest.get("segments"), list)
         or not manifest["segments"]
         or audio_source not in {"pack_cache", "tts_cache"}
@@ -5594,7 +6193,7 @@ def load_tts_pack_manifest(pack_key):
         or (
             audio_source == "tts_cache"
             and (
-                int(manifest.get("sentence_count", 0)) != 1
+                sentence_count != 1
                 or len(manifest["segments"]) != 1
             )
         )
@@ -5607,16 +6206,17 @@ def load_tts_pack_manifest(pack_key):
             start = float(segment["start"])
             end = float(segment["end"])
             int(segment["index"])
-            if (first_segment and abs(start) > 0.05) or start < previous_end - 0.01 or end <= start:
+            if (not -float("inf") < start < end < float("inf")
+                    or (first_segment and abs(start) > 0.05) or start < previous_end - 0.01):
                 return None
             first_segment = False
             previous_end = end
-        if int(manifest.get("sentence_count", 0)) != len(manifest["segments"]):
+        if sentence_count != len(manifest["segments"]):
             return None
         duration = float(manifest.get("duration", 0))
-        if duration < TTS_PACK_MIN_SECONDS - 0.05 or abs(previous_end - duration) > 0.1:
+        if not TTS_PACK_MIN_SECONDS - 0.05 <= duration < float("inf") or abs(previous_end - duration) > 0.1:
             return None
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OverflowError):
         return None
     return manifest
 
@@ -5670,7 +6270,9 @@ def reader_tts_pack_manifest(
         "duration": round(duration, 3),
         "size_bytes": int(size_bytes),
         "segments": segments,
+        "sentence_cache_keys": [sentence["cache_key"] for sentence in spec["sentences"]],
         "created_at": time.time(),
+        **({key: chapter[key] for key in ("content_revision", "chunk_chars") if key in chapter}),
         **extra,
     }
 
@@ -5721,6 +6323,7 @@ def index_single_sentence_tts_pack(book_id, chapter, spec, profile_key):
             pass
     invalidate_tts_cache_stats()
     invalidate_tts_offline_status_snapshot(book_id, profile_key)
+    refresh_finished_book_audio(book_id)
     return manifest
 
 
@@ -5936,6 +6539,7 @@ def build_reader_tts_pack(book_id, chapter, spec, config, prune_cache=True, timi
                             maybe_prune_tts_pack_cache()
                     invalidate_tts_cache_stats()
                     invalidate_tts_offline_status_snapshot(book_id, profile_key)
+                    refresh_finished_book_audio(book_id)
                     timings["build_ms"] = (time.perf_counter() - build_started) * 1000
                     return manifest
             except FileNotFoundError as exc:
@@ -6150,11 +6754,8 @@ def read_process_stat():
             if line.startswith(("VmRSS:", "VmSize:", "Threads:")):
                 key, value = line.split(":", 1)
                 stat[key] = value.strip()
-        parts = Path("/proc/self/stat").read_text(encoding="utf-8").split()
-        ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-        stat["cpu_seconds"] = (int(parts[13]) + int(parts[14])) / ticks
-    except (OSError, ValueError, IndexError, KeyError):
-        stat["cpu_seconds"] = 0.0
+    except (OSError, ValueError):
+        pass
     return stat
 
 
@@ -6165,37 +6766,43 @@ def parse_kb_value(value):
         return 0
 
 
-def process_cpu_percent(cpu_seconds):
-    now = time.time()
-    previous_time = CPU_SAMPLE["time"]
-    previous_cpu = CPU_SAMPLE["cpu"]
-    CPU_SAMPLE["time"] = now
-    CPU_SAMPLE["cpu"] = cpu_seconds
-    elapsed = max(now - previous_time, 0.001)
-    return max(0.0, (cpu_seconds - previous_cpu) / elapsed * 100)
-
-
-def system_cpu_percent():
-    try:
-        values = [int(value) for value in Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()[1:]]
-    except (OSError, ValueError, IndexError):
-        return 0.0
-    idle = values[3] + (values[4] if len(values) > 4 else 0)
-    total = sum(values)
-    previous_idle = SYSTEM_CPU_SAMPLE["idle"]
-    previous_total = SYSTEM_CPU_SAMPLE["total"]
-    SYSTEM_CPU_SAMPLE["idle"] = idle
-    SYSTEM_CPU_SAMPLE["total"] = total
-    total_delta = total - previous_total
-    idle_delta = idle - previous_idle
-    if total_delta <= 0 or previous_total == 0:
-        return 0.0
-    return round(max(0.0, min(100.0, (1 - idle_delta / total_delta) * 100)), 2)
+def cpu_usage_percent():
+    # Read counters inside the same lock as their timestamps. Sharing a short
+    # sample window avoids races and tiny intervals when several clients poll.
+    with CPU_SAMPLE_LOCK:
+        now = time.monotonic()
+        pid = os.getpid()
+        same_process = CPU_SAMPLE["pid"] == pid
+        elapsed = now - CPU_SAMPLE["time"] if same_process and CPU_SAMPLE["time"] is not None else 0
+        if same_process and 0 <= elapsed < 1:
+            return CPU_SAMPLE["usage"]
+        process_seconds = time.process_time()
+        system = None
+        try:
+            with Path("/proc/stat").open(encoding="utf-8") as stream:
+                values = [int(value) for value in stream.readline().split()[1:]]
+            if len(values) >= 4:
+                # guest/guest_nice are already included in user/nice.
+                system = (sum(values[:8]), values[3] + (values[4] if len(values) > 4 else 0))
+        except (OSError, ValueError):
+            pass
+        process_percent = system_percent = 0.0
+        if elapsed > 0:
+            process_percent = (process_seconds - CPU_SAMPLE["process"]) / elapsed * 100 / (os.cpu_count() or 1)
+            previous = CPU_SAMPLE["system"]
+            if system is not None and previous is not None:
+                total_delta, idle_delta = system[0] - previous[0], system[1] - previous[1]
+                if total_delta > 0 and idle_delta >= 0:
+                    system_percent = (1 - idle_delta / total_delta) * 100
+        usage = tuple(round(max(0.0, min(100.0, value)), 2) for value in (process_percent, system_percent))
+        CPU_SAMPLE.update(pid=pid, time=now, process=process_seconds, system=system, usage=usage)
+        return usage
 
 
 def system_status():
     mem = read_meminfo()
     proc = read_process_stat()
+    process_cpu, system_cpu = cpu_usage_percent()
     disk = shutil.disk_usage(BASE_DIR)
     total_mem = mem.get("MemTotal", 0)
     available_mem = mem.get("MemAvailable", 0)
@@ -6209,12 +6816,12 @@ def system_status():
             "rss_bytes": process_rss,
             "vms_bytes": process_vms,
             "threads": int(proc.get("Threads", "0")),
-            "cpu_percent": round(process_cpu_percent(proc.get("cpu_seconds", 0.0)), 2),
+            "cpu_percent": process_cpu,
         },
         "system": {
             "load_avg": os.getloadavg() if hasattr(os, "getloadavg") else [0, 0, 0],
             "cpu_count": os.cpu_count() or 1,
-            "cpu_percent": system_cpu_percent(),
+            "cpu_percent": system_cpu,
             "memory_total_bytes": total_mem,
             "memory_used_bytes": used_mem,
             "memory_available_bytes": available_mem,
@@ -6228,7 +6835,7 @@ def system_status():
         },
         "cache": {
             "entries": translation_cache_entries(),
-            "limit": CACHE_LIMIT,
+            "limit": translation_cache_limit(),
             "max_text_chars": CACHE_MAX_TEXT_CHARS,
             "persistent": True,
         },
@@ -6257,23 +6864,30 @@ def restart_process_later(delay=0.35):
                 # Let the Gunicorn master replace this worker with the same command.
                 app.logger.info("restart worker exiting pid=%s", os.getpid())
                 os._exit(0)
+            # Preserve interpreter flags (e.g. -u), entry point and arguments.
+            command = [sys.executable, *getattr(sys, "orig_argv", [sys.executable, *sys.argv])[1:]]
             if os.environ.get("INVOCATION_ID"):
                 # Keep systemd's main PID and journal streams. A detached child
                 # still belongs to the unit and is killed when its parent exits.
+                # Werkzeug makes its listener inheritable for the dev reloader.
+                # Close it only on successful exec, so the new server can bind
+                # and a failed exec leaves the current server operational.
+                listener_fd = os.environ.get("WERKZEUG_SERVER_FD")
+                if listener_fd is not None and int(listener_fd) > 2:
+                    os.set_inheritable(int(listener_fd), False)
                 app.logger.info("restart systemd process in place pid=%s", os.getpid())
-                os.execv(sys.executable, [sys.executable, str(BASE_DIR / "app.py"), *sys.argv[1:]])
+                os.execv(sys.executable, command)
                 return
             replacement = subprocess.Popen(
                 [
                     sys.executable,
                     "-c",
-                    "import os, sys, time; time.sleep(1.0); os.execv(sys.executable, [sys.executable, sys.argv[1]])",
-                    str(BASE_DIR / "app.py"),
+                    "import os, sys, time; time.sleep(1.0); os.execv(sys.argv[1], sys.argv[1:])",
+                    *command,
                 ],
-                cwd=BASE_DIR,
                 start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
             )
             app.logger.info(
                 "restart replacement launched old_pid=%s replacement_pid=%s",
@@ -6828,8 +7442,14 @@ def reader_page():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    wants_json = request.accept_mimetypes.best == "application/json"
+
+    def success(target="index", *, password_verified=False):
+        return (jsonify({"ok": True, "redirect": url_for(target), "password_verified": password_verified})
+                if wants_json else redirect(url_for(target)))
+
     if require_auth():
-        return redirect(url_for("index"))
+        return success()
     error = ""
     status = 200
     if request.method == "GET" and request.args.get("back") == "1":
@@ -6846,11 +7466,10 @@ def login():
         if pending_id and not pending:
             session.pop("pending_login", None)
             error = "验证已过期，请重新输入密码"
-        if request.method == "POST":
-            otp_step = request.form.get("step") == "otp"
-            if security_limited(state, otp_step):
-                error, status = "尝试次数过多，请在 5 分钟后重试", 429
-            elif otp_step:
+        otp_step = request.form.get("step") == "otp" if request.method == "POST" else bool(pending)
+        retry_after = security_retry_after(state, otp_step)
+        if request.method == "POST" and not retry_after:
+            if otp_step:
                 if not pending or not state.get("enabled"):
                     error = "验证已过期，请重新输入密码"
                 elif (factor := verify_second_factor(state, request.form.get("code"))):
@@ -6860,9 +7479,9 @@ def login():
                     authenticated_session(password, state, fresh=True)
                     if factor == "recovery":
                         session["recovery_verified_until"] = now + 300
-                    return redirect(url_for(LOGIN_TARGETS[target]))
+                    return success(LOGIN_TARGETS[target])
                 else:
-                    security_failure(state, True)
+                    retry_after = security_failure(state, True)
                     error = "验证码无效或已使用"
             elif password_matches(request.form.get("password"), password):
                 target = request.form.get("target")
@@ -6877,14 +7496,91 @@ def login():
                     logins[pending_id] = pending
                     session.clear()
                     session["pending_login"] = pending_id
+                    if wants_json:
+                        return jsonify({"ok": True, "redirect": url_for("login"), "password_verified": True})
                 else:
                     security_success(state)
                     authenticated_session(password, state, fresh=True)
-                    return redirect(url_for(LOGIN_TARGETS[target]))
+                    return success(LOGIN_TARGETS[target], password_verified=True)
             else:
-                security_failure(state)
+                retry_after = security_failure(state)
                 error = "密码不正确"
-    return render_template("login.html", error=error, otp_step=bool(pending)), status
+        if retry_after:
+            error, status = "尝试次数过多，请稍后重试", 429
+    if wants_json:
+        response = jsonify({"ok": False, "error": error, "retry_after": retry_after,
+                            "otp_step": bool(pending), "csrf_token": csrf_token()})
+        response.status_code = status if status != 200 else (401 if error else 200)
+    else:
+        passkeys_available = not pending and any(value.get("rp_id") == urlparse(request.host_url).hostname
+                                                for value in state.get("passkeys", {}).values())
+        response = app.make_response((render_template("login.html", error=error, otp_step=bool(pending),
+                                     retry_after=retry_after, passkeys_available=passkeys_available), status))
+    if retry_after:
+        response.headers["Retry-After"] = str(retry_after)
+    return response
+
+
+@app.route("/api/passkeys/login/<step>", methods=["POST"])
+def api_passkey_login(step):
+    if step not in {"options", "verify"}:
+        return jsonify({"error": "未知的验证步骤"}), 404
+    try:
+        origin, rp_id = passkey_origin()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    payload = request_json_object()
+    with security_transaction() as state:
+        password = load_config()["app_password"]
+        if (retry_after := security_retry_after(state, True)):
+            return security_limit_response(retry_after)
+        if step == "options":
+            try:
+                pending = new_passkey_challenge(state, password, "login", origin, rp_id)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 429
+            options = generate_authentication_options(
+                rp_id=rp_id, challenge=base64url_to_bytes(pending["challenge"]), timeout=60000,
+                user_verification=UserVerificationRequirement.REQUIRED,
+            )
+            # Discoverable credentials avoid publishing registered credential IDs.
+            return jsonify(json.loads(options_to_json(options)))
+        try:
+            pending = consume_passkey_challenge(state, password, "login", origin, rp_id)
+            credential = passkey_credential(payload)
+            saved = state.get("passkeys", {}).get(credential.get("id"))
+            if not saved or saved["rp_id"] != rp_id:
+                raise ValueError("通行密钥不存在")
+            user_handle = credential["response"].get("userHandle")
+            if (not isinstance(user_handle, str)
+                    or not secrets.compare_digest(base64url_to_bytes(user_handle),
+                                                   base64url_to_bytes(state["passkey_user_id"]))):
+                raise ValueError("通行密钥账户不匹配")
+            verified = verify_authentication_response(
+                credential=credential, expected_challenge=base64url_to_bytes(pending["challenge"]),
+                expected_rp_id=rp_id, expected_origin=origin,
+                credential_public_key=base64url_to_bytes(saved["public_key"]),
+                credential_current_sign_count=saved["sign_count"], require_user_verification=True,
+            )
+            if verified.credential_device_type.value != saved["device_type"]:
+                raise ValueError("通行密钥备份属性不匹配")
+        except (WebAuthnException, ValueError, TypeError, KeyError, AttributeError):
+            if (retry_after := security_failure(state, True)):
+                return security_limit_response(retry_after)
+            return jsonify({"error": "通行密钥验证失败，请重试或使用密码登录"}), 403
+        saved["sign_count"] = verified.new_sign_count
+        saved["last_used_at"] = time.time()
+        saved["backed_up"] = verified.credential_backed_up
+        # Successful device verification is a complete login, including when TOTP
+        # is enabled for password login. No password or biometric leaves the device.
+        state.get("logins", {}).pop(session.get("pending_login"), None)
+        security_success(state)
+        if security_session_matches(password, state):
+            revoke_login_client(state, session.get("client_id") or legacy_client_identifier(
+                authentication_version(password, state)), authentication_version(password, state))
+        authenticated_session(password, state, fresh=True)
+        app.logger.info("passkey login success ip=%s", client_ip())
+        return jsonify({"ok": True, "redirect": url_for("index")})
 
 
 @app.route("/logout", methods=["POST"])
@@ -6929,12 +7625,98 @@ def api_reader_tts_config_update():
         return jsonify({"error": "unauthorized"}), 401
     try:
         config = load_config()
+        previous_profile = (tts_offline_profile_key(config["reader_tts"]), config["reader_tts"].get("chunk_chars"))
         updated = update_reader_tts_config(config, request_json_object())
         save_config(updated)
+        if previous_profile != (tts_offline_profile_key(updated["reader_tts"]), updated["reader_tts"].get("chunk_chars")):
+            schedule_tts_cache_stats_refresh(book_ids={book["id"] for book in load_book_index()})
         app.logger.info("reader tts config updated ip=%s", request.remote_addr)
         return jsonify({"ok": True, "config": public_reader_tts_config(updated)})
     except Exception as exc:
         app.logger.warning("reader tts config failed ip=%s error=%s", request.remote_addr, exc)
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/reader/audio-statistics")
+def api_reader_audio_statistics():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    settings = load_config()["reader_tts"]
+    profile_key = tts_offline_profile_key(settings)
+    load_tts_cache_stats_snapshot()
+    with TTS_CACHE_STATS_LOCK:
+        previous = (TTS_CACHE_STATS_STATE["data"] or {}).get("book_audio") or {}
+        missing = not (previous.get("schema") == 1 and previous.get("profile_key") == profile_key
+                       and previous.get("chunk_chars") == int(settings.get("chunk_chars", 260)))
+        missing = missing and not TTS_CACHE_STATS_STATE["refreshing"] and not TTS_CACHE_STATS_STATE["error"]
+    if missing:
+        schedule_tts_cache_stats_refresh(book_ids=set())
+    with TTS_CACHE_STATS_LOCK:
+        data = (TTS_CACHE_STATS_STATE["data"] or {}).get("book_audio")
+        ready = (isinstance(data, dict) and data.get("schema") == 1
+                 and data.get("profile_key") == profile_key
+                 and data.get("chunk_chars") == int(settings.get("chunk_chars", 260)))
+        refreshing = TTS_CACHE_STATS_STATE["refreshing"] or bool(TTS_CACHE_STATS_STATE["stop_timers"])
+        progress_percent = TTS_CACHE_STATS_STATE["progress_percent"] if TTS_CACHE_STATS_STATE["refreshing"] else 0
+        error = TTS_CACHE_STATS_STATE["error"]
+    result = {key: value for key, value in data.items() if key != "books"} if ready else {}
+    unchanged = ready and (
+        request.args.get("since") == str(data["updated_at"])
+        and request.args.get("profile") == profile_key
+        and request.args.get("chunk") == str(data["chunk_chars"])
+    )
+    result.update({
+        "ready": ready, "refreshing": refreshing, "progress_percent": progress_percent, "error": error,
+        "profile_key": profile_key, "unchanged": unchanged,
+        "books": {
+            book_id: {key: value for key, value in book.items() if key != "source_stamp"}
+            for book_id, book in data["books"].items()
+        } if ready and not unchanged else {},
+    })
+    return jsonify(result)
+
+
+@app.route("/api/reader/audio-statistics/refresh", methods=["POST"])
+def api_reader_audio_statistics_refresh():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    # Explicit recovery bypasses the derived snapshot. Repeated clicks/devices
+    # share one worker; ordinary GETs never request a full recalibration.
+    schedule_tts_cache_stats_refresh(recheck=True)
+    return jsonify({"ok": True}), 202
+
+
+@app.route("/api/books/<book_id>/audio-statistics", methods=["POST"])
+def api_book_audio_statistics_update(book_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        if not book_record_path(book_id).is_file():
+            return jsonify({"error": "书籍不存在"}), 404
+        payload = request_json_object()
+        action = payload.get("action")
+        if not isinstance(action, str) or action not in {"playing", "stopped", "cache_changed"}:
+            return jsonify({"error": "统计更新事件无效"}), 400
+        if action == "cache_changed":
+            schedule_tts_cache_stats_refresh(book_ids={book_id})
+        else:
+            client, sequence = payload.get("client"), payload.get("sequence")
+            if (not isinstance(client, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", client)
+                    or type(sequence) is not int or not 0 < sequence < 2**53):
+                return jsonify({"error": "播放事件标识无效"}), 400
+            # Rapid pause/resume requests can arrive out of order.
+            with TTS_CACHE_STATS_LOCK:
+                events = TTS_CACHE_STATS_STATE["listening_events"]
+                key = (session.get("client_id", ""), client, book_id)
+                if sequence <= events.get(key, 0):
+                    return jsonify({"ok": True})
+                events[key] = sequence
+                events.move_to_end(key)
+                while len(events) > 1024:
+                    events.popitem(last=False)
+                update_listening_statistics(book_id, action == "playing")
+        return jsonify({"ok": True})
+    except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
 
@@ -8168,7 +8950,9 @@ def api_config():
         if "app_password" in payload:
             raise ValueError("访问密码只能通过设置页的专用接口修改")
         updated = update_nested_config(config, payload)
-        save_config(updated)
+        with TRANSLATION_CACHE_LOCK:
+            save_config(updated)
+            prune_translation_cache()
         app.logger.info("config updated ip=%s", request.remote_addr)
         return jsonify({"ok": True, "config": public_config(updated)})
     except Exception as exc:
@@ -8211,6 +8995,163 @@ def api_client_location():
     return jsonify({"ip": ip, "location": client_ip_location(ip)})
 
 
+@app.route("/api/security/passkeys/reauthenticate", methods=["POST"])
+def api_passkey_reauthenticate():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        passkey_origin()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    payload = request_json_object()
+    with security_transaction() as state:
+        password = load_config()["app_password"]
+        if not security_session_matches(password, state):
+            return jsonify({"error": "登录状态已更新，请重新登录"}), 401
+        method = payload.get("method")
+        if (not isinstance(method, str) or method not in {"password", "code"}
+                or (method == "code" and not state.get("enabled"))):
+            return jsonify({"error": "请选择有效的验证方式"}), 400
+        if (retry_after := security_retry_after(state, method == "code")):
+            return security_limit_response(retry_after)
+        valid = (password_matches(payload.get("current_password"), password) if method == "password"
+                 else verify_second_factor(state, payload.get("code")))
+        if not valid:
+            security_failure(state, method == "code")
+            return jsonify({"error": "当前密码不正确" if method == "password" else "验证码无效或已使用"}), 403
+        session["passkey_verification"] = {
+            "version": authentication_version(password, state), "client_id": session["client_id"],
+            "host": request.host, "expires": time.time() + PASSKEY_VERIFICATION_SECONDS,
+        }
+        security_success(state)
+        return jsonify({"ok": True, **public_security_state(state)})
+
+
+@app.route("/api/security/passkeys/register/<step>", methods=["POST"])
+def api_passkey_register(step):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    if step not in {"options", "verify", "diagnostic"}:
+        return jsonify({"error": "未知的验证步骤"}), 404
+    try:
+        origin, rp_id = passkey_origin()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    payload = request_json_object()
+    with security_transaction() as state:
+        password = load_config()["app_password"]
+        if not security_session_matches(password, state):
+            return jsonify({"error": "登录状态已更新，请重新登录"}), 401
+        keys = state.setdefault("passkeys", {})
+        if len(keys) >= PASSKEY_LIMIT:
+            return jsonify({"error": f"最多保存 {PASSKEY_LIMIT} 个通行密钥，请先删除不再使用的密钥"}), 409
+        verified_until = passkey_verification_until(state, password)
+        if not verified_until:
+            return jsonify({"error": "请重新验证身份", "code": "passkey_reauth_required"}), 403
+        if step == "diagnostic":
+            # One browser failure per issued challenge; never accept raw messages
+            # or credential data into logs, and do not consume a retryable challenge.
+            error = payload.get("error")
+            if not isinstance(error, str) or error not in {
+                "NotAllowedError", "AbortError", "InvalidStateError", "SecurityError",
+                "NotSupportedError", "ConstraintError", "UnknownError", "NotReadableError",
+                "DataError", "TypeError", "Error",
+            }:
+                return jsonify({"error": "无效的错误类型"}), 400
+            pending = state.get("passkey_challenges", {}).get(session.get("passkey_challenge_id"))
+            if (pending and pending["kind"] == "register" and pending["expires"] > time.time()
+                    and not pending.get("diagnostic_logged")):
+                pending["diagnostic_logged"] = True
+                browser, platform = describe_login_client(request.headers.get("User-Agent", "")[:512])
+                app.logger.warning("passkey registration failed stage=browser error=%s browser=%s platform=%s ip=%s",
+                                   error, browser, platform, client_ip())
+            return jsonify({"ok": True})
+        if step == "options":
+            try:
+                pending = new_passkey_challenge(state, password, "register", origin, rp_id,
+                                                expires=verified_until)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 429
+            user_id = state.setdefault("passkey_user_id", bytes_to_base64url(secrets.token_bytes(32)))
+            options = generate_registration_options(
+                rp_id=rp_id, rp_name="Trans", user_id=base64url_to_bytes(user_id),
+                user_name="Trans", user_display_name="Trans",
+                challenge=base64url_to_bytes(pending["challenge"]), timeout=60000,
+                supported_pub_key_algs=PASSKEY_REGISTRATION_ALGORITHMS,
+                authenticator_selection=AuthenticatorSelectionCriteria(
+                    resident_key=ResidentKeyRequirement.REQUIRED, require_resident_key=True,
+                    user_verification=UserVerificationRequirement.REQUIRED,
+                ),
+                exclude_credentials=[PublicKeyCredentialDescriptor(
+                                         id=base64url_to_bytes(key),
+                                         transports=passkey_transports(value.get("transports")))
+                                     for key, value in keys.items() if value["rp_id"] == rp_id],
+            )
+            result = json.loads(options_to_json(options))
+            # Request credential properties without relaxing resident-key or UV requirements.
+            result["extensions"] = {"credProps": True}
+            return jsonify(result)
+        name = payload.get("name")
+        if not isinstance(name, str) or not 1 <= len(clean_display_text(name, 64).strip()) <= 64 or len(name) > 64:
+            return jsonify({"error": "请填写 1～64 字的名称"}), 400
+        if (retry_after := security_retry_after(state, True)):
+            return security_limit_response(retry_after)
+        stage = "challenge"
+        try:
+            pending = consume_passkey_challenge(state, password, "register", origin, rp_id)
+            stage = "verification"
+            credential = passkey_credential(payload)
+            verified = verify_registration_response(
+                credential=credential,
+                expected_challenge=base64url_to_bytes(pending["challenge"]),
+                expected_rp_id=rp_id, expected_origin=origin, require_user_verification=True,
+                supported_pub_key_algs=PASSKEY_REGISTRATION_ALGORITHMS,
+            )
+            if not 1 <= len(verified.credential_id) <= 1023:
+                raise ValueError("通行密钥标识长度无效")
+        except (WebAuthnException, ValueError, TypeError, KeyError, AttributeError) as exc:
+            browser, platform = describe_login_client(request.headers.get("User-Agent", "")[:512])
+            app.logger.warning("passkey registration failed stage=%s error=%s browser=%s platform=%s ip=%s",
+                               stage, type(exc).__name__, browser, platform, client_ip())
+            security_failure(state, True)
+            return jsonify({"error": "通行密钥绑定失败，请重新开始"}), 400
+        credential_id = bytes_to_base64url(verified.credential_id)
+        if credential_id in keys:
+            return jsonify({"error": "此通行密钥已绑定"}), 409
+        keys[credential_id] = {
+            "name": clean_display_text(name, 64).strip(), "rp_id": rp_id, "origin": origin,
+            "public_key": bytes_to_base64url(verified.credential_public_key),
+            "sign_count": verified.sign_count, "device_type": verified.credential_device_type.value,
+            "backed_up": verified.credential_backed_up,
+            "created_at": time.time(), "last_used_at": None,
+        }
+        transports = passkey_transports(credential["response"].get("transports"))
+        if transports:
+            keys[credential_id]["transports"] = [item.value for item in transports]
+        app.logger.info("passkey registered ip=%s", client_ip())
+        security_success(state)
+        return jsonify({"ok": True, **public_security_state(state)})
+
+
+@app.route("/api/security/passkeys/delete", methods=["POST"])
+def api_passkey_delete():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    payload = request_json_object()
+    credential_id = payload.get("id")
+    if not isinstance(credential_id, str) or len(credential_id) > 2048:
+        return jsonify({"error": "通行密钥标识无效"}), 400
+    with security_transaction() as state:
+        password = load_config()["app_password"]
+        if not security_session_matches(password, state):
+            return jsonify({"error": "登录状态已更新，请重新登录"}), 401
+        if credential_id not in state.get("passkeys", {}):
+            return jsonify({"error": "通行密钥已不存在，请重新打开设置"}), 404
+        del state["passkeys"][credential_id]
+        app.logger.info("passkey deleted ip=%s", client_ip())
+        return jsonify({"ok": True, **public_security_state(state)})
+
+
 @app.route("/api/security", methods=["GET", "POST"])
 def api_security():
     if not require_auth():
@@ -8250,8 +9191,8 @@ def api_security():
                     or setup.get("version") != authentication_version(password, state)):
                 return jsonify({"error": "绑定已过期，请重新开始绑定"}), 409
             candidate = {"secret": setup["secret"]}
-            if security_limited(state, True):
-                return jsonify({"error": "尝试次数过多，请在 5 分钟后重试"}), 429
+            if (retry_after := security_retry_after(state, True)):
+                return security_limit_response(retry_after)
             if not verify_second_factor(candidate, payload.get("code"), recovery=False):
                 security_failure(state, True)
                 return jsonify({"error": "验证码不正确，请检查验证器及设备时间"}), 403
@@ -8341,20 +9282,24 @@ def api_cache_clear():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
     if request.method == "GET":
-        return jsonify({"entries": translation_cache_entries(), "limit": CACHE_LIMIT, "persistent": True})
+        return jsonify({"entries": translation_cache_entries(), "limit": translation_cache_limit(), "persistent": True})
     try:
         count = clear_translation_cache()
     except sqlite3.Error as exc:
         app.logger.error("deepseek cache clear failed ip=%s error=%s", request.remote_addr, exc)
         return jsonify({"error": "缓存清空失败"}), 500
     app.logger.info("cache cleared ip=%s entries=%s", request.remote_addr, count)
-    return jsonify({"ok": True, "cleared": count, "entries": 0, "limit": CACHE_LIMIT, "persistent": True})
+    return jsonify({"ok": True, "cleared": count, "entries": 0, "limit": translation_cache_limit(), "persistent": True})
 
 
 @app.route("/api/restart", methods=["POST"])
 def api_restart():
     if not require_auth():
         return jsonify({"error": "unauthorized"}), 401
+    if running_under_gunicorn() and PROCESS_IMPORT_PID != os.getpid():
+        return jsonify({"error": "Gunicorn 预加载模式请通过进程管理器重启，或关闭 --preload 后使用此按钮"}), 409
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        return jsonify({"error": "调试自动重载模式请通过启动终端重启服务"}), 409
     now = time.time()
     if now - RESTART_STATE["time"] < RESTART_COOLDOWN_SECONDS:
         return jsonify({"error": "重启操作过于频繁，请稍后再试"}), 429

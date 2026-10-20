@@ -116,7 +116,7 @@
               </div>
               <div class="metric-card">
                 <span>CPU 占用率</span>
-                <strong id="metricAppCpu">-</strong>
+                <strong id="metricAppCpu" title="当前进程占整机 CPU 算力的比例（0～100%）">-</strong>
               </div>
               <div class="metric-card">
                 <span>内存占用</span>
@@ -174,12 +174,19 @@
             <button class="danger-btn" id="disableMfaBtn" type="button" hidden>关闭双重验证</button>
           </div>
         </section>
+        <section class="security-section" aria-labelledby="passkeyTitle">
+          <div class="security-section-head">
+            <h3 id="passkeyTitle">通行密钥</h3>
+            <button class="ghost" id="managePasskeysBtn" type="button" disabled>管理</button>
+          </div>
+          <p id="passkeySummary" class="security-hint">使用设备指纹、人脸或锁屏密码快速登录。</p>
+        </section>
         <section class="security-section" aria-labelledby="passwordTitle">
           <div class="security-section-head">
             <h3 id="passwordTitle">修改密码</h3>
             <button class="primary" id="savePasswordBtn" type="submit" form="passwordForm" disabled>修改密码</button>
           </div>
-          <p class="security-hint">安全设置或密码变更后，其他浏览器需要重新登录。</p>
+          <p class="security-hint">密码或 2FA 设置变更后，其他浏览器需要重新登录。</p>
           <form id="passwordForm" class="security-form">
             <div class="security-password-field">
               <label for="currentPassword">当前密码</label>
@@ -201,13 +208,49 @@
             </div>
           </form>
         </section>
-        <section class="security-section" aria-labelledby="clientsTitle">
+        <section class="security-section security-clients-section" aria-labelledby="clientsTitle">
           <div class="security-section-head">
             <h3 id="clientsTitle">已登录设备</h3>
             <button class="ghost" id="refreshClientsBtn" type="button" disabled>刷新</button>
           </div>
-          <div id="loginClients" class="login-clients" aria-live="polite"><p class="security-hint">正在读取…</p></div>
+          <div id="loginClients" class="login-clients" tabindex="0" aria-labelledby="clientsTitle" aria-live="polite"><p class="security-hint">正在读取…</p></div>
         </section>
+      </section>
+    </dialog>
+
+    <dialog id="passkeysDialog" aria-labelledby="passkeysDialogTitle">
+      <section class="monitor-panel security-panel passkey-panel">
+        <div class="dialog-head">
+          <h2 id="passkeysDialogTitle" tabindex="-1" autofocus>通行密钥</h2>
+          <p id="passkeysMessage" class="config-message" role="status" hidden></p>
+          <button class="ghost" id="closePasskeysBtn" type="button">关闭</button>
+        </div>
+        <p id="passkeysHint" class="security-hint">最多支持 10 个通行密钥，验证由设备完成。</p>
+        <div id="passkeyList" class="passkey-list"></div>
+        <div class="security-actions"><button id="addPasskeyBtn" class="primary" type="button">添加通行密钥</button></div>
+      </section>
+    </dialog>
+
+    <dialog id="passkeyAuthDialog" aria-labelledby="passkeyAuthTitle">
+      <section class="monitor-panel security-panel">
+        <div class="dialog-head">
+          <h2 id="passkeyAuthTitle" tabindex="-1" autofocus>验证身份</h2>
+          <p id="passkeyAuthMessage" class="config-message" role="status" hidden></p>
+          <button id="closePasskeyAuthBtn" class="ghost" type="button">关闭</button>
+        </div>
+        <p id="passkeyAuthHint" class="security-hint"></p>
+        <form id="passkeyAuthForm" class="security-form" method="post">
+          <div id="passkeyAuthMethods" class="security-actions passkey-auth-methods" role="group" aria-label="身份验证方式" hidden>
+            <button id="passkeyUsePasswordBtn" class="ghost" type="button" aria-pressed="true">密码验证</button>
+            <button id="passkeyUseCodeBtn" class="ghost" type="button" aria-pressed="false">2FA 验证</button>
+          </div>
+          <label id="passkeyPasswordField">当前密码<input id="passkeyPassword" type="password" maxlength="256" autocomplete="current-password" required></label>
+          <label id="passkeyCodeField" hidden>验证码或恢复码<input id="passkeyCode" type="text" maxlength="64" autocomplete="one-time-code" autocapitalize="off" spellcheck="false"></label>
+        </form>
+        <form id="passkeyNameForm" class="security-form" autocomplete="off" hidden>
+          <label id="passkeyNameField" hidden>名称<input id="passkeyName" name="credential_label" type="text" maxlength="64" autocomplete="off" placeholder="例如：我的 iPhone" disabled></label>
+        </form>
+        <div class="security-actions passkey-confirm-actions"><button id="confirmPasskeyBtn" class="primary" type="submit" form="passkeyAuthForm">验证并继续</button></div>
       </section>
     </dialog>
 
@@ -261,6 +304,7 @@
 
     <script src="{{ asset_url('ui.js') }}"></script>
     <script src="{{ asset_url('font-cache.js') }}"></script>
+    <script src="{{ asset_url('passkeys.js') }}"></script>
     <script src="{{ asset_url('home.js') }}"></script>
   </body>
 </html>

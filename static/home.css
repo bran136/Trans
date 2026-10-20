@@ -160,20 +160,49 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
 }
 
 /* Monitor messages share the heading row without reserving empty space. */
-#monitorDialog .monitor-heading { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; min-width:0; }
+#monitorDialog .monitor-heading { display:flex; flex:1; align-items:center; gap:8px 12px; min-width:0; }
 #monitorDialog .monitor-heading h2 { flex-shrink:0; margin:0; }
 #monitorDialog .compact-actions { flex-shrink:0; align-self:start; }
-#monitorDialog #monitorMessage { min-width:0; max-width:100%; margin:0; overflow-wrap:anywhere; }
+#monitorDialog #monitorMessage { min-width:0; max-width:100%; min-height:32px; margin:0; padding:6px 10px; line-height:18px; overflow-wrap:anywhere; }
 #monitorDialog #monitorMessage[hidden] { display:none !important; }
+#metricTtsCacheDetail { font-size:12px; }
+@media (min-width:981px) {
+  #monitorDialog .service-metrics { grid-template-columns:minmax(0,.8fr) minmax(0,1fr) minmax(0,.8fr) minmax(0,1.4fr) minmax(0,1.55fr) minmax(0,1.85fr); gap:12px; }
+  #monitorDialog .service-metrics .metric-card { padding-inline:10px; }
+  #monitorDialog .service-metrics .metric-card:nth-child(5) { position:relative; margin-left:12px; }
+  #monitorDialog .service-metrics .metric-card:nth-child(5)::before { content:""; position:absolute; top:6px; bottom:6px; left:-13px; width:1px; background:var(--line); }
+  #monitorDialog .metric-card strong { font-size:clamp(16px,1.5vw,18px); line-height:1.35; font-variant-numeric:tabular-nums; }
+}
+@media (max-width:980px) {
+  #monitorDialog .metric-card strong { font-size:18px; line-height:1.35; font-variant-numeric:tabular-nums; }
+}
 @media (max-width:760px) {
   #monitorDialog .dialog-head { flex-wrap:wrap; }
   #monitorDialog .monitor-heading { display:contents; }
   #monitorDialog .compact-actions { margin-left:auto; }
   #monitorDialog #monitorMessage { order:1; flex-basis:100%; }
 }
+@media (max-width:640px) {
+  #monitorDialog .monitor-panel { padding:10px; }
+  #monitorDialog .dialog-head { gap:6px; }
+  #monitorDialog .compact-actions { gap:4px; }
+  #monitorDialog .compact-actions button { padding-inline:6px; }
+  #monitorDialog .monitor-sections { gap:12px; margin-top:10px; }
+  #monitorDialog .monitor-section h3 { margin:0 0 5px; font-size:13px; line-height:1.4; }
+  #monitorDialog .metric-grid { grid-template-columns:minmax(0,1fr); gap:6px; margin-top:0; }
+  #monitorDialog .metric-card { display:grid; grid-template-columns:max-content minmax(0,1fr); align-items:center; column-gap:8px; padding:8px 10px; border-radius:8px; }
+  #monitorDialog .metric-card > span { grid-column:1; grid-row:1; line-height:1.4; }
+  #monitorDialog .metric-card strong { grid-column:2; grid-row:1; margin:0; font-size:16px; text-align:right; }
+  #monitorDialog .tts-cache-detail { grid-column:2; grid-row:2; margin-top:2px; text-align:right; }
+}
+@media (max-width:640px) and (max-height:620px) {
+  #monitorDialog .monitor-sections { gap:10px; margin-top:8px; }
+  #monitorDialog .metric-grid { gap:4px; }
+  #monitorDialog .metric-card { padding-block:5px; }
+}
 
 /* Account security stays local to the homepage. */
-#securityDialog, #mfaDialog { width:min(650px, calc(100vw - 24px)); background:var(--panel); color:var(--ink); border:1px solid var(--line); box-shadow:var(--dialog-shadow); }
+#securityDialog, #mfaDialog, #passkeysDialog, #passkeyAuthDialog { width:min(650px, calc(100vw - 24px)); background:var(--panel); color:var(--ink); border:1px solid var(--line); box-shadow:var(--dialog-shadow); }
 .security-panel { padding:22px; }
 .security-panel .dialog-head { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:12px; margin-bottom:16px; }
 .security-panel .dialog-head h2 { grid-column:1; grid-row:1; margin:0; font-size:21px; white-space:nowrap; }
@@ -197,7 +226,7 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
 .password-visibility-btn svg { width:19px; height:19px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
 .password-visibility-btn[aria-pressed="true"] .password-eye-slash { display:none; }
 .security-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; grid-column:1 / -1; }
-.security-panel button { min-height:34px; padding:6px 12px; font-size:13px; }
+.security-panel button { height:32px; min-height:32px; padding:0 10px; font-size:13px; line-height:1.3; }
 .security-setup { display:grid; grid-template-columns:180px minmax(0,1fr); align-items:center; gap:16px; grid-column:1 / -1; padding:12px; border:1px solid var(--line); border-radius:10px; background:var(--subtle); }
 .security-setup img { width:180px; height:auto; max-width:100%; border-radius:6px; }
 .security-setup p, .security-recovery p { font-size:13px; line-height:1.6; margin:0 0 8px; }
@@ -216,25 +245,53 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
 .security-panel .login-client-logout { display:inline-flex; align-items:center; justify-content:center; height:26px; min-height:26px; padding:0 8px; border-radius:6px; font-size:12px; line-height:1; }
 .login-client-meta { display:flex; flex-wrap:wrap; gap:4px 16px; margin-top:6px; font-size:12px; line-height:1.6; color:var(--muted); }
 .login-client-meta span { overflow-wrap:anywhere; }
-.login-client details { margin-top:6px; font-size:12px; color:var(--muted); }
-.login-client summary { cursor:pointer; width:fit-content; }
-.login-client summary:hover { color:var(--accent); }
-.login-client details p { margin:6px 0 0; line-height:1.5; overflow-wrap:anywhere; }
-#securityDialog .security-panel { padding:18px; }
+#securityDialog .security-panel { display:flex; flex-direction:column; max-height:calc(100vh - 30px); max-height:calc(100dvh - 30px); padding:18px; overflow:hidden; }
+#securityDialog .security-panel > .dialog-head,
+#securityDialog .security-panel > .security-section { flex-shrink:0; }
+#securityDialog .security-panel > .security-clients-section { display:flex; flex-direction:column; flex-shrink:1; min-height:0; }
+#securityDialog .security-clients-section > .security-section-head { flex-shrink:0; }
 #securityDialog .dialog-head { margin-bottom:12px; }
-#securityDialog .security-section + .security-section { margin-top:12px; padding-top:12px; }
+#securityDialog .security-section + .security-section { margin-top:10px; padding-top:10px; }
 #securityDialog .security-hint { margin:6px 0 8px; line-height:1.5; }
 #securityDialog .security-form { margin-top:8px; gap:10px; }
-#securityDialog .login-clients { margin-top:8px; gap:6px; }
+#securityDialog .login-clients { min-height:0; max-height:var(--clients-preview-height, 236px); margin-top:8px; gap:6px; grid-auto-rows:max-content; align-content:start; overflow-y:auto; overscroll-behavior-y:contain; scrollbar-gutter:stable; -webkit-overflow-scrolling:touch; }
 #securityDialog .login-client { padding:9px 10px; }
 .login-client-location { flex-basis:100%; color:var(--ink); }
+@media (max-width:560px) {
+  #securityDialog .login-clients { max-height:var(--clients-preview-height, 282px); }
+  #securityDialog .login-client-meta { display:grid; grid-template-columns:max-content max-content; justify-content:space-between; column-gap:6px; }
+  #securityDialog .login-client-location { grid-column:1 / -1; min-width:0; }
+  #securityDialog .login-client-time { font-size:11px; white-space:nowrap; font-variant-numeric:tabular-nums; }
+}
+@media (max-width:360px) {
+  #securityDialog .login-client-meta { grid-template-columns:minmax(0, 1fr); }
+  #securityDialog .login-client-time { font-size:10px; }
+}
+/* Short screens need a scrollable panel so added security controls cannot hide devices. */
+@media (max-height:480px), (max-width:560px) and (max-height:700px) {
+  #securityDialog .security-panel { overflow-y:auto; }
+  #securityDialog .security-panel > .security-clients-section { flex-shrink:0; }
+  #securityDialog .login-clients { max-height:160px; }
+}
 @media (min-width:561px) {
   #securityDialog .security-section[aria-labelledby="mfaTitle"] { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:0 12px; align-items:center; }
   #securityDialog .security-section[aria-labelledby="mfaTitle"] .security-section-head { grid-column:1; grid-row:1; justify-content:flex-start; gap:8px; }
   #securityDialog .security-section[aria-labelledby="mfaTitle"] .security-actions { grid-column:2; grid-row:1; }
   #securityDialog #mfaSummary { grid-column:1 / -1; margin-bottom:0; }
 }
-#securityDialog [hidden], #mfaDialog [hidden] { display:none !important; }
+#securityDialog [hidden], #mfaDialog [hidden], #passkeysDialog [hidden], #passkeyAuthDialog [hidden] { display:none !important; }
+.passkey-panel { display:flex; flex-direction:column; gap:12px; overflow:hidden; }
+.passkey-panel .dialog-head, .passkey-panel .security-hint { margin:0; }
+.passkey-panel > :not(.passkey-list) { flex-shrink:0; }
+.passkey-list { display:grid; gap:8px; min-height:0; max-height:45dvh; overflow-y:auto; overscroll-behavior:contain; padding:2px; }
+.passkey-item { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:8px; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--subtle); }
+.passkey-item strong { display:block; font-size:13px; overflow-wrap:anywhere; }
+.passkey-item small { display:block; margin-top:4px; font-size:12px; line-height:1.5; color:var(--muted); overflow-wrap:anywhere; }
+.security-panel .passkey-delete { height:26px; min-height:26px; padding:3px 8px; font-size:12px; }
+#passkeyAuthForm, #passkeyNameForm { grid-template-columns:minmax(0,1fr); }
+#passkeyAuthForm .security-actions { margin-top:4px; }
+.passkey-confirm-actions { margin-top:14px; }
+.passkey-auth-methods button[aria-pressed="true"] { color:var(--accent); border-color:var(--accent); background:rgba(var(--accent-rgb),.08); }
 @media (max-width:760px) {
   .home-head { flex-wrap:wrap; }
   .home-head .home-actions { gap:2px; margin-left:auto; }

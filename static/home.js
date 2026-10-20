@@ -21,7 +21,7 @@ async function api(path, options = {}) {
     });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
-      throw new Error(data.error || `请求失败：${response.status}`);
+      throw Object.assign(new Error(data.error || `请求失败：${response.status}`), { code: data.code });
     }
     return await response.json();
   } catch (error) {
@@ -85,8 +85,12 @@ function renderServiceStatus(data) {
   $("metricAppCpu").textContent = `${data.process.cpu_percent}%`;
   $("metricAppMemory").textContent = `${formatBytes(data.process.rss_bytes)} | ${appMemoryPercent.toFixed(2)}%`;
   $("metricCache").textContent = `${data.cache.entries} / ${data.cache.limit}`;
-  $("metricTtsCacheEntries").textContent = `${Number(ttsCache.entries || 0)} 句`;
-  $("metricTtsCacheDetail").textContent = `缓 ${formatAudioCacheMegabytes(ttsCache.cache_disk_size_bytes ?? ttsCache.disk_size_bytes ?? ttsCache.size_bytes)}/${formatAudioCacheMegabytes(ttsCache.limit_bytes)} M · ${ttsCache.ttl_days || 0}天 | 固 ${formatAudioCacheMegabytes(ttsCache.fixed_disk_size_bytes ?? ttsCache.pinned_disk_size_bytes ?? ttsCache.pinned_size_bytes)} M`;
+  $("metricTtsCacheEntries").textContent = `${Number(ttsCache.entries || 0)}句 ｜ 固 ${formatAudioCacheMegabytes(ttsCache.fixed_disk_size_bytes ?? ttsCache.pinned_disk_size_bytes ?? ttsCache.pinned_size_bytes)}M`;
+  $("metricTtsCacheDetail").textContent = `缓 ${formatAudioCacheMegabytes(ttsCache.cache_disk_size_bytes ?? ttsCache.disk_size_bytes ?? ttsCache.size_bytes)}/${formatAudioCacheMegabytes(ttsCache.limit_bytes)} M · ${ttsCache.ttl_days || 0}天`;
+  if (ttsCache.ready === false) {
+    $("metricTtsCacheEntries").textContent = ttsCache.refreshing ? "统计中…" : "待统计";
+    $("metricTtsCacheDetail").textContent = `上限 ${formatAudioCacheMegabytes(ttsCache.limit_bytes)} M · ${ttsCache.ttl_days || 0}天`;
+  }
   $("metricSystemCpu").textContent = `${data.system.cpu_percent}%`;
   $("metricSystemMemory").textContent = `${data.system.memory_used_percent}% | ${formatBytes(data.system.memory_available_bytes)} 可用`;
   $("metricLoad").textContent = data.system.load_avg.map((item) => Number(item).toFixed(2)).join(" / ");
@@ -135,7 +139,7 @@ async function restartService() {
   $("restartServiceBtn").disabled = true;
   try {
     const previous = await api("/api/restart", { method: "POST", body: "{}" });
-    setMonitorMessage("服务正在重启，恢复后自动刷新状态", "success");
+    setMonitorMessage("正在重启，恢复后自动刷新", "success");
     stopMonitorRefresh();
     const deadline = Date.now() + 90000;
     window.setTimeout(async function poll() {
@@ -206,6 +210,20 @@ let securityScrollY = 0;
 let mfaAction = "setup";
 let mfaStep = "password";
 let clientListRevision = 0;
+const clientPreviewObserver = new ResizeObserver(() => {
+  const container = $("loginClients");
+  const heading = container.children[2]?.querySelector(".login-client-head strong");
+  if (!heading || !$("securityDialog").open) return;
+  // Keep the third title's first line halfway into the 24px bottom fade.
+  const box = heading.getBoundingClientRect();
+  const style = getComputedStyle(heading);
+  const center = box.top - container.getBoundingClientRect().top + container.scrollTop
+    + parseFloat(style.paddingTop) + parseFloat(style.lineHeight) / 2;
+  const height = `${Math.ceil(center + 12)}px`;
+  if (container.style.getPropertyValue("--clients-preview-height") !== height) {
+    container.style.setProperty("--clients-preview-height", height);
+  }
+});
 
 function securityMessage(text = "", type = "success", id = "securityMessage") {
   const node = $(id);
@@ -221,6 +239,8 @@ function recoveryRecentlyVerified() {
 function renderLoginClients() {
   const revision = ++clientListRevision;
   const container = $("loginClients");
+  clientPreviewObserver.disconnect();
+  container.style.removeProperty("--clients-preview-height");
   container.replaceChildren();
   const clients = securityState?.clients;
   if (!Array.isArray(clients) || !clients.length) {
@@ -233,7 +253,10 @@ function renderLoginClients() {
   const formatTime = (seconds) => {
     if (seconds == null) return "未知";
     const date = new Date(Number(seconds) * 1000);
-    return Number.isFinite(date.getTime()) ? date.toLocaleString("zh-CN", { hour12: false }) : "未知";
+    return Number.isFinite(date.getTime()) ? date.toLocaleString("zh-CN", {
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }) : "未知";
   };
   const locations = new Map();
   clients.forEach((client) => {
@@ -269,23 +292,19 @@ function renderLoginClients() {
     if (!locations.has(client.ip)) locations.set(client.ip, []);
     locations.get(client.ip).push(location);
     meta.appendChild(location);
-    [`登录：${formatTime(client.created_at)}`, `活动：${formatTime(client.last_seen)}`].forEach((text) => {
+    [["登录", client.created_at], ["活动", client.last_seen]].forEach(([label, seconds]) => {
       const span = document.createElement("span");
-      span.textContent = text;
+      span.className = "login-client-time";
+      span.textContent = `${label}：${formatTime(seconds)}`;
+      if (seconds != null && Number.isFinite(Number(seconds))) {
+        span.title = `${label}：${new Date(Number(seconds) * 1000).toLocaleString("zh-CN", { hour12: false })}`;
+      }
       meta.appendChild(span);
     });
     card.append(head, meta);
-    if (client.user_agent) {
-      const details = document.createElement("details");
-      const summary = document.createElement("summary");
-      summary.textContent = "浏览器详情";
-      const agent = document.createElement("p");
-      agent.textContent = client.user_agent;
-      details.append(summary, agent);
-      card.appendChild(details);
-    }
     container.appendChild(card);
   });
+  [...container.children].slice(0, 3).forEach(card => clientPreviewObserver.observe(card));
   // Location is optional enrichment: do not hold up settings or authentication.
   const queue = [...locations];
   async function locateNext() {
@@ -332,7 +351,7 @@ function renderSecurityState() {
   $("mfaStatus").textContent = securityState ? (enabled ? "已启用" : "未启用") : "正在读取";
   $("mfaStatus").classList.toggle("enabled", enabled);
   $("mfaSummary").textContent = enabled
-    ? `登录时验证动态验证码，剩余 ${securityState.recovery_remaining} 个恢复码。`
+    ? `密码登录时验证动态验证码，剩余 ${securityState.recovery_remaining} 个恢复码。`
     : "使用验证器生成动态验证码，为密码登录增加一层保护。";
   $("setupMfaBtn").hidden = enabled;
   $("recoveryMfaBtn").hidden = !enabled;
@@ -340,6 +359,11 @@ function renderSecurityState() {
   $("closeSecurityBtn").disabled = securityBusy;
   $("refreshClientsBtn").disabled = securityBusy || !securityState;
   $("savePasswordBtn").disabled = securityBusy || !securityState;
+  $("managePasskeysBtn").disabled = securityBusy || !securityState;
+  const passkeyCount = securityState?.passkeys?.length || 0;
+  $("passkeySummary").textContent = passkeyCount
+    ? `已添加 ${passkeyCount} 个，可使用设备验证快速登录。`
+    : "使用设备指纹、人脸或锁屏密码快速登录。";
   document.querySelectorAll("#securityDialog .security-actions button").forEach((button) => {
     button.disabled = securityBusy || !securityState;
   });
@@ -481,6 +505,223 @@ async function submitAccessPassword(code = "") {
     renderSecurityState();
   }
 }
+
+let passkeyAction = null;
+let passkeyMethod = "password";
+let passkeyOptions = null;
+let passkeyController = null;
+
+function renderPasskeys() {
+  const list = $("passkeyList");
+  list.replaceChildren();
+  const supported = window.TransPasskeys.supported();
+  const limit = securityState?.passkey_limit || 10;
+  const count = securityState?.passkeys?.length || 0;
+  $("addPasskeyBtn").disabled = securityBusy || !supported || count >= limit;
+  $("passkeysHint").textContent = supported
+    ? `已添加 ${count} / ${limit} 个，最多支持 ${limit} 个通行密钥。验证由设备完成。`
+    : `最多支持 ${limit} 个通行密钥。添加和使用需要 HTTPS 域名，以及支持的浏览器和设备锁屏。`;
+  const keys = securityState?.passkeys || [];
+  if (!keys.length) {
+    const empty = document.createElement("p");
+    empty.className = "security-hint";
+    empty.textContent = "尚未添加通行密钥";
+    list.appendChild(empty);
+  }
+  const formatTime = value => new Date(value * 1000).toLocaleString("zh-CN", { hour12: false });
+  keys.forEach(key => {
+    const item = document.createElement("div");
+    item.className = "passkey-item";
+    const detail = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = key.name;
+    const meta = document.createElement("small");
+    meta.textContent = `添加于 ${formatTime(key.created_at)}`;
+    const used = document.createElement("small");
+    used.textContent = key.last_used_at ? `最近使用 ${formatTime(key.last_used_at)}` : "尚未用于登录";
+    detail.append(name, meta, used);
+    const remove = document.createElement("button");
+    remove.className = "danger-btn passkey-delete";
+    remove.textContent = "删除";
+    remove.type = "button";
+    remove.disabled = securityBusy;
+    remove.addEventListener("click", () => openPasskeyAuth(key));
+    item.append(detail, remove);
+    list.appendChild(item);
+  });
+}
+
+function passkeyRecentlyVerified() {
+  return Number(securityState?.passkey_verified_until || 0) > Date.now() / 1000;
+}
+
+function renderPasskeyAuth() {
+  const deleting = Boolean(passkeyAction);
+  const verified = Boolean(passkeyOptions) || passkeyRecentlyVerified();
+  const choosing = !deleting && !verified && Boolean(securityState?.enabled);
+  if (!securityState?.enabled) passkeyMethod = "password";
+  $("passkeyAuthTitle").textContent = deleting ? "删除通行密钥" : verified ? "添加通行密钥" : "验证身份";
+  $("passkeyAuthHint").textContent = deleting
+    ? `确认删除“${passkeyAction.name}”？删除后不能再用它登录，已登录设备不受影响。`
+    : verified ? "身份验证 10 分钟内有效。填写名称后，按设备提示添加密钥。"
+      : choosing ? "密码或验证码任选一种，验证后 10 分钟内可添加通行密钥。"
+        : "请验证当前密码，验证后 10 分钟内可添加通行密钥。";
+  $("passkeyAuthMethods").hidden = !choosing;
+  $("passkeyAuthForm").hidden = deleting || verified;
+  $("passkeyNameForm").hidden = deleting || !verified;
+  $("confirmPasskeyBtn").setAttribute("form", !deleting && verified ? "passkeyNameForm" : "passkeyAuthForm");
+  for (const [id, method] of [["passkeyUsePasswordBtn", "password"], ["passkeyUseCodeBtn", "code"]]) {
+    $(id).setAttribute("aria-pressed", String(passkeyMethod === method));
+    $(id).disabled = securityBusy;
+  }
+  for (const [id, hidden] of [["passkeyNameField", deleting || !verified],
+    ["passkeyPasswordField", deleting || verified || passkeyMethod !== "password"],
+    ["passkeyCodeField", deleting || verified || passkeyMethod !== "code"]]) {
+    $(id).hidden = hidden;
+    const input = $(id).querySelector("input");
+    input.required = !hidden;
+    input.disabled = hidden || securityBusy;
+  }
+  $("confirmPasskeyBtn").textContent = securityBusy ? "正在处理…" : deleting
+    ? "确认删除" : verified ? (passkeyOptions ? "添加密钥" : "重试") : "验证并继续";
+  $("confirmPasskeyBtn").className = deleting ? "danger-btn" : "primary";
+  $("confirmPasskeyBtn").disabled = securityBusy;
+  $("closePasskeyAuthBtn").disabled = securityBusy;
+}
+
+async function preparePasskeyOptions() {
+  try {
+    passkeyOptions = await api("/api/security/passkeys/register/options", { method: "POST", body: "{}" });
+  } catch (error) {
+    if (error.code === "passkey_reauth_required") securityState.passkey_verified_until = 0;
+    throw error;
+  }
+}
+
+async function openPasskeyAuth(key = null) {
+  if (securityBusy || !$("passkeysDialog").open) return;
+  passkeyAction = key;
+  passkeyMethod = "password";
+  passkeyOptions = null;
+  $("passkeyAuthForm").reset();
+  $("passkeyNameForm").reset();
+  securityMessage("", "success", "passkeyAuthMessage");
+  renderPasskeyAuth();
+  $("passkeyAuthDialog").showModal();
+  $("passkeyAuthTitle").focus({ preventScroll: true });
+  if (!key && passkeyRecentlyVerified()) {
+    securityBusy = true;
+    renderPasskeyAuth();
+    try { await preparePasskeyOptions(); }
+    catch (error) { securityMessage(error.message, "error", "passkeyAuthMessage"); }
+    finally { securityBusy = false; renderPasskeyAuth(); }
+  }
+}
+
+$("managePasskeysBtn").addEventListener("click", () => {
+  if (securityBusy || !securityState) return;
+  securityMessage("", "success", "passkeysMessage");
+  renderPasskeys();
+  $("passkeysDialog").showModal();
+  $("passkeysDialogTitle").focus({ preventScroll: true });
+});
+$("closePasskeysBtn").addEventListener("click", () => $("passkeysDialog").close());
+$("addPasskeyBtn").addEventListener("click", () => openPasskeyAuth());
+$("closePasskeyAuthBtn").addEventListener("click", () => $("passkeyAuthDialog").close());
+$("passkeyAuthDialog").addEventListener("cancel", event => {
+  if (securityBusy) event.preventDefault();
+});
+$("passkeyAuthDialog").addEventListener("close", () => {
+  passkeyController?.abort();
+  passkeyOptions = null;
+  passkeyAction = null;
+  $("passkeyAuthForm").reset();
+  $("passkeyNameForm").reset();
+});
+for (const [id, method] of [["passkeyUsePasswordBtn", "password"], ["passkeyUseCodeBtn", "code"]]) {
+  $(id).addEventListener("click", () => {
+    if (securityBusy) return;
+    passkeyMethod = method;
+    $("passkeyPassword").value = "";
+    $("passkeyCode").value = "";
+    securityMessage("", "success", "passkeyAuthMessage");
+    renderPasskeyAuth();
+  });
+}
+async function submitPasskeyAction(event) {
+  event.preventDefault();
+  if (!securityBusy && !passkeyAction && (passkeyOptions || !$("passkeyNameField").hidden)
+      && !passkeyRecentlyVerified()) {
+    passkeyOptions = null;
+    renderPasskeyAuth();
+    securityMessage("身份验证已过期，请重新验证", "error", "passkeyAuthMessage");
+    return;
+  }
+  if (securityBusy || !event.currentTarget.reportValidity()) return;
+  const deleting = Boolean(passkeyAction);
+  securityBusy = true;
+  renderSecurityState();
+  renderPasskeyAuth();
+  securityMessage("", "success", "passkeyAuthMessage");
+  let creatingCredential = false;
+  try {
+    let data;
+    if (deleting) {
+      data = await api("/api/security/passkeys/delete", {
+        method: "POST", body: JSON.stringify({ id: passkeyAction.id }),
+      });
+    } else if (passkeyOptions) {
+      // Options are prepared before the click, preserving Safari's user gesture.
+      passkeyController = new AbortController();
+      creatingCredential = true;
+      const credential = await window.TransPasskeys.create(passkeyOptions, passkeyController.signal);
+      creatingCredential = false;
+      passkeyOptions = null;
+      data = await api("/api/security/passkeys/register/verify", {
+        method: "POST", body: JSON.stringify({ credential, name: $("passkeyName").value }),
+      });
+    } else {
+      if (!passkeyRecentlyVerified()) {
+        securityState = await api("/api/security/passkeys/reauthenticate", {
+          method: "POST", body: JSON.stringify({ method: passkeyMethod,
+            current_password: $("passkeyPassword").value, code: $("passkeyCode").value }),
+        });
+        $("passkeyPassword").value = "";
+        $("passkeyCode").value = "";
+      }
+      await preparePasskeyOptions();
+      $("passkeyAuthTitle").focus({ preventScroll: true });
+      return;
+    }
+    securityState = data;
+    $("passkeyAuthDialog").close();
+    securityMessage(deleting ? "通行密钥已删除" : "通行密钥已添加", "success", "passkeysMessage");
+  } catch (error) {
+    if (creatingCredential) {
+      // Best effort only: diagnostics must never block retries or include secrets.
+      void api("/api/security/passkeys/register/diagnostic", {
+        method: "POST", body: JSON.stringify({ error: error.name || "Error" }), timeout: 5000,
+      }).catch(() => {});
+    }
+    if (error.code === "passkey_reauth_required") {
+      securityState.passkey_verified_until = 0;
+      passkeyOptions = null;
+    }
+    securityMessage(window.TransPasskeys.message(error), "error", "passkeyAuthMessage");
+  } finally {
+    securityBusy = false;
+    passkeyController = null;
+    renderSecurityState();
+    renderPasskeyAuth();
+    renderPasskeys();
+  }
+}
+$("passkeyAuthForm").addEventListener("submit", submitPasskeyAction);
+$("passkeyNameForm").addEventListener("submit", submitPasskeyAction);
+window.TransUI.setupScrollFades($("passkeysDialog"), ".passkey-list");
+window.addEventListener("pagehide", () => passkeyController?.abort());
+
+window.TransUI.setupScrollFades($("securityDialog"), ".login-clients");
 
 $("settingsBtn").addEventListener("click", async () => {
   if ($("securityDialog").open) return;

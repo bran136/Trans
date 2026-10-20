@@ -73,6 +73,7 @@ const readerState = {
   actionConfirmParentPanel: null,
   offlineBookId: "",
   offlineBook: null,
+  offlineReturnTo: null,
   offlineStatus: null,
   offlineLocalStats: new Map(),
   offlineBusy: false,
@@ -85,6 +86,17 @@ const readerState = {
   deleteBookBusy: false,
   deleteBookFocus: null,
   deleteBookParentPanel: null,
+  audioStatistics: null,
+  localAudioStatistics: null,
+  statisticsController: null,
+  statisticsUpdatedAt: 0,
+  statisticsRepairLocal: false,
+  statisticsError: "",
+  localStatisticsError: "",
+  statisticsListeningBook: "",
+  statisticsRequests: new Set(),
+  statisticsEventSequence: 0,
+  statisticsClient: Math.random().toString(36).slice(2) + Date.now().toString(36),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -481,8 +493,9 @@ function localOfflinePackMetadata(record) {
   };
 }
 
-async function rebuildLocalOfflinePackMetadata(database, bookId, profileKey) {
-  const range = IDBKeyRange.only([bookId, profileKey]);
+async function rebuildLocalOfflinePackMetadata(database, bookId = "", profileKey = "") {
+  const range = bookId ? IDBKeyRange.only([bookId, profileKey]) : null;
+  const records = store => bookId ? store.index("bookProfile") : store;
   await new Promise((resolve, reject) => {
     const transaction = database.transaction(
       [TTS_OFFLINE_PACK_STORE, TTS_OFFLINE_PACK_META_STORE],
@@ -490,8 +503,7 @@ async function rebuildLocalOfflinePackMetadata(database, bookId, profileKey) {
     );
     const metadataStore = transaction.objectStore(TTS_OFFLINE_PACK_META_STORE);
     const copyPacks = () => {
-      const packRequest = transaction.objectStore(TTS_OFFLINE_PACK_STORE)
-        .index("bookProfile").openCursor(range);
+      const packRequest = records(transaction.objectStore(TTS_OFFLINE_PACK_STORE)).openCursor(range);
       packRequest.onsuccess = () => {
         const cursor = packRequest.result;
         if (!cursor) return;
@@ -500,7 +512,7 @@ async function rebuildLocalOfflinePackMetadata(database, bookId, profileKey) {
       };
       packRequest.onerror = () => reject(packRequest.error || new Error("重建本机缓存索引失败"));
     };
-    const metadataRequest = metadataStore.index("bookProfile").openCursor(range);
+    const metadataRequest = records(metadataStore).openCursor(range);
     metadataRequest.onsuccess = () => {
       const cursor = metadataRequest.result;
       if (!cursor) {
@@ -1156,6 +1168,15 @@ function filterLibraryBooks(books, inputId) {
 }
 $("shelfSearch").addEventListener("input", () => renderBookList($("bookList")));
 $("manageSearch").addEventListener("input", renderManageBooks);
+for (const [id, render] of [
+  ["shelfSearchForm", () => renderBookList($("bookList"))],
+  ["manageSearchForm", renderManageBooks],
+]) {
+  $(id).addEventListener("submit", event => {
+    event.preventDefault();
+    render();
+  });
+}
 
 function renderBookList(list) {
   list.innerHTML = "";
@@ -1182,21 +1203,293 @@ function renderBookList(list) {
   });
 }
 
+function statisticsBookAudio(book) {
+  const data = readerState.audioStatistics?.books?.[book.id];
+  return data && data.content_revision === (book.content_revision || "") ? data : null;
+}
+
+function audioCoverageLabel(value) {
+  return Number.isFinite(value) ? `${value}%` : "待统计";
+}
+
+function audioChapterLabel(group) {
+  if (!group) return "";
+  if (!Number.isFinite(group.complete_chapters)) return `涉及 ${group.chapters} 章`;
+  const partial = Math.max(0, group.chapters - group.complete_chapters);
+  return `完整 ${group.complete_chapters} 章${partial ? ` · 部分 ${partial} 章` : ""}`;
+}
+
+function statisticsAudioRow(label, group, fallback, temporary = false) {
+  const detail = group
+    ? `${temporary ? `涉及 ${group.chapters} 章` : audioChapterLabel(group)} · 覆盖 ${audioCoverageLabel(group.coverage_percent)}`
+    : fallback;
+  return `<span class="statistics-audio-row"><span class="statistics-audio-label"><span>${label}</span><strong>${group && group.size_known !== false ? escapeHtml(formatBytes(group.size_bytes)) : "—"}</strong></span><span class="statistics-audio-detail">${escapeHtml(group?.unknown ? `${group.size_known === false ? "索引待校准" : "覆盖率待核验"}，点击管理章节` : detail)}</span></span>`;
+}
+
+async function localAudioStatistics(server) {
+  const database = await openTtsOfflineDb();
+  const books = new Map(readerState.books.map(book => [book.id, {
+    size_bytes: 0, chapters: 0, complete_chapters: 0, coverage_percent: null,
+    content_revision: book.content_revision || "", size_known: true,
+    source: statisticsBookAudio(book), coverage: new Map(),
+    unknown: !statisticsBookAudio(book) || statisticsBookAudio(book).coverage_verified === false,
+  }]));
+  const metadataIds = new Set();
+  let packIds = [];
+  await new Promise((resolve, reject) => {
+    const transaction = database.transaction([TTS_OFFLINE_PACK_STORE, TTS_OFFLINE_PACK_META_STORE], "readonly");
+    const keys = transaction.objectStore(TTS_OFFLINE_PACK_STORE).getAllKeys();
+    keys.onsuccess = () => { packIds = keys.result; };
+    const request = transaction.objectStore(TTS_OFFLINE_PACK_META_STORE).openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      const record = cursor.value;
+      metadataIds.add(record.id);
+      const book = books.get(record.bookId);
+      const segments = record.segments;
+      if (book && Number(record.size) > 0 && Number(record.size) <= TTS_MAX_PACK_BYTES) {
+        book.size_bytes += Number(record.size);
+        const source = book.source;
+        const index = String(record.chapterIndex);
+        const expectedHash = source?.chapter_hashes?.[index];
+        const verified = source && (expectedHash ? expectedHash === record.chapterHash
+          : source.source_modified_at > 0 && Number(record.savedAt) >= source.source_modified_at * 1000);
+        if (record.profileKey === server.profile_key) {
+          const valid = verified && Number.isInteger(Number(record.chapterIndex))
+            && Number(record.chapterIndex) >= 0 && Number(record.chapterIndex) < source.chapter_count
+            && Number(record.schemaVersion) === TTS_PACK_SCHEMA_VERSION && record.format === "m4a"
+            && Number(record.duration) >= 5 && validPackSegments(segments)
+            && Number(record.sentenceCount) === segments.length
+            && Number.isInteger(Number(record.chapterSentenceCount))
+            && Number(record.chapterSentenceCount) >= segments.length
+            && (source.chapter_sentences?.[index] === undefined
+              || source.chapter_sentences[index] === Number(record.chapterSentenceCount))
+            && Math.abs(Number(segments[segments.length - 1].end) - Number(record.duration)) <= .15;
+          if (valid) {
+            let chapter = book.coverage.get(index);
+            if (!chapter) {
+              chapter = { hash: record.chapterHash, indexes: new Set(), total: Number(record.chapterSentenceCount) };
+              book.coverage.set(index, chapter);
+            }
+            if (chapter.hash !== record.chapterHash || chapter.total !== Number(record.chapterSentenceCount)) {
+              book.unknown = true;
+            }
+            segments.forEach(segment => chapter.indexes.add(Number(segment.index)));
+          } else {
+            book.unknown = true;
+          }
+        }
+      }
+      cursor.continue();
+    };
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error("读取本机缓存索引失败"));
+    transaction.onabort = transaction.onerror;
+  });
+  // Compare keys only, never read audio blobs or rebuild indexes from this dialog.
+  const actualIds = new Set(packIds);
+  if (packIds.length !== metadataIds.size || packIds.some(id => !metadataIds.has(id))) {
+    for (const id of new Set([...packIds, ...metadataIds])) {
+      if (actualIds.has(id) !== metadataIds.has(id)) {
+        const book = books.get(String(id).split(":")[0]);
+        if (book) { book.unknown = true; book.size_known = false; }
+      }
+    }
+  }
+  for (const book of books.values()) {
+    let covered = 0;
+    const counts = book.source?.chapter_sentences;
+    for (const [index, chapter] of book.coverage) {
+      const total = counts?.[index] ?? chapter.total;
+      if (!Number.isInteger(total) || total < chapter.indexes.size) book.unknown = true;
+      covered += chapter.indexes.size;
+      book.chapters += chapter.indexes.size > 0;
+      book.complete_chapters += total > 0 && chapter.indexes.size === total;
+    }
+    const total = book.source?.total_sentences;
+    if (!book.unknown && Number.isFinite(total) && total > 0 && covered <= total) {
+      book.coverage_percent = covered === total ? 100 : Math.min(99.9, Math.round(covered / total * 1000) / 10);
+    }
+    if (book.unknown) book.complete_chapters = null;
+    delete book.coverage;
+    delete book.source;
+  }
+  return books;
+}
+
+async function refreshAudioStatistics(recheck = false) {
+  readerState.statisticsController?.abort();
+  const controller = new AbortController();
+  readerState.statisticsController = controller;
+  if (recheck) readerState.statisticsRepairLocal = true;
+  const button = $("refreshStatisticsBtn");
+  button.disabled = true;
+  readerState.statisticsError = "";
+  readerState.localStatisticsError = "";
+  readerState.localAudioStatistics = null;
+  renderStatistics();
+  let localSnapshot = null;
+  const loadLocal = async (repair = false) => {
+    localSnapshot = readerState.audioStatistics?.updated_at;
+    try {
+      if (repair) {
+        // Explicit calibration rebuilds metadata from existing local records.
+        // Blob bytes are neither decoded nor uploaded; normal reads use indexes.
+        await rebuildLocalOfflinePackMetadata(await openTtsOfflineDb());
+        if (controller.signal.aborted) return;
+        readerState.statisticsRepairLocal = false;
+      }
+      const local = await localAudioStatistics(readerState.audioStatistics || {});
+      if (!controller.signal.aborted) {
+        readerState.localAudioStatistics = local;
+        readerState.localStatisticsError = "";
+      }
+    } catch (_) {
+      if (!controller.signal.aborted) readerState.localStatisticsError = "本机缓存读取失败";
+    }
+  };
+  try {
+    if (recheck) {
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try {
+        await api("/api/reader/audio-statistics/refresh", {
+          method: "POST", body: "{}", signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    // Poll the shared snapshot only while rebuilding; closing the dialog aborts the wait.
+    while (!controller.signal.aborted) {
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      const previousBooks = new Map(readerState.books.map(book => [book.id, book]));
+      let data, library;
+      try {
+        const previous = readerState.audioStatistics;
+        const query = previous?.ready ? `?${new URLSearchParams({
+          since: previous.updated_at, profile: previous.profile_key, chunk: previous.chunk_chars,
+        })}` : "";
+        [data, library] = await Promise.all([
+          api(`/api/reader/audio-statistics${query}`, { signal: controller.signal }),
+          api("/api/books", { signal: controller.signal }),
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
+      if (controller.signal.aborted) return;
+      readerState.audioStatistics = data.unchanged
+        ? { ...readerState.audioStatistics, refreshing: data.refreshing, progress_percent: data.progress_percent, error: data.error } : data;
+      readerState.statisticsError = data.error || "";
+      mergeStatisticsBooks(library.books || [], previousBooks);
+      const repairLocal = readerState.statisticsRepairLocal && !data.refreshing;
+      if (repairLocal || localSnapshot === null || localSnapshot !== readerState.audioStatistics?.updated_at) await loadLocal(repairLocal);
+      if (controller.signal.aborted) return;
+      if (data.ready && !data.error && !readerState.localStatisticsError) readerState.statisticsUpdatedAt = Date.now();
+      renderStatistics();
+      if (!data.refreshing) break;
+      await new Promise(resolve => {
+        const finish = () => { clearTimeout(timer); controller.signal.removeEventListener("abort", finish); resolve(); };
+        const timer = setTimeout(finish, 5000);
+        controller.signal.addEventListener("abort", finish, { once: true });
+      });
+      if (controller.signal.aborted) return;
+    }
+  } catch (error) {
+    controller.abort();
+    if (readerState.statisticsController === controller && $("statisticsDialog").open) {
+      readerState.statisticsError = error.name === "AbortError" ? "统计请求超时，请刷新重试" : "统计读取失败，请刷新重试";
+    }
+  } finally {
+    if (readerState.statisticsController === controller) {
+      button.disabled = false;
+      readerState.statisticsController = null;
+      if ($("statisticsDialog").open) renderStatistics();
+    }
+  }
+}
+
+function mergeStatisticsBooks(books, previousBooks) {
+  const current = new Map(readerState.books.map(book => [book.id, book]));
+  const pending = new Set([...readerState.progressRequests].map(key => key.split(":", 1)[0]));
+  readerState.books = books.map(book => {
+    const local = current.get(book.id);
+    // A shelf return may still be saving progress while this GET is in flight.
+    if (local && local.content_revision === book.content_revision
+        && (pending.has(book.id) || local !== previousBooks.get(book.id))) {
+      return { ...book, progress: local.progress, updated_at: local.updated_at, last_opened_at: local.last_opened_at };
+    }
+    return book;
+  });
+}
+
+async function notifyAudioStatistics(bookId, action) {
+  if (!bookId) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  const request = api(`/api/books/${bookId}/audio-statistics`, {
+    method: "POST", keepalive: true, signal: controller.signal,
+    body: JSON.stringify({ action, client: readerState.statisticsClient, sequence: ++readerState.statisticsEventSequence }),
+  });
+  readerState.statisticsRequests.add(request);
+  try {
+    await request;
+    if (action !== "playing" && $("statisticsDialog").open) refreshAudioStatistics();
+  } catch (_) {
+    // Statistics must never interrupt playback or a completed cache operation.
+  } finally {
+    clearTimeout(timeout);
+    readerState.statisticsRequests.delete(request);
+  }
+}
+
+function syncListeningStatistics() {
+  // All playback transitions use this hook, including media controls and natural
+  // completion. Visibility alone is not a stop: locked-screen listening continues.
+  const bookId = readerState.reading && !readerState.paused ? readerState.currentBookId : "";
+  const previous = readerState.statisticsListeningBook;
+  if (previous === bookId) return;
+  readerState.statisticsListeningBook = bookId;
+  if (previous) notifyAudioStatistics(previous, "stopped");
+  if (bookId) notifyAudioStatistics(bookId, "playing");
+}
+
+function refreshLocalAudioStatistics() {
+  readerState.localAudioStatistics = null;
+  if ($("statisticsDialog").open) refreshAudioStatistics();
+}
+
 function renderStatistics() {
   const summary = $("statisticsSummary");
   const list = $("statisticsList");
   if (!summary || !list) return;
   const books = recentlyOpenedBooks();
-  summary.textContent = books.length ? `共 ${books.length} 本 · 按正文位置统计；旧记录再次阅读后更新` : "书架中还没有书籍";
+  summary.textContent = `共 ${books.length} 本`;
+  const snapshot = readerState.audioStatistics;
+  const busy = !!readerState.statisticsController && !readerState.statisticsError && !readerState.localStatisticsError;
+  $("statisticsCacheStatusText").textContent = readerState.statisticsError || readerState.localStatisticsError
+    || (readerState.statisticsUpdatedAt ? `统计更新于 ${new Date(readerState.statisticsUpdatedAt).toLocaleTimeString("zh-CN", { hour12: false })}`
+      : busy ? "" : "缓存统计尚未就绪，请刷新");
+  $("statisticsCacheUpdating").hidden = !busy;
+  $("statisticsCacheUpdatingText").textContent = busy
+    ? snapshot?.refreshing
+      ? `后台更新中（${Number.isFinite(snapshot.progress_percent) ? snapshot.progress_percent : 0}%）`
+      : "正在读取统计…"
+    : "";
+  const scrollTop = list.scrollTop;
   list.innerHTML = "";
   books.forEach((book) => {
     const progressPercent = bookProgressPercent(book);
+    const audio = statisticsBookAudio(book);
+    const savedLocal = readerState.localAudioStatistics?.get(book.id);
+    const local = savedLocal?.content_revision === (book.content_revision || "") ? savedLocal : null;
+    const fallback = readerState.statisticsError ? "读取失败" : snapshot?.refreshing ? "统计中…" : "待更新";
     const item = document.createElement("article");
     item.className = "statistics-book";
     item.innerHTML = `
       <div class="statistics-book-head">
         <strong>${escapeHtml(book.title)}</strong>
-        <span>${!Number.isFinite(book.progress?.percent) && progressPercent ? "约 " : ""}${progressPercent}%</span>
+        <span>阅读 ${!Number.isFinite(book.progress?.percent) && progressPercent ? "约 " : ""}${progressPercent}%</span>
       </div>
       <div class="statistics-progress" role="progressbar" aria-label="${escapeAttribute(`${book.title} 阅读进度`)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progressPercent}">
         <i style="width: ${progressPercent}%"></i>
@@ -1205,9 +1498,19 @@ function renderStatistics() {
         <span>${escapeHtml(formatProgress(book))}</span>
         <span>最近打开 ${escapeHtml(formatBookLastOpened(book))}</span>
       </div>
+      <button class="statistics-audio" type="button" aria-label="${escapeAttribute(`管理《${book.title}》的音频缓存`)}">
+        <span class="statistics-audio-head"><span>音频缓存</span><span>服务器覆盖 ${audioCoverageLabel(audio?.coverage_percent)}</span></span>
+        ${statisticsAudioRow("临时缓存", audio?.temporary, fallback, true)}
+        ${statisticsAudioRow("服务器固定", audio?.fixed, fallback)}
+        ${statisticsAudioRow("本机下载", local, readerState.localStatisticsError || (readerState.statisticsController ? "读取中…" : "待刷新"))}
+      </button>
     `;
+    item.querySelector(".statistics-audio").addEventListener("click", () => {
+      openOfflineCacheManager(book, "statisticsDialog");
+    });
     list.appendChild(item);
   });
+  list.scrollTop = scrollTop;
 }
 
 function renderManageBooks() {
@@ -1236,7 +1539,7 @@ function renderManageBooks() {
         ${hasToc ? '<button type="button" data-action="toc-edit">目录</button>' : '<span class="manage-action-spacer"></span>'}
         <button type="button" data-action="edit">编辑</button>
         <button type="button" data-action="reparse" ${readerState.reparseBusy ? "disabled" : ""}>重新解析</button>
-        <button type="button" data-action="offline-cache">离线缓存</button>
+        <button type="button" data-action="offline-cache">听书缓存</button>
         <button type="button" data-action="delete">删除</button>
       </div>
     `;
@@ -2373,6 +2676,7 @@ function audioErrorMessage(audio) {
 }
 
 function updateListenButtons() {
+  syncListeningStatistics();
   const pauseButton = $("listenPauseBtn");
   pauseButton.classList.toggle("active", readerState.paused);
   pauseButton.textContent = readerState.paused ? "继续" : "暂停";
@@ -3671,15 +3975,19 @@ async function loadOfflineCacheStatus(bookId = readerState.offlineBookId) {
   return status;
 }
 
-async function openOfflineCacheManager(book) {
+async function openOfflineCacheManager(book, returnDialog = "manageDialog") {
   if (!book?.id) return;
+  readerState.offlineReturnTo = {
+    dialog: returnDialog,
+    scrollTop: returnDialog === "statisticsDialog" ? $("statisticsList").scrollTop : 0,
+  };
   readerState.offlineBookId = book.id;
   readerState.offlineBook = book;
   readerState.offlineStatus = null;
   $("offlineChapterList").innerHTML = "";
   $("offlineCacheSummary").textContent = "《" + book.title + "》 · 正在读取缓存状态";
   readerState.offlineLocalStats = new Map();
-  if ($("manageDialog").open) $("manageDialog").close();
+  if ($(returnDialog).open) $(returnDialog).close();
   openReaderDialog($("offlineCacheDialog"));
   setOfflineActiveJob(null);
   showOfflineCacheProgress("正在读取服务器和本机缓存状态");
@@ -3707,12 +4015,22 @@ async function openOfflineCacheManager(book) {
 }
 
 function closeOfflineCacheManager() {
-  setOfflineDownloadWakeLockWanted(false);
   $("offlineCacheDialog").close();
-  window.setTimeout(() => {
+}
+
+function restoreOfflineCacheParent() {
+  setOfflineDownloadWakeLockWanted(false);
+  const parent = readerState.offlineReturnTo;
+  readerState.offlineReturnTo = null;
+  if (!parent) return;
+  if (parent.dialog === "statisticsDialog") {
+    openReaderDialog($("statisticsDialog"));
+    refreshAudioStatistics();
+    $("statisticsList").scrollTop = parent.scrollTop;
+  } else {
     renderManageBooks();
     openReaderDialog($("manageDialog"));
-  }, 0);
+  }
 }
 
 function selectOfflineChapterRange(mode) {
@@ -4102,6 +4420,8 @@ async function createOfflineCache(downloadToDevice, requestedChapterIndexes = nu
     if (downloadToDevice) setOfflineDownloadWakeLockWanted(false);
     readerState.offlineCancelRequested = false;
     setOfflineCacheBusy(false);
+    refreshLocalAudioStatistics();
+    notifyAudioStatistics(bookId, "cache_changed");
   }
 }
 
@@ -4140,6 +4460,7 @@ async function deleteSelectedLocalOffline() {
     showOfflineCacheProgress(error.message, "error", bookId);
   } finally {
     setOfflineCacheBusy(false);
+    refreshLocalAudioStatistics();
   }
 }
 
@@ -4177,6 +4498,10 @@ async function unpinSelectedServerOffline() {
 function renderTtsCacheStats(stats = {}) {
   const node = $("ttsCacheStats");
   if (!node) return;
+  if (stats.ready === false) {
+    node.textContent = stats.refreshing ? "正在后台统计音频缓存…" : "缓存统计尚未就绪，请重新打开";
+    return;
+  }
   const entries = Number(stats.cache_entries ?? stats.entries ?? 0);
   const fixed = Number(stats.fixed_entries ?? stats.pinned_entries ?? 0);
   node.textContent = "缓存 " + entries + "句 · " + formatBytes(
@@ -4191,8 +4516,9 @@ function renderTtsCacheStats(stats = {}) {
 
 function scheduleTtsCacheStatsRetry(stats, attempt = 0) {
   window.clearTimeout(ttsCacheStatsRetryTimer);
-  if (!stats?.refreshing || attempt >= 6) return;
+  if (!stats?.refreshing || !$("ttsDialog").open || attempt >= 60) return;
   ttsCacheStatsRetryTimer = window.setTimeout(async () => {
+    if (!$("ttsDialog").open) return;
     try {
       const data = await api("/api/reader/tts-config");
       const latest = data.config?.cache_stats || {};
@@ -4202,7 +4528,7 @@ function scheduleTtsCacheStatsRetry(stats, attempt = 0) {
     } catch {
       // The regular config reload will retry later.
     }
-  }, 400);
+  }, 5000);
 }
 
 async function loadTtsConfig() {
@@ -4500,6 +4826,9 @@ document.querySelectorAll("[data-sleep-minutes]").forEach((button) => {
 $("fontInput").addEventListener("input", updateReaderFont);
 $("darkModeBtn").addEventListener("click", updateReaderTheme);
 $("saveTtsConfigBtn").addEventListener("click", () => saveTtsConfig());
+// This form isolates the API secret from unrelated search inputs. Save remains
+// an explicit button action; Enter must not navigate or submit the secret.
+$("ttsServiceConfigForm").addEventListener("submit", event => event.preventDefault());
 $("configureMimoCookieBtn")?.addEventListener("click", openMimoCookieDialog);
 $("saveMimoCookieBtn")?.addEventListener("click", () => saveMimoBalanceCookie());
 $("closeMimoCookieBtn")?.addEventListener("click", () => $("mimoCookieDialog").close());
@@ -4510,6 +4839,14 @@ $("shelfBtn").addEventListener("click", returnToShelf);
 $("statisticsBtn").addEventListener("click", () => {
   renderStatistics();
   openReaderDialog($("statisticsDialog"));
+  refreshAudioStatistics();
+});
+$("refreshStatisticsBtn").addEventListener("click", () => refreshAudioStatistics(true));
+$("statisticsDialog").addEventListener("close", () => {
+  if (!$("statisticsDialog").open) {
+    readerState.statisticsController?.abort();
+    renderBooks();
+  }
 });
 $("manageBtn").addEventListener("click", () => {
   renderManageBooks();
@@ -4554,9 +4891,7 @@ $("deleteLocalOfflineBtn")?.addEventListener("click", () => deleteSelectedLocalO
 $("unpinServerOfflineBtn")?.addEventListener("click", () => unpinSelectedServerOffline());
 $("closeTtsBtn").addEventListener("click", () => $("ttsDialog").close());
 $("closeSleepTimerBtn")?.addEventListener("click", () => $("sleepTimerDialog").close());
-$("offlineCacheDialog")?.addEventListener("close", () => {
-  setOfflineDownloadWakeLockWanted(false);
-});
+$("offlineCacheDialog")?.addEventListener("close", restoreOfflineCacheParent);
 window.addEventListener("resize", () => {
   resizeQuickVoiceSelect();
   resizeTtsStylePrompt();
@@ -4607,7 +4942,8 @@ window.addEventListener("popstate", (event) => {
   showShelfView();
 });
 window.addEventListener("pagehide", () => {
-  if (readerState.ttsStream) stopListening(false);
+  // Also stop preparation: the stream may not exist yet when the page is left.
+  stopListening(false);
   if (readerState.currentBookId) recordPlaybackEvent("pagehide");
   flushPendingProgress(true);
   readerState.wakeLockWanted = false;
@@ -4617,6 +4953,10 @@ window.addEventListener("pagehide", () => {
   window.clearTimeout(ttsCacheStatsRetryTimer);
 });
 document.querySelectorAll(".reader-dialog").forEach((dialog) => {
+  window.TransUI.setupScrollFades(dialog,
+    ".dialog-panel, .chapter-select-list, .book-search-results, .manage-book-list, "
+    + ".import-jobs, .statistics-list, .offline-chapter-list, .toc-edit-list, .toc-line-list"
+  );
   dialog.addEventListener("close", unlockReaderScroll);
   dialog.addEventListener("cancel", (event) => {
     if (dialog === readerState.actionConfirmParentDialog && readerState.actionConfirmResolve) {
@@ -4633,7 +4973,9 @@ document.querySelectorAll(".reader-dialog").forEach((dialog) => {
   });
 });
 $("logoutBtn").addEventListener("click", async () => {
-  await flushPendingProgress();
+  stopListening(false);
+  // The statistics endpoint needs this session; send before revoking it.
+  await Promise.allSettled([flushPendingProgress(), ...readerState.statisticsRequests]);
   readerState.wakeLockWanted = false;
   readerState.offlineDownloadWakeLockWanted = false;
   releaseReaderWakeLock();

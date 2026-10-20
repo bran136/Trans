@@ -135,29 +135,41 @@ function applyDetectedSource(detected) {
 function renderEngines() {
   const list = $("engineList");
   list.innerHTML = "";
+  const engineLinks = {
+    deepseek: "https://platform.deepseek.com/usage",
+    google: "https://translate.google.com",
+  };
   state.engines.filter((engine) => engine.enabled).forEach((engine) => {
-    const label = document.createElement("label");
-    label.className = "engine-chip";
+    const chip = document.createElement("div");
+    chip.className = "engine-chip";
     const input = document.createElement("input");
     input.type = "checkbox";
     input.value = engine.id;
+    input.setAttribute("aria-label", `使用 ${engine.name} 翻译`);
     input.checked = engine.id === "deepseek" || engine.id === "google";
     input.addEventListener("change", () => {
       renderEngineShells();
       scheduleTranslate(0);
     });
-    label.appendChild(input);
-    const name = document.createElement("span");
+    chip.appendChild(input);
+    const url = engineLinks[engine.id];
+    const name = document.createElement(url ? "a" : "span");
+    name.className = "engine-link";
+    if (url) {
+      name.href = url;
+      name.target = "_blank";
+      name.rel = "noopener noreferrer";
+    }
     name.textContent = engine.name;
-    label.appendChild(name);
     if (engine.id === "deepseek") {
       const balance = document.createElement("span");
       balance.className = "engine-balance";
       balance.id = "deepseekBalance";
       balance.textContent = formatDeepSeekBalance();
-      label.appendChild(balance);
+      name.appendChild(balance);
     }
-    list.appendChild(label);
+    chip.appendChild(name);
+    list.appendChild(chip);
   });
   if (!list.children.length) {
     list.innerHTML = '<span class="engine-empty">没有启用的翻译引擎</span>';
@@ -204,6 +216,7 @@ function renderConfig() {
   $("deepseekThinking").value = c.deepseek.thinking;
   $("deepseekReasoning").value = c.deepseek.reasoning_effort;
   $("deepseekTimeout").value = c.deepseek.timeout;
+  $("deepseekCacheLimit").value = c.deepseek.cache_limit ?? 5000;
   $("googleEnabled").checked = c.google.enabled;
   const googleEndpoints = c.google.endpoint_options || [];
   const endpointIsPreset = googleEndpoints.includes(c.google.endpoint);
@@ -940,6 +953,7 @@ async function translate() {
 }
 
 async function saveConfig() {
+  if (!$("deepseekCacheLimit").reportValidity()) return;
   const payload = {
     deepseek: {
       enabled: $("deepseekEnabled").checked,
@@ -953,6 +967,7 @@ async function saveConfig() {
       thinking: $("deepseekThinking").value,
       reasoning_effort: $("deepseekReasoning").value,
       timeout: Number($("deepseekTimeout").value),
+      cache_limit: Number($("deepseekCacheLimit").value),
     },
     google: {
       enabled: $("googleEnabled").checked,
@@ -966,6 +981,7 @@ async function saveConfig() {
     const data = await api("/api/config", { method: "PUT", body: JSON.stringify(payload) });
     state.config = data.config;
     await bootstrap();
+    await loadDeepSeekCacheStatus();
     setConfigMessage("配置已保存", "success");
     setStatus("配置已保存");
     scheduleTranslate(0);
@@ -1029,6 +1045,7 @@ $("swapBtn").addEventListener("click", () => {
   state.targetAutoMode = false;
   scheduleTranslate(0);
 });
+window.TransUI.setupScrollFades($("historyDialog"), ".history-list");
 $("historyBtn").addEventListener("click", () => $("historyDialog").showModal());
 $("closeHistoryBtn").addEventListener("click", () => $("historyDialog").close());
 document.addEventListener("visibilitychange", refreshBalanceWhenVisible);

@@ -17,7 +17,7 @@
       <section class="login-panel">
         <img class="brand-mark" src="{{ asset_url('site-icon.svg') }}" alt="" aria-hidden="true">
         <h1>Trans</h1>
-        <form method="post" class="login-form">
+        <form id="{{ 'otpLoginForm' if otp_step else 'passwordLoginForm' }}" method="post" class="login-form" autocomplete="{{ 'off' if otp_step else 'on' }}" data-otp-step="{{ 'true' if otp_step else 'false' }}" data-retry-after="{{ retry_after|default(0) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input type="hidden" name="target" value="home">
           {% if otp_step %}
@@ -26,19 +26,28 @@
           {% endif %}
           <div class="login-password-field">
             {% if otp_step %}
-            <input class="login-password" type="text" name="code" placeholder="验证码或恢复码" aria-label="验证码或恢复码" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="64" required>
+            <input id="loginCode" class="login-password" type="text" name="code" placeholder="验证码或恢复码" aria-label="验证码或恢复码" autocomplete="one-time-code" enterkeyhint="go" autocapitalize="off" spellcheck="false" maxlength="64" required>
             {% else %}
-            <input class="login-password" type="password" name="password" placeholder="访问密码" aria-label="访问密码" autocomplete="current-password" required>
+            <input id="loginPassword" class="login-password" type="password" name="password" placeholder="访问密码" aria-label="访问密码" autocomplete="current-password" enterkeyhint="go" required>
+            <button id="loginPasswordVisibility" class="login-password-visibility" type="button" aria-label="显示密码 3 秒" title="显示密码 3 秒" aria-pressed="false" aria-controls="loginPassword" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/><path class="password-eye-slash" d="m3 3 18 18"/></svg>
+            </button>
             {% endif %}
             <button class="login-submit" type="submit" aria-label="登录" title="登录">
               <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12h8m-4-4 4 4-4 4"/></svg>
+              <span class="login-spinner" aria-hidden="true"></span>
             </button>
           </div>
         </form>
-        {% if otp_step %}<a class="login-back" href="{{ url_for('login', back=1) }}">返回密码登录</a>{% endif %}
-        {% if error %}
-        <div class="form-error" role="alert">{{ error }}</div>
+        {% if passkeys_available and not otp_step %}
+        <button id="passkeyLoginBtn" class="passkey-login-btn" type="button" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="9" r="5"/><path d="m12 12 8 8m-3-3 3-3m-6 0 3-3"/></svg>
+          <span>使用通行密钥登录</span>
+        </button>
         {% endif %}
+        {% if otp_step %}<a class="login-back" href="{{ url_for('login', back=1) }}">返回密码登录</a>{% endif %}
+        <div id="loginError" class="form-error{% if error %} login-error-bounce{% endif %}" role="alert"{% if not error %} hidden{% endif %}>{{ error }}</div>
+        <p id="loginCountdown" class="login-countdown" aria-live="off" hidden></p>
       </section>
     </main>
     <footer class="login-footer">
@@ -51,5 +60,7 @@
       </div>
     </footer>
     <script src="{{ asset_url('ui.js') }}"></script>
+    <script src="{{ asset_url('passkeys.js') }}"></script>
+    <script src="{{ asset_url('login.js') }}"></script>
   </body>
 </html>

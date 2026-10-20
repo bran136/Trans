@@ -68,7 +68,8 @@
 .txt-editor-sidebar input, .txt-find-panel input, .reader-body .library-search { min-width: 0; border: 1px solid var(--line); border-radius: 9px; background: var(--control); color: var(--ink); padding: 9px 11px; font: 13px/1.5 system-ui, sans-serif; }
 .reader-body .library-search { display: block; width: 100%; height: 40px; min-height: 40px; max-height: 40px; flex: none; align-self: start; margin-bottom: 14px; }
 .reader-body .shelf-view { grid-template-rows: auto auto minmax(0, 1fr); }
-.reader-body .shelf-view > .library-search { margin-bottom: 0; }
+.reader-body .library-search-form { min-width:0; margin:0; flex:none; align-self:start; }
+.reader-body .shelf-view > .library-search-form .library-search { margin-bottom: 0; }
 .txt-editor-sidebar input { width: 100%; }
 @media (max-width: 760px) {
   .reader-body .library-search { font-size: var(--mobile-input-size, 13px); }

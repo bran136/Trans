@@ -97,7 +97,7 @@
           <h2 tabindex="-1" autofocus>服务配置</h2>
           <div id="configMessage" class="config-message" role="status" hidden></div>
           <div class="dialog-actions compact-actions">
-            <button class="ghost" value="cancel" type="submit">取消</button>
+            <button class="ghost" value="cancel" type="submit" formnovalidate>取消</button>
             <button class="ghost" id="saveConfigBtn" type="button">保存配置</button>
           </div>
         </div>
@@ -182,6 +182,10 @@
               <div class="cache-setting-inline">
                 <span>缓存 <strong id="deepseekCacheStats">正在读取</strong></span>
                 <button class="ghost" id="clearCacheBtn" type="button">清空</button>
+                <label class="cache-limit-control" for="deepseekCacheLimit">上限
+                  <input id="deepseekCacheLimit" type="number" min="1" max="100000" step="1" inputmode="numeric" required>
+                  条
+                </label>
               </div>
             </div>
           </section>

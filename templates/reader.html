@@ -40,7 +40,9 @@
               <span id="bookCount">0 本</span>
             </div>
           </div>
-          <input id="shelfSearch" class="library-search" type="search" placeholder="搜索书名或作者" aria-label="搜索书架" autocomplete="off">
+          <form id="shelfSearchForm" class="library-search-form" role="search" autocomplete="off">
+            <input id="shelfSearch" name="book_query" class="library-search" type="search" placeholder="搜索书名或作者" aria-label="搜索书架" autocomplete="off">
+          </form>
           <div id="bookList" class="book-list"></div>
         </section>
 
@@ -118,8 +120,12 @@
             </form>
           </section>
           <section>
-            <input id="manageSearch" class="library-search" type="search" placeholder="搜索书名或作者" aria-label="搜索管理中的书籍" autocomplete="off">
-            <div id="manageBookList" class="manage-book-list"></div>
+            <form id="manageSearchForm" class="library-search-form" role="search" autocomplete="off">
+              <input id="manageSearch" name="book_query" class="library-search" type="search" placeholder="搜索书名或作者" aria-label="搜索管理中的书籍" autocomplete="off">
+            </form>
+            <div class="manage-book-frame">
+              <div id="manageBookList" class="manage-book-list"></div>
+            </div>
           </section>
         </div>
       </section>
@@ -142,10 +148,21 @@
       <section class="dialog-panel">
         <div class="dialog-head">
           <h2>阅读统计</h2>
-          <button id="closeStatisticsBtn" type="button">关闭</button>
+          <div class="dialog-actions">
+            <button id="refreshStatisticsBtn" type="button" title="重新读取阅读进度，并在后台校准服务器及本机缓存统计">刷新</button>
+            <button id="closeStatisticsBtn" type="button">关闭</button>
+          </div>
         </div>
         <div id="statisticsSummary" class="statistics-summary"></div>
         <div id="statisticsList" class="statistics-list"></div>
+        <p id="statisticsCacheStatus" class="statistics-cache-note statistics-cache-status" role="status">
+          <span id="statisticsCacheStatusText"></span>
+          <span id="statisticsCacheUpdating" class="statistics-cache-updating" hidden>
+            <span class="statistics-spinner" aria-hidden="true"></span>
+            <span id="statisticsCacheUpdatingText"></span>
+          </span>
+        </p>
+        <p class="statistics-cache-note">覆盖率按句数统计；点击缓存明细可进入听书缓存页面。</p>
       </section>
     </dialog>
 
@@ -235,7 +252,7 @@
             <button id="closeTtsBtn" type="button">关闭</button>
           </div>
         </div>
-        <section class="tts-config-panel">
+        <form id="ttsServiceConfigForm" class="tts-config-panel" method="post" autocomplete="off">
           <div id="mimoBalancePanel" class="mimo-balance-panel" hidden>
             <div id="mimoBalance" class="mimo-balance"></div>
             <div class="mimo-balance-actions">
@@ -247,7 +264,7 @@
           <label class="setting-check"><input id="ttsEnabled" type="checkbox"> 启用 Xiaomi MiMo 听书</label>
           <div class="tts-settings-grid">
             <label class="tts-connection-field">API Key
-              <input id="ttsApiKey" type="password" autocomplete="off">
+              <input id="ttsApiKey" name="mimo_api_key" type="password" autocomplete="off">
             </label>
             <label class="tts-connection-field">接口地址
               <input id="ttsBaseUrl" type="url" disabled aria-disabled="true">
@@ -269,16 +286,16 @@
             <label class="setting-check"><input id="ttsCacheEnabled" type="checkbox"> 复用服务端单句缓存</label>
             <span id="ttsCacheStats" class="tts-cache-stats"></span>
           </div>
-        </section>
+        </form>
       </section>
     </dialog>
 
     <dialog id="offlineCacheDialog" class="reader-dialog offline-cache-dialog">
       <section class="dialog-panel">
         <div class="dialog-head">
-          <h2>离线听书缓存</h2>
+          <h2>听书缓存</h2>
           <div class="dialog-actions">
-            <button id="closeOfflineCacheBtn" type="button">返回管理</button>
+            <button id="closeOfflineCacheBtn" type="button">返回</button>
           </div>
         </div>
         <p id="offlineCacheSummary" class="offline-cache-summary">请选择一本书后管理离线音频。</p>
@@ -292,7 +309,9 @@
           <button id="retryOfflineJobBtn" class="offline-cache-retry" type="button" hidden>重试</button>
           <button id="cancelOfflineJobBtn" class="offline-cache-cancel" type="button" hidden>取消</button>
         </div>
-        <div id="offlineChapterList" class="offline-chapter-list"></div>
+        <div class="offline-chapter-frame">
+          <div id="offlineChapterList" class="offline-chapter-list"></div>
+        </div>
         <div class="offline-cache-actions">
           <button id="cacheServerOfflineBtn" type="button">服务器固定</button>
           <button id="cacheAndDownloadOfflineBtn" type="button">固定并下载到本地</button>

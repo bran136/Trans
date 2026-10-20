@@ -167,7 +167,44 @@
       heading.focus({ preventScroll: true });
     });
   }
+  function setupScrollFades(dialog, selector) {
+    const regions = [...dialog.querySelectorAll(selector)];
+    regions.forEach((region) => region.classList.add("scroll-fade"));
+    let frame = 0;
+    const update = () => {
+      frame = 0;
+      if (!dialog.open) return;
+      regions.forEach((region) => {
+        const overflow = region.clientHeight > 0 && region.scrollHeight - region.clientHeight > 2
+          && /^(auto|scroll)$/.test(getComputedStyle(region).overflowY);
+        region.classList.toggle("can-scroll-up", overflow && region.scrollTop > 2);
+        region.classList.toggle("can-scroll-down", overflow
+          && region.scrollHeight - region.clientHeight - region.scrollTop > 2);
+      });
+    };
+    const schedule = () => {
+      if (dialog.open && !frame) frame = window.requestAnimationFrame(update);
+    };
+    dialog.addEventListener("scroll", schedule, { capture: true, passive: true });
+    window.addEventListener("resize", schedule);
+    if ("ResizeObserver" in window) {
+      const observer = new ResizeObserver(schedule);
+      regions.forEach((region) => observer.observe(region));
+    }
+    // Includes opening, search results, cache progress and hidden sections.
+    // Exclude class mutations so updating the fade cannot trigger another update.
+    new MutationObserver(schedule).observe(dialog, {
+      childList: true, subtree: true, characterData: true,
+      attributes: true, attributeFilter: ["open", "hidden"],
+    });
+    dialog.addEventListener("close", () => {
+      window.cancelAnimationFrame(frame);
+      frame = 0;
+    });
+  }
+
   window.TransUI = {
+    setupScrollFades,
     prompt: (title, value) => showTextDialog(title, "", value),
     message: (title, message) => showTextDialog(title, message),
   };
