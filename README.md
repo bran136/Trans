@@ -39,131 +39,283 @@
 
 ## 快速开始
 
-建议使用 Linux 和 Python 3.11–3.13；这三个 Python 版本均纳入 GitHub Actions 自动检查。
+以下步骤适用于 **Ubuntu 24.04 / Debian 12、13 等使用 systemd 的 Linux 服务器**，需要可执行 `sudo` 的账户和 Python 3.11–3.13。直接使用当前登录用户运行，无需新建用户。示例安装到 `~/Trans`，也可选择其他有读写权限的目录；其他发行版请替换软件包安装命令。
 
-```bash
-git clone https://github.com/bran136/Trans.git
-cd Trans
-cp .env.example .env
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements.txt
-# 先编辑 .env，至少替换 APP_PASSWORD
-python3 app.py
-```
+这是全新安装流程。已有部署请保留原 `.env` 和运行数据，不要重新复制示例配置覆盖它们；切换启动方式前先停止旧进程，避免重复运行和端口冲突。
 
-`requirements.txt` 约束了 Flask、requests、pypdf、urllib3 和 idna 的安全最低版本。已有环境也应重新执行安装命令完成升级，不能只重启旧环境。
-
-使用 MiMo 听书时，服务端统一输出 AAC-LC/M4A（单声道、80 kbps），必须安装同时提供 `ffmpeg` 和 `ffprobe` 的 FFmpeg 软件包：
+### 1. 安装系统依赖（包含音频转换）
 
 ```bash
 sudo apt-get update
-sudo apt-get install --no-install-recommends -y ffmpeg
+sudo apt-get install --no-install-recommends -y git python3 python3-venv python3-pip ffmpeg curl nano ca-certificates
+python3 --version
 ffmpeg -version
 ffprobe -version
 ```
 
-正式版本见 [`VERSION`](VERSION)，更新记录见 [`CHANGELOG.md`](CHANGELOG.md)。页面版本附带八位构建指纹，前端资源变化后刷新即可更新指纹与资源地址。更新版本号或 Python 后端文件后需重启服务。
+确认 Python 版本在上述范围内，且 `ffmpeg`、`ffprobe` 均能输出版本信息。MiMo 听书依赖这两个程序将音频转换为 AAC-LC/M4A；应在首次启动前安装，不需要另外安装音频转换插件。
 
-默认地址：
+### 2. 下载项目并安装 Python 依赖
 
-```text
-http://127.0.0.1:31000
+```bash
+cd ~
+git clone https://github.com/bran136/Trans.git
+cd Trans
+python3 -m venv .venv
+.venv/bin/python -m pip install --no-cache-dir -r requirements.txt
+.venv/bin/python -m pip check
 ```
 
-默认只监听 `127.0.0.1`，端口由 `.env` 中的 `PORT` 控制。需要从其他机器直接访问时，可以把 `HOST` 改为 `0.0.0.0` 并使用强密码；更推荐继续监听本机，通过 HTTPS 反向代理访问。
+以下部署命令均在项目根目录（包含 `app.py` 的目录）执行。命令直接使用虚拟环境中的程序，**不需要 `source .venv/bin/activate`**。不要使用系统 Python 的 pip 安装项目依赖。
 
-主要入口：
+### 3. 配置访问密码
 
-```text
-/               主页
-/login          登录页
-/translate      在线翻译
-/translate/pdf  PDF 翻译（从在线翻译页进入）
-/reader         在线读书
+```bash
+cp .env.example .env
+chmod 600 .env
+nano .env
 ```
 
-## 目录
+在编辑器中修改以下项目，其余先保留示例值。`APP_PASSWORD` 必须换成自己的强密码（至少 12 位）；示例密码不能用于启动。
 
-以下路径均相对于项目根目录；运行数据首次使用时自动生成。
+```env
+APP_PASSWORD=请替换为自己的至少12位强密码
+HOST=127.0.0.1
+PORT=31000
+SESSION_COOKIE_SECURE=false
+```
+
+普通用户运行可将 `ALLOW_ROOT_RUN` 设为 `false`；如果当前用户是 root，保留示例中的 `true`。
+
+Nano 中按 `Ctrl+O`、回车保存，再按 `Ctrl+X` 退出。API Key 可以先留空，登录后在对应页面的“服务配置”中填写。`SECRET_KEY` 留空即可自动生成；无需手动创建数据目录。
+
+### 4. 选择一种启动方式
+
+三种方式任选其一，**推荐 systemd**：支持开机启动、异常退出后恢复和统一日志管理。
+
+<details>
+<summary>Flask 自带服务器与 Gunicorn 的区别</summary>
+
+Trans 负责翻译、阅读和听书；请求服务器负责接收浏览器请求，再交给 Trans。直接运行 `app.py` 使用 Flask 自带服务器，下面的 systemd 示例则使用 Gunicorn。systemd 负责守护进程，两种请求服务器都可以由它管理。
+
+- **日常使用**：只有一两台设备访问时，通常感觉不到明显区别，切换不会改变翻译、听书和缓存功能，也不保证翻译更快或播放更稳定。
+- **并发请求**：Flask 自带服务器通常为请求创建线程；本示例的 Gunicorn 使用 6 个请求线程，超过的请求等待处理，请求线程数量更可控，但不一定更快。
+- **进程恢复**：systemd 直接运行 `app.py` 时，进程崩溃后由 systemd 重启；使用 Gunicorn 时，它可以重新拉起工作进程，systemd 再守护 Gunicorn。两种方式下，崩溃时正在处理的请求都可能中断。
+
+长期运行推荐 Gunicorn，因为它用于正式提供网络服务；Flask 自带服务器主要用于开发调试，[Flask 官方不建议将其用于正式部署](https://flask.palletsprojects.com/en/stable/deploying/)，个人使用也适用这一建议。
+
+已有部署不必仅为与示例一致而立即切换。切换前应验证听书、后台任务和网页重启按钮，并核对监听地址与端口；不要将切换请求服务器当作播放故障的修复方法。
+
+</details>
+
+#### 方式一：systemd 系统服务（推荐）
+
+使用 Gunicorn 单个工作进程、多线程承载请求，由 systemd 管理。依赖已在第 2 步安装。下面的命令自动填写当前用户名和项目绝对路径，无需手动替换。
+
+```bash
+TRANS_DIR="$(pwd -P)"
+sudo tee /etc/systemd/system/trans.service > /dev/null <<EOF
+[Unit]
+Description=Trans translation and reading service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=$(id -un)
+WorkingDirectory=${TRANS_DIR}
+Environment=PYTHONUNBUFFERED=1
+Environment="PATH=${TRANS_DIR}/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart="${TRANS_DIR}/.venv/bin/python" -m gunicorn --workers 1 --threads 6 --bind 127.0.0.1:31000 app:app
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now trans
+sudo systemctl status trans --no-pager
+```
+
+状态应为 `active (running)`，接着按第 5 步验证网页。若启动失败，查看 `sudo journalctl -u trans -n 80 --no-pager`。
+
+- 改监听地址或端口：修改服务文件的 `--bind`，随后执行 `sudo systemctl daemon-reload` 和 `sudo systemctl restart trans`。Gunicorn 不读取 `.env` 中的 `HOST`、`PORT`，其他应用配置仍自动从 `.env` 读取，无需添加 `EnvironmentFile`。
+- 重启：`sudo systemctl restart trans`；停止：`sudo systemctl stop trans`；取消开机启动并停止：`sudo systemctl disable --now trans`。
+- 实时日志：`sudo journalctl -u trans -f`；应用日志同时保存到项目目录下的 `logs/app.log`。
+
+**保持 `--workers 1`，不要添加 `--preload`**。书籍导入、音频生成及部分任务状态在进程内管理，多 worker 会造成请求落到不同进程；线程用于处理并发请求。服务重启会中断本地正在运行的任务，已生成的缓存保留。
+
+#### 方式二：直接启动（调试用）
+
+```bash
+.venv/bin/python app.py
+```
+
+监听地址和端口取自 `.env`。日志直接显示在终端，按 `Ctrl+C` 停止；关闭终端后不能保证继续运行。这种方式使用 Flask 自带服务器，适合首次排查和临时调试。
+
+#### 方式三：nohup 后台启动（临时使用）
+
+```bash
+mkdir -p logs
+nohup .venv/bin/python app.py > logs/console.log 2>&1 < /dev/null &
+```
+
+监听地址和端口同样取自 `.env`。可关闭 SSH 终端，但不会开机自启，也不会自动恢复崩溃的进程；长期运行请使用 systemd。查看输出：
+
+```bash
+tail -f logs/console.log
+```
+
+停止时先用 `sudo ss -ltnp 'sport = :31000'` 查找监听进程，将其中的 PID 填入 `sudo kill <PID>`（更换过端口时一并调整）。重启需停止后重新运行启动命令；不要连续执行多次 nohup。网页“重启服务”可能更换 PID，应重新查询。
+
+### 5. 验证并访问网页
+
+在服务器执行：
+
+```bash
+curl -I http://127.0.0.1:31000/login
+```
+
+收到 `200 OK` 后，说明登录页可访问。地址中的 `127.0.0.1` 指当前机器；在自己电脑上直接打开它不会访问到远程服务器。
+
+首次验证可在**自己电脑的终端**建立 SSH 隧道（替换 SSH 用户和服务器地址，保留此终端）：
+
+```bash
+ssh -N -L 31000:127.0.0.1:31000 用户名@服务器地址
+```
+
+然后在电脑浏览器打开 `http://127.0.0.1:31000`，输入第 3 步的密码。若本机 31000 端口已占用，将 `-L` 后第一个端口改为 `31001`，浏览器也改用该端口。
+
+手机或公网长期访问请使用 **HTTPS 域名与反向代理**。同机 Nginx/Caddy 或面板的配置要点：
+
+| 项目 | 配置 |
+| --- | --- |
+| 域名与证书 | 将自己的域名指向服务器，为该域名启用有效的 HTTPS 证书 |
+| 代理目标 | `http://127.0.0.1:31000`；容器内的代理需使用实际能访问到 Trans 的地址 |
+| 请求头 | 保留原始 `Host`，正确追加 `X-Forwarded-For`，传递 `X-Forwarded-Proto` |
+| 上传与等待 | 按需要设置上传大小和响应超时，避免书籍/PDF 上传被代理提前拒绝或中断 |
+| `.env` | HTTPS 配好后设 `SESSION_COOKIE_SECURE=true`；`TRUSTED_PROXY_CIDRS` 填代理的实际地址，同机代理一般为 `127.0.0.1,::1` |
+
+修改配置后重启服务，再用 HTTPS 域名登录。Cloudflare 代理须使用 `Full (strict)`，并按[环境配置](#环境配置)补充可信代理网段。通行密钥应在固定的 HTTPS 域名下绑定和使用，无需额外设置域名变量。
+
+### 6. 配置所需功能
+
+- **在线翻译**：进入“服务配置”填写 DeepSeek API Key；谷歌翻译不需要该 Key，但服务器或浏览器需能访问谷歌接口。
+- **在线读书**：可直接导入 TXT/EPUB/PDF 阅读；听书需在设置中填写 MiMo API Key，系统 FFmpeg 已在第 1 步安装。
+- **PDF 翻译**：需另外部署可访问的 Zotero PDF2zh 服务，并在 PDF 页面配置其内网地址与 DeepSeek Key，详见 [PDF 翻译](#pdf-论文翻译)。未配置时不影响普通翻译和读书。
+
+主要入口为主页 `/`、在线翻译 `/translate`、PDF 翻译 `/translate/pdf`、在线读书 `/reader`。
+
+### 更新与排错
+
+按以上 systemd 示例部署后，进入实际项目目录再执行以下更新命令。更新前备份 `.env`、`config/`、`reader_data/` 和 `pdf_data/`；先结束正在运行的导入、听书等本地任务。
+
+```bash
+sudo systemctl stop trans
+git pull --ff-only
+.venv/bin/python -m pip install --no-cache-dir -r requirements.txt
+.venv/bin/python -m pip check
+sudo systemctl start trans
+sudo systemctl status trans --no-pager
+```
+
+每一步成功后再继续；若 Git 提示本地改动冲突，先处理自己的改动，不要强制覆盖。更新依赖不能只重启旧环境。直接启动或 nohup 部署则停止旧进程后执行相同的拉取、依赖安装步骤，再按原方式启动。
+
+| 现象 | 优先检查 |
+| --- | --- |
+| 启动失败或登录页报错 | `.env` 的密码是否已修改、运行用户是否有权读写项目目录；查看服务和应用日志 |
+| 端口已占用 | 旧的 Python、nohup 或系统服务是否仍在运行；三种方式不要同时启动 |
+| 本机可访问，域名无法访问 | 域名解析、证书、防火墙和反向代理目标；Docker 代理的 `127.0.0.1` 指容器自身 |
+| 登录后仍回到登录页 | 是否用 HTTP 访问却设置了 `SESSION_COOKIE_SECURE=true`，或代理未保留原始域名 |
+| 设备 IP 显示为代理 IP | `TRUSTED_PROXY_CIDRS` 和代理转发头是否匹配实际部署 |
+| 听书转码失败 | 服务运行环境能否找到 `ffmpeg`、`ffprobe`，磁盘是否有可用空间 |
+
+正式版本见 [`VERSION`](VERSION)，更新记录见 [`CHANGELOG.md`](CHANGELOG.md)。页面版本附带八位构建指纹；修改 Python 文件、版本号或服务器环境配置后，应从终端重启进程（systemd 使用 `systemctl restart trans`），确保重新读取环境。
+
+## 项目目录
+
+以下路径均相对于项目根目录。`.venv/` 在部署时创建，私有配置和运行数据在首次使用相应功能时生成。
 
 ```text
-app.py                            应用入口、在线翻译、阅读与听书
-reader_search.py                  书籍正文搜索与索引
-pdf_translation.py                PDF 翻译服务接入、任务与文件管理
-templates/                        页面模板
-static/                           页面样式、脚本、图标与字体
-scripts/migrate_wav_cache_to_m4a.py 旧音频缓存迁移工具
-VERSION / CHANGELOG.md            正式版本与更新记录
-requirements.txt / .env.example   依赖与环境配置示例
-.env                              访问密码、在线翻译与听书 API Key
+app.py                             应用入口、登录安全、在线翻译、阅读与听书
+reader_search.py                   书籍正文搜索与索引
+pdf_translation.py                 PDF 翻译服务接入、任务与文件管理
+templates/                         页面模板
+static/                            页面样式、脚本、图标、字体及前端依赖
+scripts/migrate_wav_cache_to_m4a.py  旧音频缓存迁移工具
+.github/workflows/ci.yml           自动检查流程
+VERSION / CHANGELOG.md             正式版本与更新记录
+requirements.txt / .env.example    Python 依赖与环境配置示例
+.venv/                             Python 虚拟环境
+.env                               访问密码、在线翻译与听书 API Key
 config/
-  service_config.example.json     服务接口配置示例
-  service_config.json             服务接口默认值和备选列表
-  app_config.json                 普通页面配置，不保存真实 API Key
-  secret_key                      自动生成的会话签名密钥
-  security.json                   双重验证、通行密钥公钥、登录设备及验证状态（私有）
-  deepseek_cache.sqlite3          文本翻译缓存
-  mimo_balance_state.json         MiMo 余额、过期状态及余额 Cookie
+  service_config.example.json      谷歌翻译接口配置示例
+  service_config.json              谷歌翻译接口默认值和备选列表
+  app_config.json                  页面保存的普通配置，不保存真实 API Key
+  secret_key                       自动生成的会话签名密钥
+  security.json                    2FA、通行密钥、登录设备及验证状态（私有）
+  deepseek_cache.sqlite3            文本翻译缓存
+  mimo_balance_state.json          MiMo 余额、过期状态及余额 Cookie
 reader_data/
-  books.json                      书架索引
-  books/                          原书、章节、进度、搜索索引及 TXT 备份
-  tts_cache/                      单句音频缓存
-  tts_pack_cache/                 播放包缓存
-  tts_offline.sqlite3             服务器固定音频记录
-  tts_pack_index.sqlite3          播放包归属索引
-  tts_cache_stats.json            音频缓存统计摘要
+  books.json                       书架索引
+  books/<书籍ID>/                  原书、章节、progress.json、搜索索引及 TXT 备份
+  tts_cache/                       单句音频缓存
+  tts_pack_cache/                  播放包缓存
+  tts_offline.sqlite3              服务器固定音频记录
+  tts_pack_index.sqlite3           播放包归属索引
+  tts_cache_stats.json             音频缓存统计摘要
 pdf_data/
-  config.json                    PDF 配置及独立 API Key（如已填写）
-  tasks.sqlite3                  PDF 任务记录
-  <任务ID>/                      各任务上传原文与翻译结果
-logs/app.log                      应用日志
+  config.json                      PDF 配置及独立 API Key（如已填写）
+  tasks.sqlite3                    PDF 任务记录
+  <任务ID>/                        各任务上传原文与翻译结果
+logs/app.log                       应用日志（自动轮转）
 ```
 
-`.env`、实际配置、书籍、PDF 文件、缓存和日志等私有运行数据已加入 `.gitignore`。迁移或备份时应一并保护这些文件，不要提交到公开仓库。
+`.env`、实际配置、书籍、PDF 文件、缓存和日志等私有运行数据已加入 `.gitignore`。迁移或备份时应一并保护这些文件，不要提交到公开仓库。系统服务文件位于 `/etc/systemd/system/trans.service`，不在项目目录内；nohup 示例另有 `logs/console.log`，该文件不会自动轮转。
 
 ## 环境配置
 
-`.env.example` 中包含完整示例：
+完整示例见 [`.env.example`](.env.example)。程序自动读取项目根目录的 `.env`，无需在 shell 中 `source` 它。首次部署只需设置访问密码；API Key 及常用参数可在登录后的服务配置中填写。
 
-```env
-PORT=31000
-HOST=127.0.0.1
-APP_PASSWORD=replace-with-a-strong-password
-SECRET_KEY=
-SESSION_COOKIE_SECURE=false
-TRUSTED_PROXY_CIDRS=
-ALLOW_ROOT_RUN=true
+### 站点与登录
 
-DEEPSEEK_API_KEY=
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
-ALLOW_CUSTOM_DEEPSEEK_BASE_URL=false
+| 配置项 | 用途 |
+| --- | --- |
+| `APP_PASSWORD` | 共享访问密码，必须使用至少 12 位的非默认强密码 |
+| `HOST` / `PORT` | `python app.py` 的监听地址和端口，示例为 `127.0.0.1:31000`；Gunicorn 使用启动命令的 `--bind` |
+| `SECRET_KEY` | 会话签名密钥；留空自动生成到 `config/secret_key`（权限 `0600`），自行填写时至少 32 位随机值 |
+| `SESSION_COOKIE_SECURE` | 示例为 `false`；启用 HTTPS 后设为 `true`，普通 HTTP 调试时应为 `false` |
+| `TRUSTED_PROXY_CIDRS` | 可信代理 IP 或网段，逗号分隔；默认留空，不信任转发头 |
+| `ALLOW_ROOT_RUN` | 是否允许 root 运行；示例为 `true`，普通用户可设为 `false`，root 用户需保留 `true` |
 
-MIMO_API_KEY=
-MIMO_TTS_BASE_URL=https://api.xiaomimimo.com/v1/chat/completions
-MIMO_BALANCE_URL=https://platform.xiaomimimo.com/api/v1/balance
-MIMO_TTS_MODEL=mimo-v2.5-tts
-MIMO_TTS_VOICE=冰糖
-MIMO_TTS_STYLE_PROMPT=适合小说听书，自然清晰地朗读，情绪丰富一点。
-ALLOW_CUSTOM_MIMO_BASE_URL=false
-TTS_CACHE_LIMIT_MB=8192
-TTS_CACHE_TTL_DAYS=90
-```
+使用反向代理时，`TRUSTED_PROXY_CIDRS` 只填写实际代理地址。同机 Nginx 通常为 `127.0.0.1,::1`；Docker 代理填写实际容器 IP，或仅含可信代理的专用网段。不要填写 `0.0.0.0/0`、`::/0` 等任意来源。
 
-说明：
+如果还有 Cloudflare，需加入其[官方代理网段](https://www.cloudflare.com/ips/)，并由反向代理正确追加 `X-Forwarded-For`；代理地址变化时同步调整。该项优先读取 `.env`，文件中未设置时才读取进程环境变量；留空可关闭信任。
 
-- `.env` 是真实运行配置，可以放真实密码和 API Key。
-- `.env.example` 是示例文件，不应放真实密钥。
-- `APP_PASSWORD` 至少使用 12 位非默认密码；程序会拒绝用示例密码或常见弱密码提供服务。
-- `SECRET_KEY` 留空时会自动生成到 `config/secret_key`，文件权限为 `0600`；也可以自己填写至少 32 位随机值。
-- `HOST` 控制服务监听地址：`127.0.0.1` 仅允许本机访问；`0.0.0.0` 会监听所有网络接口，只有确实需要从其他机器直连时才应使用。
-- 在线翻译和听书的 API Key 保存到 `.env`；PDF 独立配置的 Key 保存到 `pdf_data/config.json`。前端仅显示配置状态，留空保存不会覆盖原 Key。
-- 如果只通过 HTTPS 域名访问，建议设置 `SESSION_COOKIE_SECURE=true`。
-- 如果直接用 `http://服务器IP:31000` 调试，`SESSION_COOKIE_SECURE=true` 会导致浏览器不发送登录 Cookie。
-- 使用反向代理时，将 `TRUSTED_PROXY_CIDRS` 设置为代理的实际 IP 或网段，多个值用逗号分隔，才能正确识别客户端 IP；默认不信任转发头，不要填入公网任意来源。
-- 如果前面还有 Cloudflare，需同时加入其[官方代理网段](https://www.cloudflare.com/ips/)，并由反向代理正确追加 `X-Forwarded-For`；代理地址变化时同步更新配置。
-- `TRUSTED_PROXY_CIDRS` 优先读取 `.env` 中的配置，文件中不存在该项时使用进程环境变量；修改后重启生效，留空可关闭对转发头的信任。
+2FA、恢复码和通行密钥在主页“设置”中管理，不需要额外环境变量。通行密钥绑定当前访问域名，换域名后需重新添加；迁移时应保留 `config/secret_key` 和 `config/security.json`。
+
+### 翻译与听书
+
+| 配置项 | 用途 |
+| --- | --- |
+| `DEEPSEEK_API_KEY` | DeepSeek API Key，可在在线翻译的服务配置中填写 |
+| `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | 文本翻译的 API 地址与初始模型，示例使用官方接口 |
+| `ALLOW_CUSTOM_DEEPSEEK_BASE_URL` | 默认 `false`；自定义文本翻译网关需显式开启，详见下文 |
+| `MIMO_API_KEY` | MiMo API Key，可在听书设置中填写 |
+| `MIMO_TTS_BASE_URL` / `MIMO_BALANCE_URL` | MiMo 语音与余额接口，示例使用官方地址 |
+| `MIMO_TTS_MODEL` / `MIMO_TTS_VOICE` | 初始听书模型与音色，示例为 `mimo-v2.5-tts`、冰糖 |
+| `MIMO_TTS_STYLE_PROMPT` | 初始朗读风格提示词 |
+| `ALLOW_CUSTOM_MIMO_BASE_URL` | 默认 `false`；自定义 MiMo 网关需显式开启 |
+| `TTS_CACHE_LIMIT_MB` | 单句临时音频缓存上限，范围 10–8192 MB，示例 8192 MB |
+| `TTS_CACHE_TTL_DAYS` | 临时音频保留天数，范围 1–365，示例 90 天 |
+
+表中“示例”指复制 `.env.example` 后的配置；删除缓存配置项时，程序的兜底值为 80 MB、7 天。服务器固定音频不按临时缓存规则清理，播放包另有缓存管理，详见[听书缓存](#听书缓存)。
+
+在线翻译和听书的 API Key 保存到 `.env`；PDF 的独立 Key、上游地址与论文参数保存在 `pdf_data/config.json`，在 PDF 页面配置，不需要另写环境变量。前端仅显示密钥配置状态，留空保存不会覆盖原 Key。
+
+`.env` 每行使用 `键=值`，说明注释放在单独一行；需要引号时可用成对的单引号或双引号。不要把真实密码或 Key 写入 `.env.example`。除上述可信代理项外，启动时同名进程环境变量优先于 `.env`；避免在系统服务中重复设置这些应用变量。手动修改 `.env` 后从终端重启服务；页面内保存配置按页面提示生效。
 
 ## 在线翻译
 
@@ -181,6 +333,7 @@ TTS_CACHE_TTL_DAYS=90
 - 哪个翻译引擎先返回，哪个结果先显示，不等待最慢的引擎。
 - 默认展开前两个翻译结果。
 - 每个结果卡片支持折叠、展开和一键复制。
+- 原文与成功翻译的结果显示语言对应的统计：中文按字数，英文按词数。
 - 点击翻译结果中的句子会高亮对应原文，句数无法精确对应时退回高亮对应段落。
 - 折叠状态会在当前页面会话中保持，刷新后恢复默认。
 - 本地浏览器历史记录默认保留 100 条。
@@ -559,19 +712,11 @@ tail -f logs/app.log
 
 如果通过公网访问本工具，必须在 Nginx、Caddy 或 Cloudflare 上配置 HTTPS，并设置 `SESSION_COOKIE_SECURE=true`。使用 Cloudflare 时应选择 `Full (strict)`，避免 Cloudflare 到源站之间退回明文 HTTP。浏览器请求里的密码不是客户端哈希值，而是由 HTTPS 连接加密传输；服务端 `.env` 仍属于必须保护的敏感文件。
 
-示例配置为了兼容当前部署，设置了 `ALLOW_ROOT_RUN=true`，因此允许服务由 root 启动。如果删除该配置或改为 `false`，程序会拒绝以 root 启动或处理请求。这个开关只是显式解除保护，并不能降低 root 服务被利用后的系统风险；公开部署仍建议使用单独低权限用户，并交给 systemd、gunicorn 或类似进程管理器管理。
+服务使用现有账户即可，该账户需能读写项目目录。root 运行需设置 `ALLOW_ROOT_RUN=true`；普通用户无需开启此项。
 
-如果之前曾用 root 运行，切换用户前要把 `.env`、`config/`、`logs/`、`reader_data/` 和 `pdf_data/` 的所有权交给新的服务用户；不要把整个系统目录开放成可写。例如服务用户叫 `trans` 时，可按实际存在的路径执行 `chown -R trans:trans ...`。书籍、缓存、配置和日志会使用尽量收紧的目录/文件权限。
+三种启动方式与完整命令见[快速开始](#快速开始)。管理页面的“重启服务”沿用当前启动方式：直接启动或 nohup 创建新 PID 的替代进程；systemd 直接托管 Python 时原地重载；Gunicorn 替换 worker、保留主进程。Gunicorn 预加载或 Flask 调试自动重载模式需从进程管理器重启。
 
-生产环境示例（仍只监听本机，由 Nginx/Caddy 提供 HTTPS）：
-
-导入任务和离线听书任务保存在进程内存中，因此应使用单个 Gunicorn worker，不启用 `--preload`；可以通过线程处理并发网页请求。关闭或刷新浏览器不会中断导入和离线生成任务，在线播放会话则随退出停止；服务、容器或 Gunicorn 工作进程重启会中断正在运行的任务。已经生成的缓存会保留，重新提交后可以继续复用。
-
-```bash
-gunicorn --workers 1 --threads 6 --bind 127.0.0.1:31000 app:app
-```
-
-也可以直接运行 `python3 app.py`，但这是 Flask 自带服务器，适合开发或单机临时使用。管理页面的“重启服务”会沿用当前启动方式：直接启动或 nohup 启动时创建新 PID 的替代进程，保留启动参数和日志输出；systemd 托管时保留 PID 并重新加载程序；Gunicorn 模式保留主进程、替换 worker。Gunicorn 预加载或 Flask 调试自动重载模式需从启动终端或进程管理器重启。重启会中断当前请求，包括尚未完成的 PDF 上传；已被上游接收的 PDF 任务继续由独立服务处理，Trans 恢复后核对其状态，不会自动重复提交。
+重启会中断当前请求，包括尚未完成的 PDF 上传；已被上游接收的 PDF 任务继续由独立服务处理，Trans 恢复后核对状态，不会自动重复提交。
 
 ## 开发检查
 

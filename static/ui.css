@@ -717,6 +717,21 @@ html:not(.keyboard-navigation) .home-body :is(button, a):focus { outline: none; 
 @media (max-width: 760px) {
   :root { --mobile-control-size: 13px; --mobile-dialog-title-size: 17px; }
 
+  /* A transparent desktop scrollbar still takes space in mobile previews.
+     Hide only page-level bars; nested lists keep their scrolling indicators. */
+  html:has(> :is(.app-body, .reader-body, .home-body, .login-body)),
+  :is(.app-body, .reader-body, .home-body, .login-body) { scrollbar-width:none; }
+  html:has(> :is(.app-body, .reader-body, .home-body, .login-body))::-webkit-scrollbar,
+  :is(.app-body, .reader-body, .home-body, .login-body)::-webkit-scrollbar { width:0; height:0; }
+
+  html:has(> :is(.app-body, .reader-body)),
+  :is(.app-body, .reader-body) { overflow-x:clip; overscroll-behavior-x:none; }
+  .app-body .app-shell, .reader-body .reader-shell { min-width:0; max-width:100%; }
+  .app-body :is(.workspace, .translator, .panes, .input-pane, .result-pane, .results),
+  .reader-body :is(.shelf-view, .reading-view) { min-width:0; }
+  .app-body :is(#sourceText, .results) { overflow-x:hidden; }
+  .reader-body .reader-paragraph { overflow-wrap:anywhere; }
+
   :is(.app-body, .reader-body, .home-body) .dialog-head h2,
   .ui-text-panel h2,
   .action-confirm-panel h2,
@@ -1023,9 +1038,9 @@ html.translation-settings-open .app-body {
 .app-body #settingsDialog .google-settings-grid { grid-template-columns: minmax(0, 1fr) 112px; }
 .app-body #settingsDialog .google-settings-grid > label:nth-child(n) { grid-column: auto; }
 .app-body #settingsDialog .settings-group-footer { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
-.app-body #settingsDialog .cache-setting-inline { display: flex; justify-content: flex-start; gap: 8px; border: 0; padding: 0; }
+.app-body #settingsDialog .cache-setting-inline { display: flex; flex-wrap:nowrap; justify-content: flex-start; gap: 8px; border: 0; padding: 0; }
 .app-body #settingsDialog .cache-setting-inline span,
-.app-body #settingsDialog .cache-setting-inline strong { white-space: normal; font-size:14px; }
+.app-body #settingsDialog .cache-setting-inline strong { white-space: nowrap; font-size:14px; }
 .app-body #settingsDialog #clearCacheBtn { height:32px; min-height:32px; padding:0 10px; font-size:14px; }
 .app-body #settingsDialog .cache-limit-control { display:flex; align-items:center; gap:6px; padding-left:10px; border-left:1px solid var(--line); white-space:nowrap; font-size:14px; font-weight:400; }
 .app-body #settingsDialog .cache-limit-control input { width:90px; min-width:0; height:32px; min-height:32px; padding:4px 8px; font-size:14px; }
@@ -1050,11 +1065,14 @@ html.translation-settings-open .app-body {
   .app-body #settingsDialog .google-settings-grid { grid-template-columns: minmax(0, 1fr) 82px; }
   .app-body #settingsDialog .google-settings-grid > label:nth-child(n) { grid-column: auto; }
   .app-body #settingsDialog .settings-group-footer { margin-top: 9px; padding-top: 8px; }
-  .app-body #settingsDialog .cache-setting-inline { flex-wrap:wrap; }
+  .app-body #settingsDialog .cache-setting-inline { gap:4px; }
   .app-body #settingsDialog .cache-setting-inline :is(span, strong),
   .app-body #settingsDialog #clearCacheBtn,
-  .app-body #settingsDialog .cache-limit-control { font-size:var(--mobile-control-size,13px); }
-  .app-body #settingsDialog .cache-limit-control input { font-size:var(--mobile-input-size,13px); }
+  .app-body #settingsDialog .cache-limit-control { font-size:12px; }
+  .app-body #settingsDialog #clearCacheBtn { padding-inline:6px; }
+  .app-body #settingsDialog .cache-limit-control { min-width:0; gap:3px; padding-left:5px; }
+  .app-body #settingsDialog .cache-limit-control input { width:74px; padding-inline:4px; font-size:var(--mobile-input-size,13px); appearance:textfield; }
+  .app-body #settingsDialog .cache-limit-control input::-webkit-inner-spin-button { -webkit-appearance:none; margin:0; }
 }
 
 @media (max-width: 360px) {

@@ -256,10 +256,11 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
 #securityDialog .security-form { margin-top:8px; gap:10px; }
 #securityDialog .login-clients { min-height:0; max-height:var(--clients-preview-height, 236px); margin-top:8px; gap:6px; grid-auto-rows:max-content; align-content:start; overflow-y:auto; overscroll-behavior-y:contain; scrollbar-gutter:stable; -webkit-overflow-scrolling:touch; }
 #securityDialog .login-client { padding:9px 10px; }
-.login-client-location { flex-basis:100%; color:var(--ink); }
+.login-client-location { flex-basis:100%; min-width:0; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink); }
+#securityDialog .login-clients { overflow-x:hidden; }
 @media (max-width:560px) {
   #securityDialog .login-clients { max-height:var(--clients-preview-height, 282px); }
-  #securityDialog .login-client-meta { display:grid; grid-template-columns:max-content max-content; justify-content:space-between; column-gap:6px; }
+  #securityDialog .login-client-meta { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); justify-content:space-between; column-gap:6px; }
   #securityDialog .login-client-location { grid-column:1 / -1; min-width:0; }
   #securityDialog .login-client-time { font-size:11px; white-space:nowrap; font-variant-numeric:tabular-nums; }
 }

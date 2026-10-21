@@ -103,3 +103,13 @@
 .txt-change-row { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 6px; }
 .txt-editor-body .txt-change-row .txt-change { flex: 1; min-width: 0; margin-bottom: 0; }
 .txt-editor-body .txt-change-undo { flex: none; padding: 8px 10px; font-size: 12px; }
+/* Keep the management header and import controls fixed within the viewport. */
+.reader-body #manageDialog { height:min(86vh,720px); height:min(86dvh,720px); }
+.reader-body #manageDialog > .dialog-panel { display:flex; flex-direction:column; height:100%; max-height:none; overflow:hidden; }
+.reader-body #manageDialog > .dialog-panel > .dialog-head { flex-shrink:0; }
+.reader-body #manageDialog .manage-layout { flex:1; min-height:0; grid-template-rows:auto minmax(0,1fr); }
+.reader-body #manageDialog .import-jobs { max-height:min(12vh,80px); max-height:min(12dvh,80px); }
+.reader-body #manageDialog .manage-library { display:flex; flex-direction:column; min-width:0; min-height:0; }
+.reader-body #manageDialog .library-search-form { flex-shrink:0; align-self:stretch; }
+.reader-body #manageDialog .manage-book-frame { flex:1; min-height:0; }
+.reader-body #manageDialog .manage-book-list { height:100%; max-height:none; align-content:start; overflow-x:hidden; overscroll-behavior-y:contain; }

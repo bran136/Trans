@@ -99,7 +99,7 @@ function sourceForRequest() {
 }
 
 function syncTargetForSource(sourceCode) {
-  if (!state.targetAutoMode) return;
+  if (!state.targetAutoMode && normalizeDetectedLang($("targetLang").value) !== normalizeDetectedLang(sourceCode)) return;
   const target = sourceCode === "zh" ? "en" : "zh";
   if (sourceCode && sourceCode !== "auto" && $("targetLang").value !== target) {
     $("targetLang").value = target;
@@ -129,6 +129,7 @@ function applyDetectedSource(detected) {
   if ([...source.options].some((option) => option.value === detected)) {
     source.value = detected;
     syncTargetForSource(detected);
+    updateCharCount();
   }
 }
 
@@ -272,8 +273,7 @@ function clearConfigMessage() {
 
 function renderDeepSeekCacheStatus(cache = {}) {
   const entries = Number(cache.entries || 0);
-  const limit = Number(cache.limit || 0);
-  $("deepseekCacheStats").textContent = `${entries} / ${limit} 条`;
+  $("deepseekCacheStats").textContent = `${entries} 条`;
 }
 
 async function loadDeepSeekCacheStatus() {
@@ -563,6 +563,12 @@ function fillResultCard(card, result, index) {
   header.className = "result-head";
   header.appendChild(createResultTitle(result.name));
   if (result.ok) {
+    if (result.text?.trim()) {
+      const count = document.createElement("span");
+      count.className = "result-count";
+      count.textContent = textCountLabel(result.text, result.target || $("targetLang").value);
+      header.appendChild(count);
+    }
     header.appendChild(createCopyButton(result.text));
   } else if (result.ok === false) {
     header.appendChild(createRetryButton(result.engine, index));
@@ -658,6 +664,7 @@ async function retryTranslationEngine(engineId, index, button) {
       name: engineName(engineId),
       ok: true,
       text: translated.text,
+      target,
       detectedSource: translated.detectedSource,
     };
   } catch (error) {
@@ -867,12 +874,19 @@ function renderHistory() {
   });
 }
 
+function textCountLabel(text, language) {
+  const code = normalizeDetectedLang(language === "auto" ? guessSourceLang(text) : language);
+  if (!code || ["zh", "ja", "ko"].includes(code)) {
+    return `${(text.match(/[\p{L}\p{N}]/gu) || []).length} 字`;
+  }
+  return `${(text.match(/[\p{L}\p{N}][\p{L}\p{M}\p{N}]*(?:['’\-][\p{L}\p{N}][\p{L}\p{M}\p{N}]*)*/gu) || []).length} 词`;
+}
+
 function updateCharCount() {
-  $("charCount").textContent = `${$("sourceText").value.length} 字符`;
+  $("charCount").textContent = textCountLabel($("sourceText").value, sourceForRequest());
 }
 
 function handleSourceInput() {
-  updateCharCount();
   state.activeSentence = null;
   applyVisualSentenceHighlight(null, null);
   if (!$("sourceText").value.trim()) {
@@ -880,7 +894,10 @@ function handleSourceInput() {
     state.targetAutoMode = true;
     $("sourceLang").value = "auto";
     $("targetLang").value = "zh";
+  } else if (state.sourceAutoMode) {
+    applyDetectedSource(guessSourceLang($("sourceText").value));
   }
+  updateCharCount();
   scheduleTranslate();
 }
 
@@ -928,6 +945,7 @@ async function translate() {
           name: engineName(engineId),
           ok: true,
           text: translated.text,
+          target,
           detectedSource: translated.detectedSource,
         };
       } catch (error) {
@@ -1011,16 +1029,19 @@ $("sourceText").addEventListener("focus", () => $("sourceHighlight").replaceChil
 new ResizeObserver(syncSourceHighlight).observe($("sourceText"));
 $("sourceLang").addEventListener("change", () => {
   state.sourceAutoMode = $("sourceLang").value === "auto";
+  state.targetAutoMode = true;
   if (state.sourceAutoMode) {
-    state.targetAutoMode = true;
     $("targetLang").value = "zh";
+    applyDetectedSource(guessSourceLang($("sourceText").value));
   }
   syncTargetForSource($("sourceLang").value);
+  updateCharCount();
   scheduleTranslate(0);
 });
-$("targetLang").addEventListener("change", () => scheduleTranslate(0));
 $("targetLang").addEventListener("change", () => {
   state.targetAutoMode = false;
+  syncTargetForSource($("sourceLang").value);
+  scheduleTranslate(0);
 });
 $("googleEndpointPreset").addEventListener("change", () => {
   const endpoint = $("googleEndpointPreset").value;
@@ -1043,6 +1064,7 @@ $("swapBtn").addEventListener("click", () => {
   $("targetLang").value = source;
   state.sourceAutoMode = false;
   state.targetAutoMode = false;
+  updateCharCount();
   scheduleTranslate(0);
 });
 window.TransUI.setupScrollFades($("historyDialog"), ".history-list");

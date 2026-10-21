@@ -165,8 +165,26 @@ async function restartService() {
   }
 }
 
+let homeScrollPosition = null;
+function lockHomeScroll() {
+  if (homeScrollPosition) return;
+  homeScrollPosition = { x: window.scrollX, y: window.scrollY };
+  document.body.style.setProperty("--about-scroll-top", `${-homeScrollPosition.y}px`);
+  document.documentElement.classList.add("home-about-open");
+}
+function unlockHomeScroll() {
+  if (!homeScrollPosition || document.querySelector("dialog[open]")) return;
+  const { x, y } = homeScrollPosition;
+  homeScrollPosition = null;
+  document.documentElement.classList.remove("home-about-open");
+  document.body.style.removeProperty("--about-scroll-top");
+  window.scrollTo({ left: x, top: y, behavior: "instant" });
+}
+document.addEventListener("close", unlockHomeScroll, true);
+
 $("monitorBtn").addEventListener("click", () => {
   clearMonitorMessage();
+  lockHomeScroll();
   $("monitorDialog").showModal();
   startMonitorRefresh();
 });
@@ -189,31 +207,24 @@ $("logoutBtn").addEventListener("click", async () => {
   }
 });
 
-let aboutScrollY = 0;
 $("aboutBtn").addEventListener("click", () => {
-  aboutScrollY = window.scrollY;
-  document.body.style.setProperty("--about-scroll-top", `${-aboutScrollY}px`);
-  document.documentElement.classList.add("home-about-open");
+  lockHomeScroll();
   $("homeAboutDialog").showModal();
   $("homeAboutTitle").focus({ preventScroll: true });
 });
 $("closeAboutBtn").addEventListener("click", () => $("homeAboutDialog").close());
-$("homeAboutDialog").addEventListener("close", () => {
-  document.documentElement.classList.remove("home-about-open");
-  document.body.style.removeProperty("--about-scroll-top");
-  window.scrollTo(0, aboutScrollY);
-});
 
 let securityState = null;
 let securityBusy = false;
-let securityScrollY = 0;
 let mfaAction = "setup";
 let mfaStep = "password";
 let clientListRevision = 0;
 const clientPreviewObserver = new ResizeObserver(() => {
   const container = $("loginClients");
+  if (!$("securityDialog").open) return;
+  container.querySelectorAll(".login-client-location").forEach(fitClientLocation);
   const heading = container.children[2]?.querySelector(".login-client-head strong");
-  if (!heading || !$("securityDialog").open) return;
+  if (!heading) return;
   // Keep the third title's first line halfway into the 24px bottom fade.
   const box = heading.getBoundingClientRect();
   const style = getComputedStyle(heading);
@@ -224,6 +235,15 @@ const clientPreviewObserver = new ResizeObserver(() => {
     container.style.setProperty("--clients-preview-height", height);
   }
 });
+
+function fitClientLocation(node) {
+  node.title = node.textContent;
+  node.style.fontSize = "";
+  if (node.clientWidth && node.scrollWidth > node.clientWidth) {
+    const size = parseFloat(getComputedStyle(node).fontSize);
+    node.style.fontSize = `${Math.max(6, Math.floor(size * node.clientWidth / node.scrollWidth * 10) / 10)}px`;
+  }
+}
 
 function securityMessage(text = "", type = "success", id = "securityMessage") {
   const node = $(id);
@@ -305,6 +325,7 @@ function renderLoginClients() {
     container.appendChild(card);
   });
   [...container.children].slice(0, 3).forEach(card => clientPreviewObserver.observe(card));
+  clientPreviewObserver.observe(container);
   // Location is optional enrichment: do not hold up settings or authentication.
   const queue = [...locations];
   async function locateNext() {
@@ -316,7 +337,10 @@ function renderLoginClients() {
         if (typeof data.location === "string" && data.location) label = data.location;
       } catch (_) { /* A failed lookup must leave the IP and other controls usable. */ }
       if (revision !== clientListRevision || !$("securityDialog").open) return;
-      nodes.forEach((node) => { node.textContent = `${label}（${ip}）`; });
+      nodes.forEach((node) => {
+        node.textContent = `${label}（${ip}）`;
+        fitClientLocation(node);
+      });
     }
   }
   locateNext();
@@ -725,9 +749,7 @@ window.TransUI.setupScrollFades($("securityDialog"), ".login-clients");
 
 $("settingsBtn").addEventListener("click", async () => {
   if ($("securityDialog").open) return;
-  securityScrollY = window.scrollY;
-  document.body.style.setProperty("--about-scroll-top", `${-securityScrollY}px`);
-  document.documentElement.classList.add("home-about-open");
+  lockHomeScroll();
   securityState = null;
   securityBusy = true;
   securityMessage();
@@ -772,9 +794,6 @@ $("securityDialog").addEventListener("close", () => {
   clientListRevision += 1;
   $("passwordForm").reset();
   clearMfaDialog();
-  document.documentElement.classList.remove("home-about-open");
-  document.body.style.removeProperty("--about-scroll-top");
-  window.scrollTo(0, securityScrollY);
 });
 $("closeMfaBtn").addEventListener("click", () => {
   if (!securityBusy) $("mfaDialog").close();

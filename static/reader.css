@@ -77,7 +77,7 @@ a,
 .reader-shell {
   display: flex;
   flex-direction: column;
-  width: calc(100vw - clamp(16px, 2vw, 32px));
+  width: calc(100% - clamp(16px, 2vw, 32px));
   height: 100dvh;
   margin: 0 auto;
   padding: max(8px, env(safe-area-inset-top)) 0 max(48px, env(safe-area-inset-bottom));
@@ -2100,7 +2100,7 @@ body > .action-confirm-overlay {
   }
 
   .reader-shell {
-    width: min(100vw - 12px, 1500px);
+    width: calc(100% - 16px);
     height: auto;
     min-height: 100dvh;
     padding: max(8px, env(safe-area-inset-top)) 0 max(10px, env(safe-area-inset-bottom));
