@@ -34,6 +34,79 @@
     && /Version\/[\d.]+.*Safari\//.test(browserAgent)
     && !/(?:CriOS|FxiOS|EdgiOS|OPiOS|DuckDuckGo|GSA)\//.test(browserAgent);
   document.documentElement.classList.toggle("iphone-safari", isIPhoneSafari);
+  const isAndroid = /Android/.test(browserAgent);
+  document.documentElement.classList.toggle("android-browser", isAndroid);
+  if (isAndroid) {
+    // Let modern Chrome paint behind the gesture bar. Keep Safari's existing
+    // viewport policy; page layouts already reserve the bottom safe area.
+    const viewport = document.querySelector('meta[name="viewport"]');
+    if (viewport && !/viewport-fit\s*=/.test(viewport.content)) {
+      viewport.content += ", viewport-fit=cover";
+    }
+  }
+
+  // Safari samples viewport edges; Chrome also samples the document canvas
+  // for its bottom bar. Match the modal backdrop and restore the page theme.
+  // Observe state changes only, never scroll/playback.
+  if (isIPhoneSafari || isAndroid) {
+    const themeMeta = document.querySelector('meta[name="theme-color"]');
+    const needsEdges = isIPhoneSafari && document.body.matches(".reader-body, .app-body");
+    let modalOrder = [...document.querySelectorAll("dialog:modal")];
+    const addEdges = (host) => {
+      if (host.querySelector(":scope > .browser-edge-tint")) return;
+      for (const edge of ["top", "bottom"]) {
+        const tint = document.createElement("span");
+        tint.className = `browser-edge-tint browser-edge-tint-${edge}`;
+        tint.setAttribute("aria-hidden", "true");
+        host.appendChild(tint);
+      }
+    };
+    // All theme/backdrop colors in our styles resolve to rgb()/rgba().
+    const channels = (color) => color.match(/[\d.]+/g)?.map(Number);
+    const syncBrowserBars = () => {
+      const base = channels(getComputedStyle(document.body).backgroundColor);
+      if (!base || base.length < 3) return;
+      let color = base.slice(0, 3);
+      modalOrder = modalOrder.filter((dialog) => dialog.isConnected && dialog.matches(":modal"));
+      for (const dialog of modalOrder) {
+        const shade = channels(getComputedStyle(dialog, "::backdrop").backgroundColor);
+        if (shade && shade.length >= 3) {
+          const alpha = shade[3] ?? 1;
+          color = color.map((value, i) => shade[i] * alpha + value * (1 - alpha));
+        }
+        if (needsEdges) {
+          addEdges(dialog);
+          dialog.style.setProperty("--browser-edge-color", `rgb(${color.map(Math.round).join(", ")})`);
+        }
+      }
+      // Keep the page theme and document canvas in sync, including installed apps.
+      const tint = `#${color.map((value) => Math.round(value).toString(16).padStart(2, "0")).join("")}`;
+      if (themeMeta && themeMeta.content !== tint) themeMeta.content = tint;
+      if (isAndroid) {
+        document.documentElement.style.setProperty("--browser-canvas-color", tint);
+      }
+    };
+    if (needsEdges) addEdges(document.body);
+    // open mutations preserve showModal() order, including nested dialogs and
+    // dynamically created text prompts. Ordinary content changes are ignored.
+    new MutationObserver((records) => {
+      for (const { target } of records) {
+        if (!(target instanceof HTMLDialogElement)) continue;
+        modalOrder = modalOrder.filter((dialog) => dialog !== target);
+        if (target.matches(":modal")) modalOrder.push(target);
+      }
+      syncBrowserBars();
+    }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ["open"] });
+    const themeObserver = new MutationObserver(syncBrowserBars);
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    themeObserver.observe(document.body, { attributes: true, attributeFilter: ["class"] });
+    // Reader settings can restore theme-color without changing a theme class.
+    if (isAndroid && themeMeta) {
+      themeObserver.observe(themeMeta, { attributes: true, attributeFilter: ["content"] });
+    }
+    window.addEventListener("pageshow", syncBrowserBars);
+    syncBrowserBars();
+  }
 
   // Show keyboard focus only after keyboard navigation, not dialog auto-focus.
   document.addEventListener("keydown", (event) => {
@@ -167,13 +240,14 @@
       heading.focus({ preventScroll: true });
     });
   }
-  function setupScrollFades(dialog, selector) {
-    const regions = [...dialog.querySelectorAll(selector)];
+  function setupScrollFades(container, selector) {
+    const regions = [...container.querySelectorAll(selector)];
+    const isActive = () => !container.hidden && (container.tagName !== "DIALOG" || container.open);
     regions.forEach((region) => region.classList.add("scroll-fade"));
     let frame = 0;
     const update = () => {
       frame = 0;
-      if (!dialog.open) return;
+      if (!isActive()) return;
       regions.forEach((region) => {
         const overflow = region.clientHeight > 0 && region.scrollHeight - region.clientHeight > 2
           && /^(auto|scroll)$/.test(getComputedStyle(region).overflowY);
@@ -183,9 +257,9 @@
       });
     };
     const schedule = () => {
-      if (dialog.open && !frame) frame = window.requestAnimationFrame(update);
+      if (isActive() && !frame) frame = window.requestAnimationFrame(update);
     };
-    dialog.addEventListener("scroll", schedule, { capture: true, passive: true });
+    container.addEventListener("scroll", schedule, { capture: true, passive: true });
     window.addEventListener("resize", schedule);
     if ("ResizeObserver" in window) {
       const observer = new ResizeObserver(schedule);
@@ -193,14 +267,15 @@
     }
     // Includes opening, search results, cache progress and hidden sections.
     // Exclude class mutations so updating the fade cannot trigger another update.
-    new MutationObserver(schedule).observe(dialog, {
+    new MutationObserver(schedule).observe(container, {
       childList: true, subtree: true, characterData: true,
       attributes: true, attributeFilter: ["open", "hidden"],
     });
-    dialog.addEventListener("close", () => {
+    container.addEventListener("close", () => {
       window.cancelAnimationFrame(frame);
       frame = 0;
     });
+    schedule();
   }
 
   window.TransUI = {

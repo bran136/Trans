@@ -1,3 +1,7 @@
+/* Reader page layout and presentation. Load after theme.css and ui.css.
+   Keep page components and their mobile/night variants here; shared controls
+   and Safari browser tint compatibility belong to ui.css. */
+
 html {
   background: var(--bg);
 }
@@ -95,27 +99,15 @@ a,
 .reader-topbar h1 {
   margin: 0;
   display: inline-block;
-  color: var(--ink);
-  font-family: "ReaderYShiWritten", "Microsoft YaHei", "微软雅黑", sans-serif;
-  font-size: clamp(24px, 3vw, 36px);
-  font-weight: 700;
-  letter-spacing: 0;
-  text-shadow: 0 2px 0 rgba(var(--surface-rgb), 0.94), 0 12px 28px rgba(var(--accent-rgb), 0.24);
 }
 
 .reader-topbar h1::after {
   content: "";
-  display: block;
   width: 74%;
   height: 4px;
   margin-top: 2px;
   border-radius: 999px;
   background: var(--accent);
-}
-
-.reader-dark .reader-topbar h1 {
-  color: var(--ink);
-  text-shadow: 0 12px 28px rgba(var(--accent-rgb), 0.28);
 }
 
 .reader-topbar span {
@@ -142,10 +134,8 @@ a,
   min-height: 34px;
   padding: 0 14px;
   border: 1px solid var(--line);
-  border-radius: 12px;
   background: rgba(var(--surface-rgb), 0.78);
   color: var(--ink);
-  font-weight: 600;
   text-decoration: none;
 }
 
@@ -153,7 +143,6 @@ a,
 .reader-actions button {
   min-height: 30px;
   padding: 0 12px;
-  border-radius: 11px;
 }
 
 .reader-stage {
@@ -182,9 +171,11 @@ a,
 
 .shelf-view {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 12px;
   padding: 16px;
+  /* The bookshelf is opaque; it does not need a backdrop blur layer. */
+  backdrop-filter: none;
 }
 
 .shelf-head {
@@ -196,7 +187,6 @@ a,
 
 .shelf-head h2 {
   margin: 0;
-  font-size: clamp(22px, 2.3vw, 30px);
 }
 
 .shelf-head span,
@@ -242,8 +232,6 @@ a,
 .upload-drop:hover,
 .upload-drop.loading {
   transform: translateY(-1px);
-  border-color: rgba(var(--accent-rgb), 0.78);
-  box-shadow: 0 12px 24px rgba(var(--accent-rgb), 0.12);
 }
 
 .upload-drop strong {
@@ -283,6 +271,7 @@ a,
   0% {
     transform: translateX(-110%);
   }
+
   100% {
     transform: translateX(250%);
   }
@@ -397,21 +386,13 @@ a,
   width: 100%;
   padding: 16px;
   border: 1px solid var(--line);
-  border-radius: 15px;
-  background: var(--control);
   color: var(--ink);
   text-align: left;
   transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
-  background:
-    linear-gradient(180deg, rgba(var(--surface-rgb), 0.2) 0%, var(--panel) 48%),
-    radial-gradient(circle at 20% 8%, rgba(var(--accent-rgb), 0.13), transparent 34%);
 }
 
 .reader-dark .book-item {
   border-color: var(--line);
-  background:
-    linear-gradient(180deg, rgba(var(--surface-rgb), 0.7) 0%, var(--panel) 54%),
-    radial-gradient(circle at 20% 8%, rgba(var(--accent-rgb), 0.18), transparent 34%);
   color: var(--ink);
 }
 
@@ -419,7 +400,6 @@ a,
   display: none;
   position: absolute;
   inset: 0 0 72px;
-  border-radius: 14px 14px 0 0;
   background-position: center;
   background-size: cover;
 }
@@ -428,21 +408,11 @@ a,
   content: "";
   position: absolute;
   inset: 0;
-  background: linear-gradient(180deg, transparent 55%, rgba(var(--surface-rgb), 0.92));
-}
-
-.reader-dark .book-cover::after {
-  background: linear-gradient(180deg, transparent 50%, rgba(var(--surface-rgb), 0.94));
 }
 
 .book-item:hover {
   transform: translateY(-2px);
   border-color: rgba(var(--accent-rgb), 0.38);
-}
-
-.book-item.active {
-  border-color: rgba(var(--accent-rgb), 0.72);
-  box-shadow: inset 4px 0 0 var(--accent), 0 10px 24px rgba(var(--accent-rgb), 0.12);
 }
 
 .book-item strong,
@@ -764,11 +734,9 @@ a,
 
 .chapter-select-btn,
 .listen-toolbar select {
-  background-image:
-    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
     linear-gradient(135deg, var(--muted) 50%, transparent 50%);
-  background-position:
-    calc(100% - 12px) calc(50% - 1px),
+  background-position: calc(100% - 12px) calc(50% - 1px),
     calc(100% - 8px) calc(50% - 1px);
   background-size: 4px 4px, 4px 4px;
   background-repeat: no-repeat;
@@ -852,7 +820,6 @@ a,
   padding: 0;
   overflow: hidden;
   background: var(--panel);
-  box-shadow: var(--shadow);
 }
 
 .manage-dialog {
@@ -870,7 +837,13 @@ a,
 .statistics-dialog {
   width: min(620px, calc(100vw - 24px));
 }
-.statistics-dialog .dialog-head .dialog-actions { display:flex; flex-direction:row; gap:6px; flex-shrink:0; }
+
+.statistics-dialog .dialog-head .dialog-actions {
+  display: flex;
+  flex-direction: row;
+  gap: 6px;
+  flex-shrink: 0;
+}
 
 .book-metadata-dialog {
   width: min(520px, calc(100vw - 24px));
@@ -908,16 +881,12 @@ a,
   box-shadow: var(--shadow);
 }
 
-.reader-dark .dialog-panel {
-  border-color: rgba(var(--neutral-rgb), 0.2);
-  background: rgba(var(--surface-rgb), 0.96);
-}
-
 .dialog-panel:focus {
   outline: none;
 }
 
 /* Keep the dialog surface intact when its scrolling contents fade. */
+
 .reader-body .reader-dialog > .dialog-panel {
   border: 0;
   background: transparent;
@@ -1047,8 +1016,17 @@ a,
   font-weight: 600;
 }
 
-.statistics-dialog .dialog-panel { display:flex; flex-direction:column; gap:10px; overflow:hidden; }
-.statistics-dialog .dialog-panel > :not(.statistics-list) { flex-shrink:0; }
+.statistics-dialog .dialog-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+}
+
+.statistics-dialog .dialog-panel > :not(.statistics-list) {
+  flex-shrink: 0;
+}
+
 .statistics-list {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -1124,7 +1102,11 @@ a,
   font-size: 11px;
   font-weight: 600;
 }
-.statistics-book-meta > span { min-width:0; overflow-wrap:anywhere; }
+
+.statistics-book-meta > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 
 .reader-body .statistics-audio {
   display: grid;
@@ -1140,34 +1122,110 @@ a,
   font-size: 12px;
   font-weight: 400;
 }
-.statistics-audio-head { display:flex; justify-content:space-between; gap:8px; padding-bottom:6px; border-bottom:1px solid var(--line); font-weight:600; }
-.statistics-audio-head > span:last-child { color:var(--accent-strong); }
-.statistics-audio-row { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:baseline; gap:2px 12px; line-height:1.5; }
-.statistics-audio-label { display:inline-flex; align-items:baseline; gap:8px; }
-.statistics-audio-label > span { min-width:5em; }
-.statistics-audio-row strong { font-weight:500; white-space:nowrap; font-variant-numeric:tabular-nums; }
-.statistics-audio-detail { flex:1 1 12em; min-width:0; color:var(--muted); text-align:right; overflow-wrap:anywhere; }
-.statistics-cache-note { margin:0; color:var(--muted); font-size:11px; line-height:1.5; }
-.statistics-cache-status { display:flex; flex-wrap:wrap; align-items:center; gap:4px 10px; }
-.statistics-cache-status > span:empty { display:none; }
-.statistics-cache-updating { display:inline-flex; align-items:center; gap:6px; color:var(--accent-strong); }
+
+.statistics-audio-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+  font-weight: 600;
+}
+
+.statistics-audio-head > span:last-child {
+  color: var(--accent-strong);
+}
+
+.statistics-audio-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 2px 12px;
+  line-height: 1.5;
+}
+
+.statistics-audio-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.statistics-audio-label > span {
+  min-width: 5em;
+}
+
+.statistics-audio-row strong {
+  font-weight: 500;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.statistics-audio-detail {
+  flex: 1 1 12em;
+  min-width: 0;
+  color: var(--muted);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.statistics-cache-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.statistics-cache-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+
+.statistics-cache-status > span:empty {
+  display: none;
+}
+
+.statistics-cache-updating {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--accent-strong);
+}
+
 .statistics-spinner {
-  width:13px;
-  height:13px;
-  flex:none;
-  border-radius:50%;
-  background:conic-gradient(from 0deg, transparent, var(--accent));
-  -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
-  mask:radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
-  animation:statistics-spin .9s linear infinite;
+  width: 13px;
+  height: 13px;
+  flex: none;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, transparent, var(--accent));
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
+  animation: statistics-spin .9s linear infinite;
 }
-@keyframes statistics-spin { to { transform:rotate(360deg); } }
+
+@keyframes statistics-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @media (prefers-reduced-motion:reduce) {
-  .statistics-spinner { animation:none; }
+  .statistics-spinner {
+    animation: none;
+  }
 }
+
 @media (min-width:900px) {
-  .statistics-dialog { width:min(980px, calc(100vw - 48px)); }
-  .statistics-list { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
+  .statistics-dialog {
+    width: min(980px, calc(100vw - 48px));
+  }
+
+  .statistics-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
 }
 
 .book-metadata-field {
@@ -1204,7 +1262,6 @@ a,
 
 .dialog-head h2 {
   margin: 0;
-  font-size: 17px;
 }
 
 .dialog-actions {
@@ -1781,7 +1838,6 @@ body > .action-confirm-overlay {
   padding: 0 10px;
   border: 1px solid transparent;
   border-radius: 12px;
-  background: rgba(var(--surface-rgb), 0.96);
   color: var(--ink);
   font-size: 18px;
   font-weight: 500;
@@ -1847,7 +1903,6 @@ body > .action-confirm-overlay {
 }
 
 .reader-dark .font-option {
-  background: rgba(var(--surface-rgb), 0.94);
   color: var(--ink);
 }
 
@@ -2066,12 +2121,6 @@ body > .action-confirm-overlay {
   outline-offset: 2px;
 }
 
-.reader-dark .reader-version {
-  border-color: rgba(var(--neutral-rgb), 0.22);
-  background: rgba(var(--surface-rgb), 0.86);
-  color: var(--muted);
-}
-
 @media (max-width: 760px) {
   .action-confirm-overlay .dialog-head {
     align-items: stretch;
@@ -2093,33 +2142,51 @@ body > .action-confirm-overlay {
   }
 
   .reader-body {
-    position: relative;
-    height: auto;
     min-height: 100dvh;
-    overflow: auto;
+    overflow: hidden;
   }
 
   .reader-shell {
+    /* Anchor the frame to the viewport from the first paint, including PWA
+       startup. Only the book list and reading content scroll inside it. */
+    position: fixed;
+    inset: 0;
     width: calc(100% - 16px);
     height: auto;
-    min-height: 100dvh;
-    padding: max(8px, env(safe-area-inset-top)) 0 max(10px, env(safe-area-inset-bottom));
+    padding: max(8px, env(safe-area-inset-top)) 0 calc(10px + env(safe-area-inset-bottom, 0px));
+    overflow: hidden;
+  }
+
+  /* Keep the first render and view switches in the same bounded rectangle.
+     Panel contents must not determine the flex item's height. */
+
+  .reader-stage {
+    position: relative;
+    flex: 1 1 0;
+  }
+
+  .shelf-view,
+  .reading-view {
+    position: absolute;
+    inset: 0;
+    height: auto;
   }
 
   .reader-topbar {
     display: grid;
     grid-template-columns: 1fr;
-    grid-template-rows: 56px 38px;
-    gap: 8px;
-    position: sticky;
-    top: calc(-64px + env(safe-area-inset-top));
+    grid-template-rows: 36px 34px;
+    gap: 2px;
+    position: relative;
     z-index: 20;
-    margin-bottom: 8px;
+    margin-top: calc(0px - var(--reader-heading-offset, 0px));
+    margin-bottom: 4px;
   }
 
   .reader-topbar > div {
-    height: 56px;
+    height: 36px;
     padding-right: 82px;
+    clip-path: inset(var(--reader-heading-offset, 0px) 0 0);
   }
 
   .reader-topbar h1 {
@@ -2130,9 +2197,9 @@ body > .action-confirm-overlay {
     display: grid;
     grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 4px;
-    height: 38px;
+    height: 34px;
     width: 100%;
-    padding: 4px 0;
+    padding: 2px 0;
     background: var(--reader-page-background);
   }
 
@@ -2141,23 +2208,8 @@ body > .action-confirm-overlay {
     min-width: 0;
     min-height: 30px;
     padding: 0 2px;
-    border-radius: 999px;
     font-size: clamp(12px, 3.4vw, 14px);
     white-space: nowrap;
-  }
-
-  .shelf-view,
-  .reading-view {
-    height: auto;
-    min-height: 78vh;
-  }
-
-  .shelf-view {
-    overflow: visible;
-  }
-
-  .reading-view {
-    overflow: visible;
   }
 
   .shelf-head {
@@ -2172,7 +2224,8 @@ body > .action-confirm-overlay {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     grid-auto-rows: 132px;
     justify-content: stretch;
-    overflow: visible;
+    overflow-x: hidden;
+    overscroll-behavior-y: contain;
   }
 
   .book-item {
@@ -2180,23 +2233,25 @@ body > .action-confirm-overlay {
   }
 
   .reader-toolbar {
-    position: sticky;
-    top: calc(38px + env(safe-area-inset-top));
+    position: relative;
     z-index: 12;
     grid-template-columns: auto minmax(0, 1fr) auto;
     gap: 6px;
-    padding: 8px;
+    padding: 4px 8px;
     border-radius: 18px 18px 0 0;
     box-shadow: 0 8px 18px rgba(var(--shadow-rgb), 0.08);
   }
 
-  .listen-toolbar {
-    position: sticky;
-    top: calc(89px + env(safe-area-inset-top));
+  .reader-body .reading-view .listen-toolbar {
+    position: relative;
+    grid-column: 1;
+    grid-row: 2;
+    align-self: start;
     z-index: 11;
     grid-template-columns: auto auto auto minmax(76px, 1fr) auto;
-    gap: 6px;
-    padding: 7px 8px;
+    gap: 3px 6px;
+    padding: 4px 8px;
+    background: rgba(var(--surface-rgb), 0.58);
     box-shadow: 0 8px 18px rgba(var(--shadow-rgb), 0.06);
   }
 
@@ -2229,30 +2284,32 @@ body > .action-confirm-overlay {
 
   .listen-toolbar span {
     grid-column: 1 / -1;
-    line-height: 1.35;
+    line-height: 1.25;
     overflow: visible;
     text-overflow: clip;
     white-space: normal;
   }
 
   .reader-toolbar button {
-    min-height: 34px;
+    min-height: 32px;
     padding: 0 9px;
-    border-radius: 12px;
     font-size: 14px;
     white-space: nowrap;
   }
 
   .chapter-select-btn {
-    height: 34px;
+    height: 32px;
     padding: 0 28px 0 8px;
     font-size: 14px;
   }
 
   .book-content {
-    min-height: 72vh;
-    padding: 24px 18px 46px;
-    overflow: visible;
+    grid-column: 1;
+    grid-row: 2 / 4;
+    padding: calc(18px + var(--reader-heading-offset, 0px) + var(--reader-listen-height, 0px)) 18px 46px;
+    scroll-padding-top: var(--reader-listen-height, 0px);
+    overflow-x: hidden;
+    overscroll-behavior-y: contain;
   }
 
   .tts-settings-grid {
@@ -2315,6 +2372,8 @@ body > .action-confirm-overlay {
 
   .reader-version {
     position: absolute;
+    translate: 0 calc(0px - var(--reader-heading-offset, 0px));
+    clip-path: inset(var(--reader-heading-offset, 0px) 0 0);
     top: max(10px, env(safe-area-inset-top));
     right: max(8px, env(safe-area-inset-right));
     bottom: auto;
@@ -2378,7 +2437,525 @@ body > .action-confirm-overlay {
 }
 
 /* Reparse uses the same indeterminate indicator as book import. */
-.reparse-progress { height: 6px; }
+
+.reparse-progress {
+  height: 6px;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .reparse-progress.parsing div { animation: none; width: 100%; opacity: .65; }
+  .reparse-progress.parsing div {
+    animation: none;
+    width: 100%;
+    opacity: .65;
+  }
+}
+
+/* Reader component presentation and responsive settings. */
+
+:where(.reader-body) .reader-topbar h1 {
+  color: var(--ink);
+  font-family: inherit;
+  font-weight: 650;
+  text-shadow: none;
+  letter-spacing: -0.7px;
+}
+
+:where(.reader-body) .reader-topbar h1 {
+  font-size: clamp(24px, 2.4vw, 30px);
+}
+
+:where(.reader-body) .reader-topbar h1::after {
+  display: none;
+}
+
+:where(.reader-body) .shelf-view,
+:where(.reader-body) .reading-view {
+  border-color: var(--line);
+}
+
+:where(.reader-body) .shelf-head h2 {
+  font-size: 24px;
+  font-weight: 600;
+}
+
+:where(.reader-body) .book-item {
+  background: linear-gradient(160deg, var(--subtle), var(--panel) 65%);
+  border-radius: 12px;
+  box-shadow: 0 2px 6px rgba(var(--shadow-rgb), 0.035);
+}
+
+:where(.reader-body) .book-cover {
+  border-radius: 11px 11px 0 0;
+}
+
+:where(.reader-body) .book-item .book-cover {
+  display: none;
+}
+
+:where(.reader-body) .book-item.active {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent), 0 3px 12px rgba(var(--shadow-rgb), 0.06);
+}
+
+.reader-dark .reader-topbar h1 {
+  color: var(--ink);
+  text-shadow: none;
+}
+
+.reader-dark .book-item {
+  background: var(--panel);
+}
+
+.reader-dark .book-item.active {
+  border-color: var(--accent-strong);
+  box-shadow: inset 3px 0 0 var(--accent-strong);
+}
+
+.reader-dark button:focus-visible,
+.reader-dark a:focus-visible,
+.reader-dark select:focus-visible,
+.reader-dark input:focus-visible {
+  outline-color: var(--accent-strong);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .reader-dark .reader-actions a:hover,
+  .reader-dark .reader-actions button:hover {
+    color: var(--accent-strong);
+  }
+}
+
+:where(.reader-body) .font-option {
+  background: var(--subtle);
+  border-color: var(--line);
+}
+
+.reader-dark .font-option {
+  background: var(--subtle);
+}
+
+.reader-dark .dialog-panel {
+  background: var(--panel);
+  border-color: var(--line);
+}
+
+.reader-dark .reader-toolbar,
+.reader-dark .listen-toolbar {
+  background: var(--panel);
+}
+
+.reader-dark .reader-version {
+  background: var(--panel);
+  color: var(--muted);
+}
+
+:where(.reader-body) .upload-drop,
+.reader-dark .upload-drop {
+  background: var(--subtle);
+  border-color: var(--line-strong);
+}
+
+:where(.reader-body) .upload-drop:hover,
+:where(.reader-body) .upload-drop.loading {
+  border-color: var(--accent);
+  box-shadow: var(--shadow);
+}
+
+.reader-dark .font-option.active,
+:where(.reader-body) .font-option.active {
+  background: var(--selected);
+}
+
+.reader-dark .font-option.active:hover,
+:where(.reader-body) .font-option.active:hover {
+  background: var(--selected);
+}
+
+.reader-dark .book-cover::after {
+  background: linear-gradient(180deg, transparent 50%, var(--panel));
+}
+
+:where(.reader-body) .book-cover::after {
+  background: linear-gradient(180deg, transparent 55%, var(--panel));
+}
+
+.reader-dark .app-version .version-github-link img {
+  filter: invert(1);
+}
+
+:where(.reader-body) .reader-topbar #readerStatus[hidden] {
+  display: none;
+}
+
+/* The selected font keeps a persistent tinted fill as well as its checkmark. */
+
+.reader-body .font-option.active,
+.reader-body .font-option.active:hover,
+.reader-body .font-option.active:focus,
+.reader-body .font-option.active:focus-visible {
+  position: relative;
+  padding-inline: 26px;
+  background: rgba(var(--accent-rgb), .16);
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.reader-body .font-option.active::after {
+  content: "✓";
+  position: absolute;
+  right: 9px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--accent-strong);
+  font-size: 13px;
+}
+
+:where(.reader-body) .mimo-balance-actions a {
+  transition: border-color 140ms ease, color 140ms ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .reader-body .mimo-balance-actions a:hover {
+    border-color: var(--accent);
+    color: var(--accent-strong);
+  }
+}
+
+/* Keep narrow screens within the viewport; content scrolls in its own panel. */
+
+@media (max-width: 760px) {
+  .reader-body .reader-shell {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .reader-body :is(.shelf-view, .reading-view) {
+    min-width: 0;
+  }
+
+  .reader-body .reader-paragraph {
+    overflow-wrap: anywhere;
+  }
+}
+
+/* Listening status stays between the title and actions, including long errors. */
+
+:where(.reader-body) #ttsDialog .dialog-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+:where(.reader-body) #ttsDialog .dialog-head h2 {
+  white-space: nowrap;
+}
+
+:where(.reader-body) #ttsDialog .dialog-head .dialog-actions {
+  grid-column: 3;
+  grid-row: 1;
+  flex-wrap: nowrap;
+}
+
+:where(.reader-body) #ttsDialog .dialog-head button {
+  white-space: nowrap;
+}
+
+:where(.reader-body) #ttsDialog #ttsConfigMessage {
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Desktop listening settings: connection fields above a complete voice row. */
+
+@media (min-width: 761px) {
+  :where(.reader-body) #ttsDialog {
+    width: min(760px, calc(100vw - 48px));
+  }
+
+  :where(.reader-body) #ttsDialog .dialog-panel {
+    padding: 22px 24px;
+    gap: 16px;
+  }
+
+  :where(.reader-body) #ttsDialog .dialog-head h2 {
+    font-size: 21px;
+  }
+
+  :where(.reader-body) #ttsDialog .dialog-head button {
+    min-height: 36px;
+    padding: 0 16px;
+    font-size: 14px;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-config-panel {
+    gap: 16px;
+    padding-top: 16px;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 14px 16px;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid label {
+    grid-column: span 2;
+    min-width: 0;
+    gap: 7px;
+    color: var(--ink);
+    font-size: 14px;
+    font-weight: 500;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid .tts-connection-field {
+    grid-column: span 3;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid .tts-wide {
+    grid-column: 1 / -1;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid :is(input, select, textarea) {
+    min-width: 0;
+    min-height: 40px;
+    font-size: 15px;
+    font-weight: 400;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid textarea {
+    min-height: 82px;
+    line-height: 1.6;
+  }
+
+  :where(.reader-body) #ttsDialog .setting-check {
+    font-size: 14px;
+    font-weight: 500;
+  }
+
+  :where(.reader-body) #ttsDialog .mimo-balance-panel {
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--subtle);
+    flex-wrap: wrap;
+  }
+
+  :where(.reader-body) #ttsDialog .mimo-balance {
+    font-size: 14px;
+  }
+
+  :where(.reader-body) #ttsDialog .mimo-balance-actions :is(button, a) {
+    min-height: 32px;
+    padding: 5px 10px;
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-cache-row {
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    padding-top: 14px;
+    border-top: 1px solid var(--line);
+  }
+
+  :where(.reader-body) #ttsDialog .tts-cache-stats,
+  :where(.reader-body) #ttsDialog .reader-config-message {
+    font-size: 13px;
+    font-weight: 400;
+  }
+}
+
+/* Equalize native desktop controls without changing touch-device Safari. */
+
+@media (min-width: 761px) and (hover: hover) and (pointer: fine) {
+  :where(.reader-body) #ttsDialog :is(#ttsModel, #ttsVoiceId, #ttsChunkChars) {
+    box-sizing: border-box;
+    height: 40px;
+    min-height: 40px;
+    padding-block: 0;
+  }
+}
+
+/* Compact mobile listening settings without changing the control type scale. */
+
+@media (max-width: 760px) {
+  :where(.reader-body) #ttsDialog {
+    width: calc(100vw - 16px);
+    max-width: calc(100vw - 16px);
+  }
+
+  :where(.reader-body) #ttsDialog .dialog-panel {
+    padding: 8px 12px;
+    gap: 8px;
+  }
+
+  :where(.reader-body) #ttsDialog .dialog-head button {
+    min-height: 30px;
+    padding: 0 10px;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-config-panel {
+    gap: 8px;
+    padding-top: 8px;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px 10px;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid label {
+    min-width: 0;
+    gap: 3px;
+    line-height: 1.3;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid :is(.tts-connection-field, .tts-model-field, .tts-wide) {
+    grid-column: 1 / -1;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid :is(input, select) {
+    min-width: 0;
+    min-height: 32px;
+    height: 32px;
+    padding: 0 9px;
+    font-weight: 400;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-settings-grid textarea {
+    padding: 6px 9px;
+    font-weight: 400;
+  }
+
+  :where(.reader-body) #ttsDialog .setting-check {
+    gap: 7px;
+    line-height: 1.4;
+    font-weight: 500;
+  }
+
+  :where(.reader-body) #ttsDialog .mimo-balance-panel {
+    gap: 5px;
+    padding: 7px 9px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--subtle);
+  }
+
+  :where(.reader-body) #ttsDialog .mimo-balance {
+    min-height: 0;
+    padding: 0;
+    line-height: 1.4;
+  }
+
+  :where(.reader-body) #ttsDialog .mimo-balance-actions {
+    gap: 5px;
+    flex-wrap: wrap;
+  }
+
+  :where(.reader-body) #ttsDialog .mimo-balance-actions :is(a, button) {
+    min-height: 28px;
+    padding: 3px 8px;
+    font-weight: 400;
+  }
+
+  :where(.reader-body) #ttsDialog .tts-cache-row {
+    gap: 3px;
+    padding-top: 7px;
+    border-top: 1px solid var(--line);
+  }
+
+  :where(.reader-body) #ttsDialog .tts-cache-stats {
+    font-size: 11px;
+    line-height: 1.35;
+    font-weight: 400;
+  }
+}
+
+/* Reading preferences use a two-column font gallery on phones. */
+
+@media (max-width: 760px) {
+  .reader-body #settingsDialog {
+    width: calc(100vw - 16px);
+    max-width: calc(100vw - 16px);
+  }
+
+  .reader-body #settingsDialog .dialog-panel {
+    padding: 10px 12px;
+    gap: 10px;
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - max(12px, env(safe-area-inset-top)) - max(12px, env(safe-area-inset-bottom)));
+  }
+
+  .reader-body #settingsDialog .dialog-head button {
+    min-height: 32px;
+    padding: 0 10px;
+  }
+
+  .reader-body #settingsDialog .setting-row {
+    gap: 6px;
+  }
+
+  .reader-body #settingsDialog .font-size-setting {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .reader-body #settingsDialog #fontValue {
+    margin-left: 6px;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .reader-body #settingsDialog #fontInput {
+    min-width: 0;
+    height: 28px;
+    margin: 0;
+  }
+
+  .reader-body #settingsDialog .font-picker {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px 10px;
+  }
+
+  .reader-body #settingsDialog .font-option {
+    min-height: 42px;
+    padding: 6px 8px;
+    border-radius: 9px;
+    font-size: 16px;
+  }
+
+  .reader-body #settingsDialog .font-option.active {
+    padding-left: 8px;
+    padding-right: 23px;
+  }
+
+  .reader-body #settingsDialog .font-option.active::after {
+    right: 6px;
+  }
+
+  .reader-body #settingsDialog .font-load-tools {
+    min-height: 28px;
+    padding: 2px 0 0;
+    gap: 4px;
+    justify-content: space-between;
+  }
+
+  .reader-body #settingsDialog .font-load-status {
+    font-weight: 400;
+  }
+
+  .reader-body #settingsDialog .font-load-button {
+    min-height: 28px;
+    padding: 3px 6px;
+    flex-shrink: 0;
+  }
 }

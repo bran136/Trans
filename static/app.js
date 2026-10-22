@@ -25,25 +25,25 @@ const state = {
   resultPanelCollapsed: {},
   activeSentence: null,
   clearCacheConfirmFocus: null,
-  settingsScrollPosition: null,
+  dialogScrollPosition: null,
 };
 
 const $ = (id) => document.getElementById(id);
 const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || "";
 
-function lockSettingsBackground() {
-  if (state.settingsScrollPosition) return;
-  state.settingsScrollPosition = { x: window.scrollX, y: window.scrollY };
-  document.body.style.setProperty("--settings-scroll-top", `${-window.scrollY}px`);
-  document.documentElement.classList.add("translation-settings-open");
+function lockTranslationBackground() {
+  if (state.dialogScrollPosition) return;
+  state.dialogScrollPosition = { x: window.scrollX, y: window.scrollY };
+  document.body.style.setProperty("--translation-scroll-top", `${-window.scrollY}px`);
+  document.documentElement.classList.add("translation-dialog-open");
 }
 
-function unlockSettingsBackground() {
-  if ($("settingsDialog").open || !state.settingsScrollPosition) return;
-  const { x, y } = state.settingsScrollPosition;
-  document.documentElement.classList.remove("translation-settings-open");
-  document.body.style.removeProperty("--settings-scroll-top");
-  state.settingsScrollPosition = null;
+function unlockTranslationBackground() {
+  if (!state.dialogScrollPosition || $("settingsDialog").open || $("historyDialog").open) return;
+  const { x, y } = state.dialogScrollPosition;
+  document.documentElement.classList.remove("translation-dialog-open");
+  document.body.style.removeProperty("--translation-scroll-top");
+  state.dialogScrollPosition = null;
   window.scrollTo({ left: x, top: y, behavior: "instant" });
 }
 
@@ -1068,17 +1068,22 @@ $("swapBtn").addEventListener("click", () => {
   scheduleTranslate(0);
 });
 window.TransUI.setupScrollFades($("historyDialog"), ".history-list");
-$("historyBtn").addEventListener("click", () => $("historyDialog").showModal());
+$("historyBtn").addEventListener("click", () => {
+  lockTranslationBackground();
+  $("historyDialog").showModal();
+});
+for (const dialog of [$("historyDialog"), $("settingsDialog")]) {
+  dialog.addEventListener("close", unlockTranslationBackground);
+}
 $("closeHistoryBtn").addEventListener("click", () => $("historyDialog").close());
 document.addEventListener("visibilitychange", refreshBalanceWhenVisible);
 $("settingsBtn").addEventListener("click", () => {
   clearConfigMessage();
   $("deepseekCacheStats").textContent = "正在读取";
-  lockSettingsBackground();
+  lockTranslationBackground();
   $("settingsDialog").showModal();
   loadDeepSeekCacheStatus();
 });
-$("settingsDialog").addEventListener("close", unlockSettingsBackground);
 $("settingsDialog").addEventListener("click", (event) => {
   if (event.target.closest(".info-help")) return;
   document.querySelectorAll(".info-help[open]").forEach((help) => {

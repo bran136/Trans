@@ -193,6 +193,47 @@ function normalizeFontId(fontId) {
   return options.some((font) => font.id === fontId) ? fontId : "system";
 }
 
+function setupReaderViewport() {
+  const mobile = window.matchMedia("(max-width: 760px)");
+  const navigation = document.querySelector(".reader-actions");
+  const reading = $("readingView");
+  const content = $("bookContent");
+  const controls = $("listenToolbar");
+  let offset = 0;
+  let controlsHeight = 0;
+  let pending = false;
+  const schedule = () => {
+    if (pending || (!mobile.matches && offset === 0 && controlsHeight === 0)) return;
+    pending = true;
+    window.requestAnimationFrame(() => {
+      pending = false;
+      let next = 0;
+      if (mobile.matches && !reading.hidden) {
+        // Matching inner padding lets the first scroll hide the title before
+        // moving the content, without changing the available scroll distance.
+        next = Math.min(navigation.offsetTop, Math.max(0, content.scrollTop));
+      }
+      const height = mobile.matches ? controls.getBoundingClientRect().height : 0;
+      if (height !== controlsHeight) {
+        controlsHeight = height;
+        reading.style.setProperty("--reader-listen-height", `${height}px`);
+      }
+      if (next === offset) return;
+      offset = next;
+      document.body.style.setProperty("--reader-heading-offset", `${offset}px`);
+    });
+  };
+  const resize = new ResizeObserver(schedule);
+  const mutation = new MutationObserver(schedule);
+  content.addEventListener("scroll", schedule, { passive: true });
+  resize.observe(content);
+  resize.observe(controls);
+  mutation.observe(content, { childList: true });
+  mutation.observe(reading, { attributes: true, attributeFilter: ["hidden"] });
+  mobile.addEventListener("change", schedule);
+  schedule();
+}
+
 function lockReaderScroll() {
   if (document.body.classList.contains("dialog-scroll-locked")) return;
   readerState.scrollLockTop = window.scrollY || document.documentElement.scrollTop || 0;
@@ -2454,7 +2495,7 @@ function updateProgressFromScroll(save = true) {
   const content = $("bookContent");
   const bounds = content.getBoundingClientRect();
   const contained = getComputedStyle(content).overflowY !== "visible";
-  const top = contained ? Math.max(0, bounds.top) : Math.max(0, document.querySelector(".reader-topbar").getBoundingClientRect().bottom,
+  const top = contained ? Math.max(0, bounds.top, $("listenToolbar").getBoundingClientRect().bottom) : Math.max(0, document.querySelector(".reader-topbar").getBoundingClientRect().bottom,
     $("readingView").querySelector(".reader-toolbar").getBoundingClientRect().bottom,
     $("listenToolbar").getBoundingClientRect().bottom);
   const bottom = Math.min(bounds.bottom, window.innerHeight);
@@ -2797,30 +2838,27 @@ function stopSleepFade(resetVolume = true) {
 function startSleepFadeIfNeeded(audio, stopAt = audio?.duration) {
   if (!canAdjustMediaVolume()
     || !readerState.sleepPausePending
+    || readerState.sleepFadeStarted
     || !audio
     || !Number.isFinite(Number(stopAt))) return;
-  const normalizedStopAt = Number.isFinite(Number(stopAt)) ? Number(stopAt) : audio.duration;
-  const secondsLeft = () => Math.max(
-    0,
-    (normalizedStopAt - audio.currentTime)
-      / Math.max(0.8, Math.min(Number(audio.playbackRate) || 1, 2)),
-  );
-  if (secondsLeft() > TTS_SLEEP_FADE_SECONDS + 0.2) return;
-  const applyVolume = () => {
-    const remainingSeconds = secondsLeft();
-    audio.volume = Math.max(0.05, Math.min(1, remainingSeconds / TTS_SLEEP_FADE_SECONDS));
-  };
-  applyVolume();
-  if (readerState.sleepFadeStarted) return;
+  const endTime = Number(stopAt);
+  const fadeDistance = endTime - audio.currentTime;
+  const rate = Math.max(0.8, Math.min(Number(audio.playbackRate) || 1, 2));
+  if (fadeDistance <= 0 || fadeDistance / rate > TTS_SLEEP_FADE_SECONDS + 0.2
+    || audio.volume <= 0.05) return;
+  // Start at the current volume, even when only a short sentence remains.
+  // Media time keeps buffering and playback-rate changes from causing jumps.
+  const startVolume = audio.volume;
   readerState.sleepFadeStarted = true;
   readerState.sleepFadeTimerId = window.setInterval(() => {
     if (!readerState.sleepPausePending || audio.paused || audio.ended || readerState.ttsAudio !== audio) {
       stopSleepFade(false);
       return;
     }
-    applyVolume();
+    const fraction = Math.max(0, Math.min(1, (endTime - audio.currentTime) / fadeDistance));
+    audio.volume = Math.min(audio.volume, Math.max(0.05, startVolume * fraction));
     if (audio.volume <= 0.05) stopSleepFade(false);
-  }, 200);
+  }, 50);
 }
 
 function finishSleepPause(index) {
@@ -3408,7 +3446,7 @@ function applyReaderTheme(value) {
   if (button) {
     button.classList.toggle("active", dark);
     button.setAttribute("aria-pressed", dark ? "true" : "false");
-    button.textContent = dark ? "日间" : "黑暗";
+    button.textContent = dark ? "日间" : "夜间";
   }
   window.localStorage.setItem("readerTheme", dark ? "dark" : "light");
 }
@@ -4952,6 +4990,7 @@ window.addEventListener("pagehide", () => {
   window.clearTimeout(readerState.mimoBalanceRetryTimer);
   window.clearTimeout(ttsCacheStatsRetryTimer);
 });
+window.TransUI.setupScrollFades($("shelfView"), ".book-list");
 document.querySelectorAll(".reader-dialog").forEach((dialog) => {
   window.TransUI.setupScrollFades(dialog,
     ".dialog-panel, .chapter-select-list, .book-search-results, .manage-book-list, "
@@ -4983,6 +5022,7 @@ $("logoutBtn").addEventListener("click", async () => {
   window.location.href = "/login";
 });
 
+setupReaderViewport();
 restoreReaderSettings();
 initializeMediaSession();
 window.history.replaceState({ readerView: "shelf" }, "", window.location.href);

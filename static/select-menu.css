@@ -1,0 +1,91 @@
+/* Shared picker presentation; native selects retain their existing layout. */
+.custom-selects select:not([multiple]):not([size]) {
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+.custom-selects select:not([multiple]):not([size]):not(.select-chevron select) {
+  padding-right: 28px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 50%, calc(100% - 10px) 50%;
+  background-size: 4px 4px;
+  background-repeat: no-repeat;
+}
+
+.custom-selects select[aria-expanded="true"] {
+  border-color: var(--accent);
+}
+
+.custom-selects:not(.keyboard-navigation) select:focus {
+  outline: none;
+}
+
+.ui-select-menu[popover] {
+  position: fixed;
+  inset: auto;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 5px;
+  max-height: 320px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: 0 8px 28px rgba(var(--shadow-rgb), 0.16);
+  font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  outline: none;
+  touch-action: pan-y;
+}
+
+.ui-select-option {
+  position: relative;
+  min-height: 36px;
+  padding: 8px 30px 8px 10px;
+  border-radius: 7px;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.ui-select-option.is-focused {
+  background: var(--subtle);
+}
+
+.ui-select-option[aria-selected="true"] {
+  background: var(--selected);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.ui-select-option[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  right: 13px;
+  top: calc(50% - 6px);
+  width: 5px;
+  height: 10px;
+  border: solid currentColor;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.ui-select-option[aria-disabled="true"] {
+  color: var(--muted);
+  opacity: 0.55;
+  cursor: default;
+}
+
+.ui-select-group {
+  padding: 8px 10px 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@media (pointer: coarse) {
+  .ui-select-menu[popover] { font-size: 13px; }
+  .ui-select-option { min-height: 40px; padding-block: 10px; }
+}

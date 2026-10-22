@@ -10,9 +10,10 @@
     <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
     <script src="{{ asset_url('reader-theme.js') }}"></script>
     <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
-    <link rel="stylesheet" href="{{ asset_url('reader.css') }}">
     <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
+    <link rel="stylesheet" href="{{ asset_url('reader.css') }}">
     <link rel="stylesheet" href="{{ asset_url('reader-tools.css') }}">
+    <link rel="stylesheet" href="{{ asset_url('select-menu.css') }}">
   </head>
   <body class="reader-body" data-media-artwork-url="{{ asset_url('media-artwork.png') }}">
     <div class="reader-shell">
@@ -227,7 +228,7 @@
         <div class="dialog-head">
           <h2>阅读设置</h2>
           <div class="dialog-actions">
-            <button id="darkModeBtn" class="theme-mode-btn" type="button" aria-pressed="false">黑暗</button>
+            <button id="darkModeBtn" class="theme-mode-btn" type="button" aria-pressed="false">夜间</button>
             <button id="closeSettingsBtn" type="button">关闭</button>
           </div>
         </div>
@@ -395,6 +396,7 @@
       </a>
     </div>
     <script src="{{ asset_url('ui.js') }}"></script>
+    <script src="{{ asset_url('select-menu.js') }}"></script>
     <script src="{{ asset_url('font-cache.js') }}"></script>
     <script src="{{ asset_url('reader-audio.js') }}"></script>
     <script src="{{ asset_url('reader-stream.js') }}"></script>
