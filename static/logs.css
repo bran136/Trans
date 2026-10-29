@@ -1,0 +1,15 @@
+/* Standalone log tracker; no homepage or reader layout dependencies. */
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--panel); color: var(--ink); font-family: system-ui, sans-serif; }
+header { display: flex; align-items: center; flex: none; gap: 16px; min-height: 60px; padding: 12px 22px; border-bottom: 1px solid var(--line); background: var(--bg); }
+h1 { margin: 0; font-size: 18px; font-weight: 600; white-space: nowrap; }
+#logStatus { color: var(--muted); font-size: 12px; }
+#logStatus[data-error="true"] { color: var(--danger); }
+#latestBtn { margin-left: auto; flex: none; padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--ink); font: inherit; font-size: 12px; cursor: pointer; }
+#latestBtn:hover { color: var(--accent-strong); border-color: var(--accent); }
+#latestBtn:focus-visible, #logLines:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+#logLines { flex: 1; min-height: 0; overflow: auto; overflow-anchor: none; overscroll-behavior: contain; font: 13px/1.7 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
+#logLines:empty::before { content: "等待新日志…"; display: block; padding: 22px; color: var(--muted); font: 13px system-ui, sans-serif; }
+.log-line { min-height: 38px; padding: 8px 22px; border-bottom: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
+.log-line:nth-child(even) { background: var(--subtle); }

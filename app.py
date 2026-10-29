@@ -1,4 +1,5 @@
 import json
+import codecs
 import copy
 import gzip
 import zlib
@@ -127,6 +128,9 @@ BUILD_VERSION_FILES = (
     BASE_DIR / "static" / "pdf-translation.js",
     BASE_DIR / "static" / "pdf-metadata-worker.js",
     BASE_DIR / "templates" / "home.html",
+    BASE_DIR / "templates" / "logs.html",
+    BASE_DIR / "static" / "logs.css",
+    BASE_DIR / "static" / "logs.js",
     BASE_DIR / "templates" / "index.html",
     BASE_DIR / "templates" / "login.html",
     BASE_DIR / "templates" / "reader.html",
@@ -3416,7 +3420,7 @@ def add_security_headers(response):
     )
     if request.path.startswith("/static/fonts/") and request.args.get("v"):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-    elif request.path.startswith("/api/") or request.path in {"/", "/login", "/translate", "/translate/pdf", "/reader"} or request.path.startswith("/reader/books/"):
+    elif request.path.startswith("/api/") or request.path in {"/", "/login", "/logs", "/translate", "/translate/pdf", "/reader"} or request.path.startswith("/reader/books/"):
         response.headers.setdefault("Cache-Control", "no-store")
     if request.endpoint in {"api_book_text", "api_book_text_backup"} and response.status_code == 200 and not response.direct_passthrough:
         response.vary.add("Accept-Encoding")
@@ -7435,6 +7439,22 @@ def translate_page():
     return render_template("index.html")
 
 
+@app.route("/logs")
+def logs_page():
+    if not require_auth():
+        return redirect(url_for("login"))
+    # Capture the starting position when opening the page, not on a later poll.
+    file_id, offset = "", None
+    try:
+        stat = (LOG_DIR / "app.log").stat()
+        file_id, offset = f"{stat.st_dev:x}:{stat.st_ino:x}", stat.st_size
+    except FileNotFoundError:
+        offset = 0
+    except OSError:
+        pass  # Establish a tail position once the log becomes readable.
+    return render_template("logs.html", log_file=file_id, log_offset=offset)
+
+
 @app.route("/reader")
 def reader_page():
     if not require_auth():
@@ -9278,6 +9298,43 @@ def api_status():
             time.perf_counter() - started,
         )
     return jsonify(result)
+
+
+@app.route("/api/logs")
+def api_logs():
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        offset = int(request.args.get("offset", "0"))
+        if not 0 <= offset <= 2**63 - 1:
+            raise ValueError
+    except (ValueError, TypeError):
+        return jsonify({"error": "日志位置无效"}), 400
+    try:
+        # Only the current application log is exposed; no client-supplied path.
+        with (LOG_DIR / "app.log").open("rb") as stream:
+            stat = os.fstat(stream.fileno())
+            file_id = f"{stat.st_dev:x}:{stat.st_ino:x}"
+            reset = request.args.get("file") != file_id or offset > stat.st_size
+            if reset:
+                offset = 0
+            if request.args.get("tail") == "1":
+                offset = stat.st_size
+            stream.seek(offset)
+            data = stream.read(64 * 1024)
+            # Leave a split UTF-8 character for the next read, including when
+            # the writer has only written part of the final character so far.
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            text = decoder.decode(data, final=False)
+            pending, _ = decoder.getstate()
+            return jsonify({"file": file_id, "offset": offset + len(data) - len(pending),
+                            "text": text, "reset": reset,
+                            "more": offset + len(data) < stat.st_size, "missing": False})
+    except FileNotFoundError:
+        return jsonify({"file": "", "offset": 0, "text": "", "reset": True,
+                        "more": False, "missing": True})
+    except OSError:
+        return jsonify({"error": "暂时无法读取日志"}), 503
 
 
 @app.route("/api/cache", methods=["GET", "DELETE"])

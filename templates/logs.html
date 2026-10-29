@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f6f5f2">
+    <title>追踪日志 · Trans</title>
+    <link rel="icon" type="image/svg+xml" href="{{ asset_url('site-icon.svg') }}">
+    <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
+    <link rel="stylesheet" href="{{ asset_url('logs.css') }}">
+  </head>
+  <body data-log-file="{{ log_file }}" data-log-offset="{{ log_offset if log_offset is not none else '' }}">
+    <header>
+      <h1>追踪日志</h1>
+      <span id="logStatus" role="status">正在连接…</span>
+      <button id="latestBtn" type="button" hidden>回到最新</button>
+    </header>
+    <main id="logLines" tabindex="0" aria-label="打开本页后新增的日志"></main>
+    <script src="{{ asset_url('logs.js') }}"></script>
+  </body>
+</html>
