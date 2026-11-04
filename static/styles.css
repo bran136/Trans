@@ -769,9 +769,11 @@ dialog::backdrop {
   height: 14px;
 }
 
-.version-github-link:hover {
-  opacity: 1;
-  transform: translateY(-1px);
+@media (hover: hover) and (pointer: fine) {
+  .version-github-link:hover {
+    opacity: 1;
+    transform: translateY(-1px);
+  }
 }
 
 .version-github-link:focus-visible {

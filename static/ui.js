@@ -100,11 +100,12 @@
     const themeObserver = new MutationObserver(syncBrowserBars);
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
     themeObserver.observe(document.body, { attributes: true, attributeFilter: ["class"] });
-    // Reader settings can restore theme-color without changing a theme class.
+    // Theme restoration can update theme-color without changing a theme class.
     if (isAndroid && themeMeta) {
       themeObserver.observe(themeMeta, { attributes: true, attributeFilter: ["content"] });
     }
     window.addEventListener("pageshow", syncBrowserBars);
+    window.addEventListener("themechange", syncBrowserBars);
     syncBrowserBars();
   }
 

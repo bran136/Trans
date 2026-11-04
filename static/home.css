@@ -8,6 +8,27 @@
   background: var(--bg);
 }
 
+/* Night artwork retains the home page's muted green identity. Existing day
+   colors remain unchanged; decorative surfaces need page-specific overrides. */
+.theme-dark .translation-art { background: #151714; }
+.theme-dark .reading-art { background: #121914; }
+.theme-dark .art-index { color: #9da799; }
+.theme-dark .specimen-en { color: #d0d8ce; }
+.theme-dark .specimen-zh { color: #aebaa8; }
+.theme-dark .translation-rule { color: #8e9d87; }
+.theme-dark .translation-rule span { background: #43503f; }
+.theme-dark .book-back { background: repeating-linear-gradient(90deg, #34382e 0, #34382e 1px, #474c40 1px, #474c40 3px); border-color: #4e5847; }
+.theme-dark .book-front { background: #344835; color: #dce1d5; }
+.theme-dark .book-edition { color: #adbba4; }
+.theme-dark .book-bookmark { background: #9c844f; }
+.theme-dark .tool-arrow { color: #aebba8; }
+.theme-dark .security-status.enabled { color: var(--success); background: rgba(var(--success-rgb), .1); border-color: rgba(var(--success-rgb), .3); }
+@media (hover: hover) and (pointer: fine) {
+  .theme-dark .tool-card:hover { border-color: #697c61; box-shadow: var(--shadow); }
+  .theme-dark .tool-card:hover .tool-arrow { background: #344835; border-color: #697c61; color: #dce1d5; }
+  .theme-dark .home-actions .ghost:hover { background: var(--subtle); }
+}
+
 .home-shell { width: min(100%, 1040px); margin: 0 auto; }
 .home-head { margin-bottom: clamp(36px, 7vh, 72px); gap: 20px; }
 .home-brand { gap: 12px; }

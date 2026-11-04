@@ -742,6 +742,41 @@
   backdrop-filter: none;
 }
 
+/* Night workspace: matching black text panes, one quiet control surface.
+   Keep these colors local so dialogs, PDF translation and day mode stay intact. */
+.theme-dark .app-body .translator {
+  --line: #25262a;
+  --control: #161719;
+  --muted: #9fa1a8;
+  background: var(--bg);
+  box-shadow: none;
+}
+
+.theme-dark .translator :is(.source-editor, .results, .result-card) {
+  background: var(--bg);
+}
+
+.theme-dark .translator :is(.toolbar, .pane-head, .result-head, .engine-row) {
+  background: var(--panel);
+}
+
+.theme-dark .translator #sourceText::placeholder {
+  color: var(--muted);
+  opacity: 1;
+}
+
+.theme-dark .translator .result-copy:not(:disabled) {
+  background: var(--control);
+  border-color: var(--line);
+  color: var(--muted);
+}
+
+.theme-dark .translator .result-toggle { background: transparent; }
+
+@media (hover: hover) and (pointer: fine) {
+  .theme-dark .translator .result-toggle:hover { background: var(--control); }
+}
+
 :where(.app-body) .brand-title {
   color: var(--ink);
   font-family: inherit;

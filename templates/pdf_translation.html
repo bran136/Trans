@@ -6,6 +6,7 @@
 <title>PDF 翻译</title>
 <link rel="icon" type="image/svg+xml" sizes="any" href="{{ asset_url('site-icon.svg') }}">
 <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
+<script src="{{ asset_url('theme.js') }}"></script>
 <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
 <link rel="stylesheet" href="{{ asset_url('styles.css') }}">
 <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
@@ -17,7 +18,7 @@
 <div class="app-shell">
 <header class="topbar">
 <div class="pdf-brand"><h1 id="pdfTitle" class="brand-title" tabindex="-1">PDF 翻译</h1><span id="connectionState" class="pdf-connection" role="status" data-state="checking">检测中</span></div>
-<div class="top-actions"><button class="ghost" id="settingsBtn" type="button">服务配置</button><button class="ghost" id="aboutBtn" type="button">关于</button></div>
+<div class="top-actions"><a class="ghost" href="{{ url_for('translate_page') }}">← 返回在线翻译</a><button class="ghost" id="settingsBtn" type="button">服务配置</button><button class="ghost" id="aboutBtn" type="button">关于</button></div>
 </header>
 <main class="pdf-layout">
 <section class="pdf-panel pdf-upload-panel">
@@ -103,7 +104,8 @@
 </div>
 </dialog>
 <dialog id="confirmDialog" class="pdf-confirm" aria-labelledby="confirmTitle"><form method="dialog"><h2 id="confirmTitle" tabindex="-1" autofocus></h2><p id="confirmText"></p><div class="pdf-dialog-actions"><button class="ghost" value="cancel">取消</button><button class="ghost" value="confirm">确认</button></div></form></dialog>
-    <div class="version-badge app-version">
+    <div class="version-badge app-version has-theme-toggle">
+      {% include '_theme_toggle.html' %}
       <a class="version-link" href="https://github.com/bran136/Trans/blob/master/CHANGELOG.md" target="_blank" rel="noopener noreferrer" title="查看更新日志">v{{ app_version() }}</a>
       <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">
         <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">

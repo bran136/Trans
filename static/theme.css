@@ -39,23 +39,25 @@ html {
   --scrollbar-thumb-hover: rgba(115, 116, 113, 0.65);
 }
 
-html.reader-dark-root,
-.reader-body.reader-dark {
+/* All pages inherit one night palette; page-specific artwork stays local. */
+html.theme-dark {
   color-scheme: dark;
-  --bg: #191a1c;
-  --panel: #222325;
-  --control: #2a2b2e;
-  --subtle: #2a2b2d;
-  --paper: #1e1f21;
-  --ink: #e7e6e2;
+  background: #000000;
+  --bg: #000000;
+  --panel: #111214;
+  --control: #1b1c1f;
+  --subtle: #17181b;
+  --paper: #000000;
+  --ink: #dededb;
   --muted: #aaa9a4;
-  --line: #3a3b3d;
+  --line: #303236;
   --line-strong: #606163;
   --accent: #a5abe7;
   --accent-strong: #c0c4f3;
   --accent-rgb: 165, 171, 231;
   --selected: #30313d;
-  --surface-rgb: 34, 35, 37;
+  --surface-rgb: 17, 18, 20;
+  --shadow-rgb: 0, 0, 0;
   --neutral-rgb: 150, 150, 146;
   --disabled-bg: #242527;
   --disabled-ink: #999995;
@@ -69,3 +71,28 @@ html.reader-dark-root,
   --scrollbar-thumb: rgba(170, 169, 164, 0.4);
   --scrollbar-thumb-hover: rgba(170, 169, 164, 0.65);
 }
+
+/* The same accessible icon control is shared by the footer and reader settings. */
+.theme-toggle {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--control);
+  color: var(--ink);
+  cursor: pointer;
+}
+.theme-toggle svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.theme-toggle .theme-sun, .theme-dark .theme-toggle .theme-moon { display: none; }
+.theme-dark .theme-toggle .theme-sun { display: block; }
+@media (hover: hover) and (pointer: fine) {
+  .theme-toggle:hover { border-color: var(--accent); color: var(--accent-strong); }
+}
+.theme-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.theme-dark .version-github-link img { filter: invert(1); }

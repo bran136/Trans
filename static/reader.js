@@ -3432,29 +3432,6 @@ async function refreshSelectedReaderFont() {
   updateReaderFontFamily(value, false, false);
 }
 
-function applyReaderTheme(value) {
-  const dark = value === "dark";
-  document.body.classList.toggle("reader-dark", dark);
-  if (typeof window.applyReaderDocumentTheme === "function") {
-    window.applyReaderDocumentTheme(dark);
-  } else {
-    document.documentElement.classList.toggle("reader-dark-root", dark);
-    const themeColor = document.querySelector('meta[name="theme-color"]');
-    if (themeColor) themeColor.content = dark ? "#191a1c" : "#f6f5f2";
-  }
-  const button = $("darkModeBtn");
-  if (button) {
-    button.classList.toggle("active", dark);
-    button.setAttribute("aria-pressed", dark ? "true" : "false");
-    button.textContent = dark ? "日间" : "夜间";
-  }
-  window.localStorage.setItem("readerTheme", dark ? "dark" : "light");
-}
-
-function updateReaderTheme() {
-  applyReaderTheme(document.body.classList.contains("reader-dark") ? "light" : "dark");
-}
-
 function renderFontPicker() {
   const picker = $("fontPicker");
   if (!picker) return;
@@ -3521,7 +3498,6 @@ async function restoreReaderSettings() {
   if (fontId !== savedFamily) window.localStorage.setItem("readerFontFamily", fontId);
   const activeFont = document.querySelector(`.font-option[data-font="${fontId}"]`);
   if (activeFont) activeFont.classList.add("active");
-  applyReaderTheme(window.localStorage.getItem("readerTheme") === "dark" ? "dark" : "light");
   const savedPlaybackRate = Number(window.localStorage.getItem("readerPlaybackRate"));
   if ($("playbackRateSelect")) {
     $("playbackRateSelect").value = [0.8, 1, 1.2, 1.5, 2].includes(savedPlaybackRate)
@@ -4862,7 +4838,6 @@ document.querySelectorAll("[data-sleep-minutes]").forEach((button) => {
   });
 });
 $("fontInput").addEventListener("input", updateReaderFont);
-$("darkModeBtn").addEventListener("click", updateReaderTheme);
 $("saveTtsConfigBtn").addEventListener("click", () => saveTtsConfig());
 // This form isolates the API secret from unrelated search inputs. Save remains
 // an explicit button action; Enter must not navigate or submit the secret.

@@ -83,8 +83,8 @@
 .txt-editor-body .txt-change { display: block; width: 100%; margin-bottom: 6px; text-align: left; font: 12px/1.7 system-ui, sans-serif; white-space: pre-wrap; overflow-wrap: anywhere; padding: 8px 10px; }
 .txt-change ins { background: #daf1df; color: #185d30; text-decoration: none; }
 .txt-change del { background: #fbe0e1; color: #96303a; }
-.reader-dark .txt-change ins { background: #233f2f; color: #afe4bd; }
-.reader-dark .txt-change del { background: #4d2c32; color: #ffc0c5; }
+.theme-dark .txt-change ins { background: #233f2f; color: #afe4bd; }
+.theme-dark .txt-change del { background: #4d2c32; color: #ffc0c5; }
 .txt-editor-body .txt-text-button { padding: 0; margin-right: 12px; border: 0; border-radius: 0; background: transparent; color: var(--muted); font: inherit; }
 .txt-editor-body .txt-text-button:hover { color: var(--danger); }
 

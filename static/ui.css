@@ -203,8 +203,17 @@ dialog {
   }
 }
 
-/* A quiet, consistent version/source component on every page. */
+/* Night-only overrides for fixed-color legacy controls and native autofill. */
+.theme-dark input:is(:autofill, :-webkit-autofill),
+.theme-dark textarea:is(:autofill, :-webkit-autofill) {
+  -webkit-text-fill-color: var(--ink);
+  caret-color: var(--ink);
+  -webkit-box-shadow: 0 0 0 1000px var(--control) inset;
+  box-shadow: 0 0 0 1000px var(--control) inset;
+}
+.theme-dark .primary { color: var(--bg); }
 
+/* A quiet, consistent version/source component on every page. */
 .app-version.version-badge,
 .app-version.reader-version {
   display: inline-flex;
@@ -229,10 +238,17 @@ dialog {
   text-decoration: none;
 }
 
-.version-link:hover {
-  color: var(--accent);
-  text-decoration: underline;
-  text-underline-offset: 3px;
+.app-version.has-theme-toggle { padding-left: 0; }
+.app-version .theme-toggle { position: relative; width: 30px; height: 22px; margin-right: 8px; border: 0; border-right: 1px solid var(--line); border-radius: 7px 0 0 7px; background: transparent; color: var(--muted); }
+.app-version .theme-toggle::before { content: ""; position: absolute; inset: -7px 0; }
+
+@media (hover: hover) and (pointer: fine) {
+  .version-link:hover {
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+  .app-version .theme-toggle:hover { color: var(--accent-strong); background: var(--subtle); }
 }
 
 .app-version .version-link {
@@ -259,9 +275,11 @@ dialog {
   border-radius: 7px;
 }
 
-.app-version .version-github-link:hover {
-  background: var(--subtle);
-  transform: none;
+@media (hover: hover) and (pointer: fine) {
+  .app-version .version-github-link:hover {
+    background: var(--subtle);
+    transform: none;
+  }
 }
 
 .app-version .version-github-link:focus-visible {
@@ -651,6 +669,7 @@ html:not(.keyboard-navigation) .home-body :is(button, a):focus {
 
 :is(.app-body, .reader-body, .home-body) button.touch-pressed:not(:disabled),
 :is(.app-body, .reader-body, .home-body) a.touch-pressed,
+.app-version .touch-pressed,
 .app-body .engine-chip.touch-pressed {
   color: var(--accent-strong) !important;
   border-color: var(--accent) !important;

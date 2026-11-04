@@ -8,7 +8,7 @@
     <title>在线读书</title>
     <link rel="icon" type="image/svg+xml" sizes="any" href="{{ asset_url('site-icon.svg') }}">
     <link rel="manifest" href="{{ asset_url('site.webmanifest') }}">
-    <script src="{{ asset_url('reader-theme.js') }}"></script>
+    <script src="{{ asset_url('theme.js') }}"></script>
     <link rel="stylesheet" href="{{ asset_url('theme.css') }}">
     <link rel="stylesheet" href="{{ asset_url('ui.css') }}">
     <link rel="stylesheet" href="{{ asset_url('reader.css') }}">
@@ -228,7 +228,7 @@
         <div class="dialog-head">
           <h2>阅读设置</h2>
           <div class="dialog-actions">
-            <button id="darkModeBtn" class="theme-mode-btn" type="button" aria-pressed="false">夜间</button>
+            {% include '_theme_toggle.html' %}
             <button id="closeSettingsBtn" type="button">关闭</button>
           </div>
         </div>
@@ -389,7 +389,8 @@
       </section>
     </dialog>
 
-    <div class="reader-version app-version">
+    <div class="reader-version app-version has-theme-toggle">
+      {% include '_theme_toggle.html' %}
       <a class="version-link" href="https://github.com/bran136/Trans/blob/master/CHANGELOG.md" target="_blank" rel="noopener noreferrer" title="查看更新日志">v{{ app_version() }}</a>
       <a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans" title="在 GitHub 查看项目">
         <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">

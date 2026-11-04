@@ -3,7 +3,6 @@
   const desktop = matchMedia('(hover: hover) and (pointer: fine)').matches
     && !/Android|iPhone|iPad|iPod/.test(navigator.userAgent)
     && !(navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  document.body.classList.toggle('reader-dark', document.documentElement.classList.contains('reader-dark-root'));
   if (!desktop) { get('txtEditorUnavailable').hidden = false; return; }
   get('txtEditorPage').hidden = false;
   const bookId = document.body.dataset.bookId;
