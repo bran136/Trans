@@ -291,17 +291,20 @@ a,
   max-height: min(42vh, 260px);
   overflow: auto;
   padding: 2px;
+  border-radius: 13px;
+  overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
 }
 
 .import-job {
   display: grid;
   gap: 3px;
+  min-height: 0;
   padding: 8px 10px;
   border: 1px solid rgba(var(--accent-rgb), 0.18);
   border-radius: 11px;
+  overflow: hidden;
   background: rgba(var(--surface-rgb), 0.94);
-  box-shadow: 0 12px 28px rgba(var(--shadow-rgb), 0.11);
 }
 
 .import-job strong,
@@ -315,12 +318,14 @@ a,
 .import-job strong {
   color: var(--ink);
   font-size: 12px;
+  line-height: 18px;
 }
 
 .import-job span {
   color: var(--muted);
   font-size: 11px;
   font-weight: 600;
+  line-height: 18px;
 }
 
 .import-job-progress {
@@ -455,6 +460,9 @@ a,
   border-bottom: 1px solid var(--line);
   background: rgba(var(--surface-rgb), 0.74);
 }
+
+#readerProgressNotice { grid-column:1 / -1; display:flex; align-items:center; flex-wrap:wrap; gap:6px; }
+#readerProgressNotice #resumeLatestProgressBtn { flex:none; padding:4px 9px; min-height:28px; font-size:12px; }
 
 .theme-dark .reader-toolbar {
   background: rgba(var(--surface-rgb), 0.72);
@@ -1188,36 +1196,6 @@ a,
 
 .statistics-cache-status > span:empty {
   display: none;
-}
-
-.statistics-cache-updating {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--accent-strong);
-}
-
-.statistics-spinner {
-  width: 13px;
-  height: 13px;
-  flex: none;
-  border-radius: 50%;
-  background: conic-gradient(from 0deg, transparent, var(--accent));
-  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
-  mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
-  animation: statistics-spin .9s linear infinite;
-}
-
-@keyframes statistics-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@media (prefers-reduced-motion:reduce) {
-  .statistics-spinner {
-    animation: none;
-  }
 }
 
 @media (min-width:900px) {
@@ -2652,11 +2630,7 @@ body > .action-confirm-overlay {
 
 :where(.reader-body) #ttsDialog #ttsConfigMessage {
   min-width: 0;
-  min-height: 0;
   margin: 0;
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 1.4;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -2754,7 +2728,7 @@ body > .action-confirm-overlay {
   }
 
   :where(.reader-body) #ttsDialog .tts-cache-stats,
-  :where(.reader-body) #ttsDialog .reader-config-message {
+  :where(.reader-body) #ttsDialog .reader-config-message:not([data-feedback-box]) {
     font-size: 13px;
     font-weight: 400;
   }

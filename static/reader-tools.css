@@ -3,7 +3,8 @@
 .reader-body .reader-dialog.chapter-select-dialog { width: min(780px, calc(100vw - 24px)); }
 .reader-body .chapter-select-dialog .dialog-panel { max-height: calc(100dvh - 32px); gap: 12px; }
 .book-search-tabs { display: flex; gap: 6px; }
-.book-search-tabs button, .book-search-form button, #bookSearchMore {
+.book-search-tabs button, .book-search-form button, #bookSearchMore,
+.reader-body .bookmark-actions button, .reader-body .bookmark-row > .danger {
   border: 1px solid var(--line); border-radius: 9px; padding: 7px 14px;
   background: var(--subtle); color: var(--ink); font-size: 13px;
 }
@@ -87,6 +88,9 @@
 .theme-dark .txt-change del { background: #4d2c32; color: #ffc0c5; }
 .txt-editor-body .txt-text-button { padding: 0; margin-right: 12px; border: 0; border-radius: 0; background: transparent; color: var(--muted); font: inherit; }
 .txt-editor-body .txt-text-button:hover { color: var(--danger); }
+.txt-editor-body #txtEditorDeleteBackup { color: var(--danger); }
+.txt-editor-body #txtEditorDeleteYes { color:var(--danger); border-color:rgba(var(--danger-rgb), .24); background:rgba(var(--danger-rgb), .08); }
+.txt-editor-body #txtEditorDeleteYes:hover { border-color:rgba(var(--danger-rgb), .52); background:rgba(var(--danger-rgb), .14); }
 
 #txtEditorLocked { max-width: 560px; }
 #txtEditorLocked h1 { font-size: 22px; line-height: 1.4; }
@@ -102,12 +106,19 @@
 .txt-change-row { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 6px; }
 .txt-editor-body .txt-change-row .txt-change { flex: 1; min-width: 0; margin-bottom: 0; }
 .txt-editor-body .txt-change-undo { flex: none; padding: 8px 10px; font-size: 12px; }
+.reader-body .bookmark-actions { display:flex; justify-content:flex-start; gap:8px; margin-bottom:4px; flex-shrink:0; }
+.reader-body .bookmark-actions button { padding:4px 10px; min-height:28px; border-radius:6px; font-size:12px; background:transparent; color:var(--muted); }
+.reader-body .bookmark-actions[hidden] { display:none; }
+.reader-body .bookmark-row { display:flex; align-items:center; gap:8px; }
+.reader-body .bookmark-row .book-search-result { flex:1; min-width:0; }
+.reader-body .bookmark-row small { display:block; margin-top:5px; color:var(--muted); font-size:12px; }
+.reader-body .bookmark-row > .danger { flex-shrink:0; padding:5px 9px; color:var(--danger); border-color:rgba(var(--danger-rgb), .3); }
 /* Keep the management header and import controls fixed within the viewport. */
 .reader-body #manageDialog { height:min(86vh,720px); height:min(86dvh,720px); }
 .reader-body #manageDialog > .dialog-panel { display:flex; flex-direction:column; height:100%; max-height:none; overflow:hidden; }
 .reader-body #manageDialog > .dialog-panel > .dialog-head { flex-shrink:0; }
 .reader-body #manageDialog .manage-layout { flex:1; min-height:0; grid-template-rows:auto minmax(0,1fr); }
-.reader-body #manageDialog .import-jobs { max-height:min(12vh,80px); max-height:min(12dvh,80px); }
+.reader-body #manageDialog .import-jobs { max-height:156px; grid-auto-rows:max-content; }
 .reader-body #manageDialog .manage-library { display:flex; flex-direction:column; min-width:0; min-height:0; }
 .reader-body #manageDialog .library-search-form { flex-shrink:0; align-self:stretch; }
 .reader-body #manageDialog .manage-book-frame { flex:1; min-height:0; }

@@ -96,7 +96,7 @@
         <div class="dialog-head">
           <div class="monitor-heading">
             <h2 tabindex="-1" autofocus>服务监控</h2>
-            <div id="monitorMessage" class="config-message" hidden></div>
+            <div id="monitorMessage" data-feedback-box class="config-message" hidden></div>
           </div>
           <div class="dialog-actions compact-actions">
             <button class="ghost" id="refreshStatusBtn" type="button">刷新</button>
@@ -164,8 +164,11 @@
       <section class="monitor-panel security-panel">
         <div class="dialog-head">
           <h2 id="securityTitle" tabindex="-1" autofocus>设置</h2>
-          <p id="securityMessage" class="config-message" role="status" hidden></p>
-          <button class="ghost" id="closeSecurityBtn" type="button">关闭</button>
+          <p id="securityMessage" data-feedback-box class="config-message" role="status" hidden></p>
+          <div class="security-header-actions">
+            <a class="ghost" href="/reader/backup" target="_blank" rel="noopener">备份与恢复</a>
+            <button class="ghost" id="closeSecurityBtn" type="button">关闭</button>
+          </div>
         </div>
         <section class="security-section" aria-labelledby="mfaTitle">
           <div class="security-section-head"><h3 id="mfaTitle">2FA 双重验证</h3><span id="mfaStatus" class="security-status">正在读取</span></div>
@@ -304,8 +307,8 @@
       </section>
     </dialog>
 
+    <script src="{{ asset_url('ui-feedback.js') }}"></script>
     <script src="{{ asset_url('ui.js') }}"></script>
-    <script src="{{ asset_url('font-cache.js') }}"></script>
     <script src="{{ asset_url('passkeys.js') }}"></script>
     <script src="{{ asset_url('home.js') }}"></script>
   </body>

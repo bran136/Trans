@@ -1,0 +1,93 @@
+/* Backup workspace; controls, feedback, theme and version badge use the shared UI. */
+html:has(.backup-page) { overscroll-behavior-y:auto; }
+.backup-page { min-height:0; height:100vh; height:100dvh; overscroll-behavior-x:none; overscroll-behavior-y:auto; margin:0; color:var(--ink); background:var(--bg); overflow-x:clip; overflow-y:auto; }
+.backup-shell { display:flex; flex-direction:column; gap:14px; height:100vh; height:100dvh; padding:24px max(24px, env(safe-area-inset-left), env(safe-area-inset-right)) 42px; }
+.backup-header, .backup-toolbar, .backup-section-head, .backup-bottom, .backup-actions, .backup-feedback { display:flex; align-items:center; gap:10px; }
+.backup-header, .backup-section-head, .backup-bottom { justify-content:space-between; }
+.backup-header h1 { margin:0; font-size:28px; letter-spacing:-.03em; }
+.backup-page h2 { margin:0; font-size:18px; }
+.backup-page a { text-decoration:none; }
+.backup-header, .backup-toolbar, .backup-bottom, .backup-footnote, .backup-section-head { flex-shrink:0; }
+.backup-panel { display:flex; flex-direction:column; flex:1; min-height:0; padding:18px; border:1px solid var(--line); border-radius:var(--panel-radius, 20px); background:var(--panel); }
+.backup-toolbar { flex-wrap:wrap; justify-content:space-between; padding-bottom:14px; border-bottom:1px solid var(--line); }
+.backup-tabs { display:flex; align-items:center; gap:4px; padding:4px; border:1px solid var(--line); border-radius:12px; background:var(--subtle); }
+.backup-page .backup-tabs .ghost { border-color:transparent; background:transparent; color:var(--muted); white-space:nowrap; }
+.backup-page .backup-tabs .ghost[aria-selected="true"] { color:var(--bg); border-color:var(--accent); background:var(--accent); font-weight:600; box-shadow:0 2px 6px rgba(var(--accent-rgb),.18); }
+.backup-feedback { flex-wrap:wrap; min-width:0; }
+.backup-feedback [data-feedback-box] { margin:0; }
+.backup-view { display:flex; flex-direction:column; flex:1; min-height:0; gap:12px; padding-top:12px; }
+.backup-scroll { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; overscroll-behavior-x:contain; overscroll-behavior-y:auto; padding:2px; }
+.backup-book { padding:14px; margin-bottom:10px; border:1px solid var(--line); border-radius:12px; min-width:0; }
+.backup-book:last-child { margin-bottom:0; }
+.backup-book-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.backup-book strong { font-size:15px; overflow-wrap:anywhere; }
+.backup-note, .backup-footnote, .backup-book p { color:var(--muted); font-size:12px; line-height:1.6; margin:0; }
+.backup-book p { margin-top:6px; }
+.backup-options { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px 16px; margin-top:12px; }
+.backup-option { display:flex; align-items:center; gap:7px; font-size:13px; min-width:0; }
+.backup-option input { flex:none; margin:0; width:16px; height:16px; accent-color:var(--accent); }
+.backup-option:has(input:disabled) { color:var(--muted); }
+.backup-actions { flex-wrap:wrap; margin-top:12px; }
+.backup-actions .backup-option { margin-right:8px; }
+.backup-page .ghost, .backup-upload { display:inline-flex; align-items:center; justify-content:center; min-height:32px; padding:5px 12px; font-size:13px; border:1px solid var(--line); border-radius:8px; color:var(--ink); background:var(--control); font-family:inherit; cursor:pointer; }
+.backup-page .backup-selection-head { flex-wrap:nowrap; align-items:center; }
+.backup-selection-head strong { min-width:0; }
+.backup-page .backup-select-book { flex:none; min-height:28px; padding:3px 9px; font-size:12px; }
+.backup-page .backup-primary { color:var(--accent-strong); border-color:rgba(var(--accent-rgb),.35); background:rgba(var(--accent-rgb),.08); }
+.backup-page .danger { color:var(--danger); border-color:rgba(var(--danger-rgb),.3); background:rgba(var(--danger-rgb),.07); }
+.backup-page button:disabled { opacity:.5; cursor:default; }
+.backup-upload { position:relative; }
+.backup-upload input { position:absolute; width:1px; height:1px; clip-path:inset(50%); overflow:hidden; }
+.backup-upload:focus-within { outline:2px solid var(--accent); outline-offset:2px; }
+.backup-page progress { width:100%; flex:none; height:5px; accent-color:var(--accent); margin:8px 0 0; }
+.backup-bottom { border-top:1px solid var(--line); padding-top:12px; }
+.backup-bottom > span { min-width:0; overflow-wrap:anywhere; }
+.backup-bottom > button { flex:none; white-space:nowrap; }
+.backup-footnote { margin:0; }
+.backup-page:has(dialog[open]) .backup-scroll { overflow-y:hidden; }
+.backup-page [hidden] { display:none !important; }
+.backup-page .version-badge { position:fixed; top:auto; right:max(14px,env(safe-area-inset-right)); bottom:max(7px,env(safe-area-inset-bottom)); }
+.backup-page dialog { width:min(480px,calc(100% - 24px)); max-height:calc(100dvh - 32px); overflow:auto; border:1px solid var(--line); border-radius:16px; background:var(--panel); color:var(--ink); padding:20px; }
+.backup-page dialog p { white-space:pre-line; overflow-wrap:anywhere; font-size:13px; line-height:1.7; }
+.backup-page dialog::backdrop { background:rgba(0,0,0,.35); backdrop-filter:blur(5px); }
+@media (hover:hover) { .backup-page .ghost:hover { color:var(--accent-strong); border-color:var(--accent); } .backup-page .danger:hover { color:var(--danger); border-color:var(--danger); } }
+@media (min-width:1100px) { #backupBooks, #restoreBooks { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-content:start; gap:12px; } #backupBooks .backup-book, #restoreBooks .backup-book { margin:0; } .backup-options { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media (max-width:700px) {
+  /* Keep native pull-to-refresh, but size the workspace to the visible viewport.
+     Override Android's shared body min-height so browser bars cannot push out the footer. */
+  html:has(.backup-page) { height:auto; overflow-x:clip; overflow-y:auto; overscroll-behavior-y:auto; }
+  :root > body.backup-page { width:100%; height:var(--backup-viewport-height,100svh); min-height:0; display:flex; flex-direction:column; overflow-x:clip; overflow-y:visible; overscroll-behavior-y:auto; }
+  .backup-shell { flex:1; height:auto; min-height:0; overflow:clip; gap:10px; padding:14px max(12px,env(safe-area-inset-left),env(safe-area-inset-right)) 0; }
+  /* The footer gets its own measured row instead of overlaying the actions. */
+  .backup-page > .version-badge { position:static; flex:none; align-self:flex-end; margin:6px max(12px,env(safe-area-inset-right)) max(7px,env(safe-area-inset-bottom)); }
+  .backup-view { overflow:clip; }
+  .backup-scroll { overscroll-behavior-y:auto; }
+  .backup-header h1 { font-size:23px; } .backup-header .ghost { font-size:12px; padding-inline:8px; }
+  .backup-panel { padding:12px; border-radius:16px; overflow:clip; } .backup-toolbar { display:grid; grid-template-columns:minmax(0,1fr) auto; grid-template-rows:auto minmax(28px,auto); gap:8px; padding-bottom:10px; }
+  .backup-tabs { grid-column:1; grid-row:1; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:2px; padding:3px; }
+  .backup-tabs .ghost { padding:5px 2px; font-size:12px; }
+  .backup-feedback { display:contents; }
+  #backupStatus { grid-column:1 / -1; grid-row:2; justify-self:start; align-self:start; text-align:left; }
+  #refreshBackup { grid-column:2; grid-row:1; padding-inline:8px; white-space:nowrap; }
+  .backup-options { grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+  .backup-book { padding:12px; } .backup-book strong { font-size:14px; }
+  .backup-book-head { align-items:flex-start; flex-wrap:wrap; } .backup-book-head .backup-actions { margin:0; }
+  .backup-footnote { font-size:11px; }
+}
+
+.backup-group-title { margin:8px 0 10px !important; font-size:15px !important; }
+.backup-tool-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-bottom:16px; }
+.backup-tool-grid .backup-book { margin:0; }
+.backup-tool-grid .backup-options { grid-template-columns:repeat(2,minmax(0,1fr)); }
+.backup-encryption { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-bottom:14px; }
+.backup-encryption label { display:flex; flex-direction:column; gap:5px; font-size:13px; }
+.backup-encryption p { grid-column:1 / -1; }
+.backup-page input[type=password] { box-sizing:border-box; width:100%; min-width:0; padding:8px 10px; font:inherit; font-size:13px; color:var(--ink); background:var(--control); border:1px solid var(--line); border-radius:8px; }
+.backup-tool-details { margin:10px 0; }
+.backup-tool-details summary { cursor:pointer; font-size:12px; color:var(--muted); }
+.backup-tool-details dl { display:grid; grid-template-columns:auto minmax(0,1fr); gap:5px 12px; font-size:12px; }
+.backup-tool-details dt, .backup-tool-details dd { margin:0; overflow-wrap:anywhere; }
+.backup-tool-details dd { color:var(--muted); }
+@media (max-width:900px) { .backup-tool-grid { grid-template-columns:1fr; gap:8px; } .backup-tool-grid .backup-book { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; } .backup-tool-grid .backup-options { margin:0; } }
+@media (max-width:400px) { .backup-encryption { grid-template-columns:1fr; } }
+@supports (-webkit-touch-callout:none) { .backup-page input[type=password] { font-size:16px; } }

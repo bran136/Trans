@@ -6,6 +6,7 @@
   document.body.classList.toggle('txt-desktop-enabled', desktop);
   let mode = 'toc', bookId = '', generation = 0, controller = null, timer = 0;
   let nextCursor = null, revision = '', query = '', seen = new Set();
+  let bookmarks = [], bookmarkBusy = false;
   const dialog = $('chapterSelectDialog');
   const input = $('bookSearchInput');
   const status = $('bookSearchStatus');
@@ -64,12 +65,15 @@
     mode = value;
     $('searchTocTab').setAttribute('aria-pressed', String(mode === 'toc'));
     $('searchBodyTab').setAttribute('aria-pressed', String(mode === 'body'));
-    input.placeholder = mode === 'toc' ? '搜索章节标题或序号' : '输入正文关键词，至少 2 个字符';
+    $('bookmarksTab').setAttribute('aria-pressed', String(mode === 'bookmarks'));
+    $('bookmarkActions').hidden = mode !== 'bookmarks';
+    input.placeholder = mode === 'toc' ? '搜索章节标题或序号' : mode === 'bookmarks' ? '搜索书签内容' : '输入正文关键词，至少 2 个字符';
     $('bookSearchSubmit').hidden = mode !== 'body';
     $('chapterSelectList').hidden = mode !== 'toc';
-    results.hidden = mode !== 'body';
+    results.hidden = mode === 'toc';
     $('bookSearchMore').hidden = true;
     if (mode === 'toc') filterToc();
+    else if (mode === 'bookmarks') loadBookmarks();
     else {
       results.replaceChildren(); nextCursor = null; seen = new Set();
       status.textContent = '输入关键词后搜索本书正文';
@@ -84,15 +88,104 @@
     setMode(value);
   }
   $('chapterSelectBtn').addEventListener('click', () => openSearch('toc'));
+  $('chapterSelectBtn').addEventListener('click', () => updateProgressFromScroll(false), true);
   $('searchTocTab').addEventListener('click', () => setMode('toc'));
   $('searchBodyTab').addEventListener('click', () => setMode('body'));
+  $('bookmarksTab').addEventListener('click', () => setMode('bookmarks'));
   function handleSearchInput() {
     if (mode === 'toc') filterToc();
+    else if (mode === 'bookmarks') renderBookmarks();
     else { cancelSearch(); results.replaceChildren(); nextCursor = null; $('bookSearchMore').hidden = true; status.textContent = '按回车或点击搜索'; }
   }
   input.addEventListener('input', event => { if (!event.isComposing) handleSearchInput(); });
   input.addEventListener('compositionend', handleSearchInput);
   dialog.addEventListener('close', cancelSearch);
+
+  async function loadBookmarks(options = {}) {
+    const mutating = Boolean(options.method);
+    if (mutating && bookmarkBusy) return;
+    if (mutating) {
+      bookmarkBusy = true;
+      $('addBookmarkBtn').disabled = true;
+      results.querySelectorAll('.bookmark-row .danger').forEach(button => { button.disabled = true; });
+    }
+    const own = ++generation, targetBook = bookId;
+    if (!options.method) { bookmarks = []; results.replaceChildren(); }
+    $('exportBookmarksBtn').disabled = true;
+    status.textContent = '正在读取书签…';
+    try {
+      const data = await api(`/api/books/${targetBook}/bookmarks`, options);
+      if (own !== generation || targetBook !== readerState.currentBookId || !dialog.open) return;
+      bookmarks = data.bookmarks;
+      renderBookmarks();
+      if (options.method === 'POST' && data.duplicate) status.textContent = '当前位置已有书签，未重复添加';
+    } catch (error) { if (own === generation) status.textContent = error.message; }
+    finally {
+      if (mutating) {
+        bookmarkBusy = false;
+        $('addBookmarkBtn').disabled = false;
+        results.querySelectorAll('.bookmark-row .danger').forEach(button => { button.disabled = false; });
+        // A newer tab/read request may have observed the list before this write finished.
+        if (own !== generation && targetBook === readerState.currentBookId && mode === 'bookmarks' && dialog.open) loadBookmarks();
+      }
+    }
+  }
+  function renderBookmarks() {
+    results.replaceChildren();
+    $('exportBookmarksBtn').disabled = !bookmarks.length;
+    const needle = input.value.trim().toLocaleLowerCase();
+    const visible = bookmarks.filter(item => `${item.title}\n${item.quote}`.toLocaleLowerCase().includes(needle));
+    status.textContent = bookmarks.length ? `${visible.length} 个书签` : '还没有书签，可保存正文中当前高亮的句子';
+    visible.forEach(item => {
+      const row = document.createElement('div'); row.className = 'bookmark-row';
+      const jump = document.createElement('button'); jump.type = 'button'; jump.className = 'book-search-result';
+      jump.disabled = item.stale;
+      const title = document.createElement('strong'); title.textContent = item.title;
+      const quote = document.createElement('span'); markText(quote, item.quote, input.value.trim());
+      const info = document.createElement('small'); info.textContent = item.stale
+        ? '正文已更新，请重新添加；原文片段仍保留' : `第 ${item.sentence + 1} 句 · ${new Date(item.created_at * 1000).toLocaleString()}`;
+      jump.append(title, quote, info);
+      const targetBook = bookId;
+      jump.addEventListener('click', async () => {
+        if (targetBook !== readerState.currentBookId) return;
+        jump.disabled = true;
+        stopListening(false, false);
+        try {
+          if (await loadChapter(item.chapter, item.sentence, item.content_revision)) dialog.close();
+        } catch (error) {
+          if (targetBook === readerState.currentBookId && mode === 'bookmarks' && dialog.open) status.textContent = error.message;
+        } finally { jump.disabled = item.stale; }
+      });
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger'; remove.textContent = '删除';
+      remove.disabled = bookmarkBusy;
+      remove.addEventListener('click', async () => {
+        if (targetBook !== readerState.currentBookId) return;
+        remove.disabled = true;
+        await loadBookmarks({ method: 'DELETE', body: JSON.stringify({ id: item.id }) });
+        remove.disabled = false;
+      });
+      row.append(jump, remove); results.append(row);
+    });
+  }
+  function currentBookmarkPosition() {
+    return {
+      chapter: readerState.currentChapter,
+      sentence: readerState.currentSentence,
+      content_revision: readerState.currentBook?.content_revision || '',
+    };
+  }
+  $('addBookmarkBtn').addEventListener('click', async () => {
+    const button = $('addBookmarkBtn'); button.disabled = true;
+    try {
+      await loadBookmarks({ method: 'POST', body: JSON.stringify(currentBookmarkPosition()) });
+    } finally { button.disabled = false; }
+  });
+  $('exportBookmarksBtn').addEventListener('click', () => {
+    const text = bookmarks.map(item => `## ${item.title}\n\n${item.quote}\n`).join('\n');
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown;charset=utf-8' }));
+    const link = document.createElement('a'); link.href = url; link.download = 'Trans-书签.md'; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  });
 
   async function request(url, options = {}) {
     const response = await fetch(url, { ...options, signal: controller?.signal,
@@ -163,6 +256,7 @@
   $('bookSearchForm').addEventListener('submit', event => {
     event.preventDefault();
     if (mode === 'toc') { filterToc(); return; }
+    if (mode === 'bookmarks') { renderBookmarks(); return; }
     cancelSearch();
     query = input.value.trim();
     if (query.length < 2 || query.length > 80) { status.textContent = '请输入 2–80 个字符'; return; }

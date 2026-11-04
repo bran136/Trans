@@ -280,6 +280,7 @@
   }
 
   window.TransUI = {
+    ...window.TransFeedback,
     setupScrollFades,
     prompt: (title, value) => showTextDialog(title, "", value),
     message: (title, message) => showTextDialog(title, message),

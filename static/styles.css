@@ -330,7 +330,7 @@ textarea:disabled {
 
 .tool-card strong {
   color: var(--accent-strong);
-  font-family: "AppYShiWritten", "Microsoft YaHei", "微软雅黑", sans-serif;
+  font-family: inherit;
   font-size: 30px;
   font-weight: 700;
 }

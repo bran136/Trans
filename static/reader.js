@@ -12,7 +12,8 @@ const readerState = {
   progressSentence: 0,
   progressFollowsAudio: false,
   lastProgressKey: "",
-  progressRequests: new Set(),
+  progressRequests: new Map(),
+  progressSession: null,
   sentences: [],
   readingOffsets: [0],
   sentenceOffsets: [0],
@@ -32,6 +33,7 @@ const readerState = {
   mediaMetadataSignature: "",
   saveTimer: null,
   importJobs: [],
+  dismissedImportJobs: new Set(),
   localImportJobs: [],
   importPollTimer: null,
   importDisplayTimer: null,
@@ -89,6 +91,7 @@ const readerState = {
   audioStatistics: null,
   localAudioStatistics: null,
   statisticsController: null,
+  statisticsManualRefresh: false,
   statisticsUpdatedAt: 0,
   statisticsRepairLocal: false,
   statisticsError: "",
@@ -1012,11 +1015,12 @@ function setStatus(text) {
   $("readerStatus").textContent = text || "本地书架";
 }
 
-function setUploadMessage(text, type = "") {
+function setUploadMessage(text, type = "", successDuration = 4000) {
+  if (type === "success" && successDuration === 0 && !$("manageDialog").open) return;
   const message = $("uploadMessage");
   if (!message) return;
-  message.textContent = text;
   message.className = `upload-message ${type}`.trim();
+  window.TransUI.feedback(message, text, type || "info", true, null, successDuration);
 }
 
 function showUploadProgress(percent) {
@@ -1067,7 +1071,10 @@ function renderImportJobs() {
   const shouldShowJob = (job) => {
     const age = now - Number(job.updated_at || 0);
     if (["uploading", "receiving", "parsing"].includes(job.status)) return true;
-    if (job.status === "done") return age < 20;
+    if (job.status === "done") {
+      if (!$("manageDialog").open) readerState.dismissedImportJobs.add(job.id);
+      return !readerState.dismissedImportJobs.has(job.id);
+    }
     if (job.status === "error") return age < 120;
     return age < 20;
   };
@@ -1091,7 +1098,7 @@ function renderImportJobs() {
   $("bookFile").disabled = limited;
   window.clearTimeout(readerState.importDisplayTimer);
   const expiries = jobs
-    .filter((job) => !["uploading", "parsing"].includes(job.status))
+    .filter((job) => !["uploading", "receiving", "parsing", "done"].includes(job.status))
     .map((job) => {
       const ttl = job.status === "error" ? 120 : 20;
       return Math.max(1, ttl - (Date.now() / 1000 - Number(job.updated_at || 0)));
@@ -1099,7 +1106,8 @@ function renderImportJobs() {
   if (expiries.length) {
     readerState.importDisplayTimer = window.setTimeout(renderImportJobs, Math.min(...expiries) * 1000);
   }
-  if (!readerState.reparseBusy) {
+  const feedback = $("uploadMessage");
+  if (!readerState.reparseBusy && !(feedback.textContent && ["error", "success", "pending"].includes(feedback.dataset.feedback))) {
     if (limited) {
       setUploadMessage("已有 2 本书正在导入，请等待至少一本完成");
     } else if (!$("bookFile").files[0]) {
@@ -1111,13 +1119,21 @@ function renderImportJobs() {
 async function loadImportJobs() {
   const data = await api("/api/book-imports");
   const previousDone = new Set(readerState.importJobs.filter((job) => job.status === "done").map((job) => job.id));
+  const previousErrors = new Set(readerState.importJobs.filter((job) => job.status === "error").map((job) => job.id));
   readerState.importJobs = data.jobs || [];
+  const failed = readerState.importJobs.find((job) => job.status === "error" && !previousErrors.has(job.id));
+  if (failed) setUploadMessage(`${failed.name}：${failed.error || "导入失败"}`, "error");
   const serverIds = new Set(readerState.importJobs.map((job) => job.id));
   readerState.localImportJobs = readerState.localImportJobs.filter((job) => !job.server_id || !serverIds.has(job.server_id));
   renderImportJobs();
   const hasNewDone = readerState.importJobs.some((job) => job.status === "done" && !previousDone.has(job.id));
   if (hasNewDone) await loadBooks();
   const hasActive = activeImportCount() > 0;
+  const visibleCompletion = readerState.importJobs.some(job => job.status === "done"
+    && !previousDone.has(job.id) && !readerState.dismissedImportJobs.has(job.id));
+  if (!hasActive && !failed && visibleCompletion && $("manageDialog").open) {
+    setUploadMessage("导入完成", "success", 0);
+  }
   window.clearTimeout(readerState.importPollTimer);
   if (hasActive) {
     readerState.importPollTimer = window.setTimeout(() => loadImportJobs().catch((error) => setStatus(error.message)), 1500);
@@ -1289,6 +1305,10 @@ async function localAudioStatistics(server) {
       metadataIds.add(record.id);
       const book = books.get(record.bookId);
       const segments = record.segments;
+      if (book && !(Number(record.size) > 0 && Number(record.size) <= TTS_MAX_PACK_BYTES)) {
+        book.unknown = true;
+        book.size_known = false;
+      }
       if (book && Number(record.size) > 0 && Number(record.size) <= TTS_MAX_PACK_BYTES) {
         book.size_bytes += Number(record.size);
         const source = book.source;
@@ -1339,6 +1359,11 @@ async function localAudioStatistics(server) {
     }
   }
   for (const book of books.values()) {
+    // An empty local index is conclusive even before the server has sentence counts.
+    if (book.size_known && book.size_bytes === 0) {
+      book.unknown = false;
+      book.coverage_percent = 0;
+    }
     let covered = 0;
     const counts = book.source?.chapter_sentences;
     for (const [index, chapter] of book.coverage) {
@@ -1363,12 +1388,13 @@ async function refreshAudioStatistics(recheck = false) {
   readerState.statisticsController?.abort();
   const controller = new AbortController();
   readerState.statisticsController = controller;
+  readerState.statisticsManualRefresh = recheck;
   if (recheck) readerState.statisticsRepairLocal = true;
   const button = $("refreshStatisticsBtn");
   button.disabled = true;
+  const finish = window.TransUI.busyButton(button);
   readerState.statisticsError = "";
   readerState.localStatisticsError = "";
-  readerState.localAudioStatistics = null;
   renderStatistics();
   let localSnapshot = null;
   const loadLocal = async (repair = false) => {
@@ -1443,16 +1469,22 @@ async function refreshAudioStatistics(recheck = false) {
     }
   } finally {
     if (readerState.statisticsController === controller) {
+      finish();
       button.disabled = false;
       readerState.statisticsController = null;
-      if ($("statisticsDialog").open) renderStatistics();
+      if ($("statisticsDialog").open) {
+        renderStatistics();
+        if (recheck && !controller.signal.aborted && !readerState.statisticsError && !readerState.localStatisticsError) {
+          window.TransUI.feedback($("statisticsCacheUpdating"), "统计已刷新", "success");
+        }
+      }
     }
   }
 }
 
 function mergeStatisticsBooks(books, previousBooks) {
   const current = new Map(readerState.books.map(book => [book.id, book]));
-  const pending = new Set([...readerState.progressRequests].map(key => key.split(":", 1)[0]));
+  const pending = new Set([...readerState.progressRequests.keys()].map(key => key.split(":", 1)[0]));
   readerState.books = books.map(book => {
     const local = current.get(book.id);
     // A shelf return may still be saving progress while this GET is in flight.
@@ -1507,16 +1539,18 @@ function renderStatistics() {
   const books = recentlyOpenedBooks();
   summary.textContent = `共 ${books.length} 本`;
   const snapshot = readerState.audioStatistics;
-  const busy = !!readerState.statisticsController && !readerState.statisticsError && !readerState.localStatisticsError;
-  $("statisticsCacheStatusText").textContent = readerState.statisticsError || readerState.localStatisticsError
-    || (readerState.statisticsUpdatedAt ? `统计更新于 ${new Date(readerState.statisticsUpdatedAt).toLocaleTimeString("zh-CN", { hour12: false })}`
-      : busy ? "" : "缓存统计尚未就绪，请刷新");
-  $("statisticsCacheUpdating").hidden = !busy;
-  $("statisticsCacheUpdatingText").textContent = busy
-    ? snapshot?.refreshing
-      ? `后台更新中（${Number.isFinite(snapshot.progress_percent) ? snapshot.progress_percent : 0}%）`
-      : "正在读取统计…"
-    : "";
+  const busy = !!readerState.statisticsController && (!snapshot?.ready || snapshot?.refreshing || readerState.statisticsManualRefresh)
+    && !readerState.statisticsError && !readerState.localStatisticsError;
+  const error = readerState.statisticsError || readerState.localStatisticsError;
+  $("statisticsCacheStatusText").textContent = readerState.statisticsUpdatedAt
+    ? `统计更新于 ${new Date(readerState.statisticsUpdatedAt).toLocaleTimeString("zh-CN", { hour12: false })}`
+    : !busy && !error ? "缓存统计尚未就绪，请刷新" : "";
+  const feedback = $("statisticsCacheUpdating");
+  if (error) window.TransUI.feedback(feedback, error, "error");
+  else if (busy) window.TransUI.feedback(feedback, snapshot?.refreshing
+    ? `后台更新中（${Number.isFinite(snapshot.progress_percent) ? snapshot.progress_percent : 0}%）`
+    : "正在读取统计…", "pending");
+  else if (feedback.dataset.feedback !== "success") window.TransUI.feedback(feedback, "");
   const scrollTop = list.scrollTop;
   list.innerHTML = "";
   books.forEach((book) => {
@@ -1596,16 +1630,14 @@ function renderManageBooks() {
 
 function showTocEditMessage(text, type = "") {
   const node = $("tocEditMessage");
-  node.textContent = text || "";
   node.className = `reader-config-message ${type}`.trim();
-  node.hidden = !text;
+  window.TransUI.feedback(node, text || "", type || "info");
 }
 
 function showTocLineMessage(text, type = "") {
   const node = $("tocLineMessage");
-  node.textContent = text || "";
   node.className = `reader-config-message ${type}`.trim();
-  node.hidden = !text;
+  window.TransUI.feedback(node, text || "", type || "info");
 }
 
 function closeActionConfirmation(confirmed) {
@@ -1748,6 +1780,7 @@ async function renameTxtChapter(chapter) {
     return;
   }
   try {
+    showTocEditMessage("正在保存章节标题…", "pending");
     await api(`/api/books/${readerState.tocEditBookId}/chapters/${chapter.index}/title`, {
       method: "PATCH",
       body: JSON.stringify({ title: trimmed }),
@@ -1868,9 +1901,8 @@ async function splitTxtChapterAtLine(line) {
 
 function showBookMetadataMessage(text, type = "") {
   const message = $("bookMetadataMessage");
-  message.textContent = text || "";
   message.className = `reader-config-message ${type}`.trim();
-  message.hidden = !text;
+  window.TransUI.feedback(message, text || "", type || "info");
 }
 
 function openBookMetadataEditor(book) {
@@ -1894,7 +1926,7 @@ async function saveBookMetadata(event) {
   }
   const trimmedAuthor = $("bookAuthorInput").value.trim();
   $("saveBookMetadataBtn").disabled = true;
-  showBookMetadataMessage("正在保存");
+  showBookMetadataMessage("正在保存…", "pending");
   try {
     const data = await api(`/api/books/${bookId}`, {
       method: "PATCH",
@@ -2151,15 +2183,24 @@ async function uploadBook(event) {
       readerState.localImportJobs = readerState.localImportJobs.map((job) => (
         job.id === localJobId ? { ...job, status: "parsing", progress: 100, server_id: data.job.id, updated_at: Date.now() / 1000 } : job
       ));
-      readerState.importJobs = [data.job, ...readerState.importJobs.filter((job) => job.id !== data.job.id)];
+      const job = data.job;
+      readerState.importJobs = [job, ...readerState.importJobs.filter((item) => item.id !== job.id)];
       renderImportJobs();
       startImportPolling();
-      setStatus("正在解析");
-      setUploadMessage(`已加入导入队列：${data.job.name}`, "success");
+      if (job.status === "done") {
+        setStatus("导入完成");
+        setUploadMessage("导入完成", "success", 0);
+        await loadBooks();
+      } else if (job.status === "error") {
+        setUploadMessage(job.error || "导入失败", "error");
+      } else {
+        setStatus("正在解析");
+        setUploadMessage(`正在导入：${job.name}`, "pending");
+      }
     } else if (data.book) {
       await loadBooks();
       setStatus("导入完成");
-      setUploadMessage(`已导入：《${data.book.title}》`, "success");
+      setUploadMessage(`已导入：《${data.book.title}》`, "success", 0);
     }
   } catch (error) {
     readerState.localImportJobs = readerState.localImportJobs.map((job) => (
@@ -2174,7 +2215,7 @@ async function uploadBook(event) {
   }
 }
 
-async function openBook(bookId, chapter = 0, sentence = 0, addHistory = true) {
+async function openBook(bookId, chapter = 0, sentence = 0, addHistory = true, latestProgress = false) {
   const navigationRequest = ++readerState.navigationRequest;
   const openedFromShelf = !$("shelfView").hidden;
   flushPendingProgress();
@@ -2184,14 +2225,21 @@ async function openBook(bookId, chapter = 0, sentence = 0, addHistory = true) {
   readerState.displayedBookId = "";
   readerState.currentBookId = bookId;
   setStatus("正在打开书籍…");
+  // Returning to a book must not fetch a new writer version before this page's
+  // previous save settles. Saves for other books do not delay navigation.
+  const pending = [...readerState.progressRequests.entries()]
+    .filter(([key]) => key.startsWith(`${bookId}:`)).map(([, promise]) => promise);
+  await Promise.allSettled(pending);
+  if (navigationRequest !== readerState.navigationRequest) return;
   const data = await api(`/api/books/${bookId}`).catch((error) => {
     if (navigationRequest === readerState.navigationRequest) throw error;
     return null;
   });
   if (readerState.currentBookId !== bookId || navigationRequest !== readerState.navigationRequest) return;
   const previous = readerState.books.find((book) => book.id === bookId);
-  if (previous && previous.content_revision !== data.book.content_revision
-      && chapter === (previous.progress?.chapter || 0) && sentence === (previous.progress?.sentence || 0)) {
+  if (latestProgress || (previous && (previous.content_revision !== data.book.content_revision
+      || previous.progress_version !== data.book.progress_version)
+      && chapter === (previous.progress?.chapter || 0) && sentence === (previous.progress?.sentence || 0))) {
     chapter = data.book.progress?.chapter || 0;
     sentence = data.book.progress?.sentence || 0;
   }
@@ -2209,6 +2257,11 @@ async function openBook(bookId, chapter = 0, sentence = 0, addHistory = true) {
   }
   if (readerState.currentBookId !== bookId || navigationRequest !== readerState.navigationRequest) return;
   readerState.currentBook = data.book;
+  readerState.progressSession = {
+    bookId, version: data.book.progress_version || 0, sequence: 0, acknowledged: 0, blocked: false,
+    writer: window.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-reader`,
+  };
+  renderProgressNotice();
   readerState.chapters = data.chapters || [];
   prepareReadingOffsets();
   renderBooks();
@@ -2242,6 +2295,7 @@ function updateCurrentBookProgressLocally() {
     sentence: readerState.progressSentence,
     percent: currentReadingPercent(),
     contentRevision: readerState.currentBook?.content_revision || "",
+    progressSession: readerState.progressSession,
   };
   readerState.books = readerState.books.map((book) => (
     book.id === bookId
@@ -2332,7 +2386,7 @@ function selectChapter(chapterIndex) {
     .catch((error) => setListenStatus(error.message));
 }
 
-async function loadChapter(chapterIndex, sentenceIndex = 0) {
+async function loadChapter(chapterIndex, sentenceIndex = 0, expectedRevision = null) {
   if (!readerState.currentBookId) return false;
   const navigationRequest = ++readerState.navigationRequest;
   const bookId = readerState.currentBookId;
@@ -2343,6 +2397,9 @@ async function loadChapter(chapterIndex, sentenceIndex = 0) {
     return null;
   });
   if (!isCurrent()) return false;
+  if (expectedRevision !== null && data.book.content_revision !== expectedRevision) {
+    throw new Error("正文已更新，书签位置需要重新确认");
+  }
   readerState.currentBook = data.book;
   readerState.currentChapter = data.chapter.index;
   readerState.currentSentence = sentenceIndex;
@@ -2354,7 +2411,8 @@ async function loadChapter(chapterIndex, sentenceIndex = 0) {
   if (data.book.progress?.percent === 100 && data.book.progress.chapter === readerState.currentChapter
       && data.book.progress.sentence === readerState.currentSentence) readerState.chapterComplete = true;
   saveProgressSoon();
-  setStatus(readerState.currentBook.title);
+  setStatus(readerState.progressSession?.blocked
+    ? readerState.progressSession.message || "其他页面已更新进度，请重新打开本书后继续同步" : readerState.currentBook.title);
   if (readerState.reading) updateMediaSessionMetadata();
   return true;
 }
@@ -2541,26 +2599,59 @@ function flushPendingProgress(keepalive = false) {
   if (snapshot) return saveProgress(snapshot, keepalive);
 }
 
+function renderProgressNotice() {
+  const session = readerState.progressSession;
+  const blocked = session?.blocked && session.bookId === readerState.currentBookId;
+  const text = blocked ? session.message || "其他页面已更新进度" : "";
+  $("readerProgressNotice").hidden = !blocked;
+  window.TransUI.feedback($("readerProgressMessage"), text || "", "error");
+}
+
+async function resumeLatestProgress() {
+  const session = readerState.progressSession;
+  if (!session?.blocked || session.bookId !== readerState.currentBookId || $("resumeLatestProgressBtn").disabled) return;
+  const finish = window.TransUI.busyButton($("resumeLatestProgressBtn"));
+  try {
+    await openBook(session.bookId, 0, 0, false, true);
+  } catch (error) {
+    if (readerState.currentBookId === session.bookId) {
+      readerState.progressSession.blocked = true;
+      readerState.progressSession.message = error.message;
+      renderProgressNotice();
+    }
+  } finally { finish(); }
+}
+
 async function saveProgress(snapshot = null, keepalive = false) {
   const bookId = snapshot?.bookId || readerState.currentBookId;
   const chapter = snapshot?.chapter ?? readerState.currentChapter;
   const sentence = snapshot?.sentence ?? readerState.progressSentence;
   if (!bookId || (!snapshot && readerState.displayedBookId !== bookId)) return;
-  const payload = JSON.stringify({
+  const progressSession = snapshot?.progressSession || readerState.progressSession;
+  if (!progressSession || progressSession.bookId !== bookId || progressSession.blocked) return;
+  const position = {
     chapter,
     sentence,
     percent: snapshot?.percent ?? currentReadingPercent(),
     content_revision: snapshot?.contentRevision ?? readerState.currentBook?.content_revision ?? "",
-  });
-  const progressKey = `${bookId}:${payload}`;
+  };
+  const progressKey = `${bookId}:${progressSession.writer}:${JSON.stringify(position)}`;
   if (readerState.lastProgressKey === progressKey || (!keepalive && readerState.progressRequests.has(progressKey))) return;
-  readerState.progressRequests.add(progressKey);
+  const sequence = ++progressSession.sequence;
+  const payload = JSON.stringify({ ...position, progress_version: progressSession.version,
+    progress_writer: progressSession.writer, progress_sequence: sequence });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 10000);
+  const saving = api(`/api/books/${bookId}/progress`, {
+    method: "PUT", keepalive, body: payload, signal: controller.signal,
+  });
+  readerState.progressRequests.set(progressKey, saving);
   try {
-    const data = await api(`/api/books/${bookId}/progress`, {
-      method: "PUT",
-      keepalive,
-      body: payload,
-    });
+    const data = await saving;
+    if (sequence < progressSession.acknowledged) return;
+    progressSession.acknowledged = sequence;
+    progressSession.version = Math.max(progressSession.version, data.book?.progress_version || 0);
+    if (progressSession !== readerState.progressSession) return;
     readerState.lastProgressKey = progressKey;
     if (data.book) {
       readerState.books = readerState.books.map((book) => (book.id === data.book.id ? data.book : book));
@@ -2570,9 +2661,17 @@ async function saveProgress(snapshot = null, keepalive = false) {
       if (!$("shelfView").hidden) renderBooks();
     }
   } catch (error) {
-    setStatus(error.message);
+    if (["progress_conflict", "content_changed"].includes(error.code)) {
+      progressSession.blocked = true;
+      progressSession.message = error.code === "content_changed" ? "书籍内容已更新，请跳转到最新进度" : "其他页面已更新进度，请跳转到最新进度";
+    }
+    if (progressSession === readerState.progressSession) {
+      renderProgressNotice();
+      setStatus(error.message);
+    }
   } finally {
-    readerState.progressRequests.delete(progressKey);
+    window.clearTimeout(timeout);
+    if (readerState.progressRequests.get(progressKey) === saving) readerState.progressRequests.delete(progressKey);
   }
 }
 
@@ -3351,9 +3450,6 @@ async function ensureReaderFontLoaded(fontId, forceRetry = false) {
 async function activateCachedReaderFont(fontId) {
   const webFamily = FONT_WEB_FAMILIES[fontId];
   if (!webFamily) return true;
-  if (fontId === "yshi-written" && window.readerRequiredFontPromise) {
-    await window.readerRequiredFontPromise.catch(() => false);
-  }
   if (isReaderFontLoaded(fontId)) {
     setFontLoadState(fontId, "ready");
     return true;
@@ -3517,11 +3613,11 @@ function selectOption(label, value, selected = false) {
   return item;
 }
 
-function showTtsConfigMessage(text, type = "") {
+function showTtsConfigMessage(text, type = "", source = "") {
   const message = $("ttsConfigMessage");
-  message.hidden = !text;
-  message.textContent = text || "";
+  message.dataset.source = source;
   message.className = `reader-config-message ${type}`.trim();
+  window.TransUI.feedback(message, text || "", type || "info");
 }
 
 function formatBytes(bytes) {
@@ -3616,6 +3712,7 @@ function scheduleMimoBalanceInterval() {
 
 async function loadMimoBalance(options = {}) {
   const force = !!options.force;
+  if (!force && $("refreshMimoBalanceBtn").classList.contains("ui-busy")) return false;
   if ((!force && document.hidden) || !ttsReady() || !readerState.ttsConfig?.balance_cookie_configured) return false;
   const requestId = ++readerState.mimoBalanceRequestId;
   window.clearTimeout(readerState.mimoBalanceRetryTimer);
@@ -3636,6 +3733,8 @@ async function loadMimoBalance(options = {}) {
       scheduleMimoBalanceInterval();
     }
     renderMimoBalance();
+    const message = $("ttsConfigMessage");
+    if (!data.balance?.auth_expired && message.dataset.source === "balance" && message.dataset.feedback === "error") showTtsConfigMessage("");
     return !data.balance?.auth_expired;
   } catch (error) {
     if (requestId !== readerState.mimoBalanceRequestId) return false;
@@ -3747,7 +3846,7 @@ function showOfflineCacheProgress(message, type = "", bookId = "", retry = null)
   if (bookId && bookId !== readerState.offlineBookId) return;
   const node = $("offlineCacheProgress");
   const text = $("offlineCacheProgressText");
-  text.textContent = message || "";
+  window.TransUI.feedback(text, message || "", type || "info", false, null, 0);
   text.title = message || "";
   node.classList.toggle("visible", !!message);
   node.classList.toggle("error", type === "error");
@@ -3839,7 +3938,7 @@ async function resumeOfflineJob(job, bookId) {
     } : null;
     showOfflineCacheProgress(
       completedJob.message || (completedJob.status === "cancelled" ? "任务已取消" : "服务器固定完成"),
-      hasFailures ? "error" : "",
+      hasFailures ? "error" : "success",
       bookId,
       retry,
     );
@@ -4153,7 +4252,7 @@ async function cancelOfflineJob() {
 
     if (ownsWait) {
       const completedJob = await waitForOfflineJob(data.job, bookId);
-      showOfflineCacheProgress(completedJob.message || "任务已取消", "", bookId);
+      showOfflineCacheProgress(completedJob.message || "任务已取消", "success", bookId);
       await loadOfflineCacheStatus(bookId);
     }
   } catch (error) {
@@ -4390,7 +4489,7 @@ async function createOfflineCache(downloadToDevice, requestedChapterIndexes = nu
       const message = completedJob?.status === "cancelled"
         ? completedJob.message || "任务已取消"
         : downloadToDevice ? "已停止后续本机下载" : completedJob?.message;
-      showOfflineCacheProgress(message, "", bookId);
+      showOfflineCacheProgress(message, "success", bookId);
       await loadOfflineCacheStatus(bookId);
       return;
     }
@@ -4405,7 +4504,7 @@ async function createOfflineCache(downloadToDevice, requestedChapterIndexes = nu
         ? "服务器固定完成 · 复用 " + Number(completedJob.cached_sentences || 0)
           + " 句 · 生成 " + Number(completedJob.generated_sentences || 0) + " 句" + failedText
         : "所选章节已完整固定，无需重复处理";
-      showOfflineCacheProgress(message, failed || failedPacks ? "error" : "", bookId, retry);
+      showOfflineCacheProgress(message, failed || failedPacks ? "error" : "success", bookId, retry);
       await loadOfflineCacheStatus(bookId);
       return;
     }
@@ -4413,14 +4512,14 @@ async function createOfflineCache(downloadToDevice, requestedChapterIndexes = nu
     const complete = offlineDownloadIsComplete(downloaded);
     showOfflineCacheProgress(
       offlineDownloadSummary(downloaded) + failedText,
-      failed || failedPacks || !complete ? "error" : "",
+      failed || failedPacks || !complete ? "error" : "success",
       bookId,
       failed || failedPacks || !complete ? { bookId, chapterIndexes, downloadToDevice: true } : null,
     );
     await loadOfflineCacheStatus(bookId);
   } catch (error) {
     if (error.name === "AbortError") {
-      showOfflineCacheProgress("本机下载已取消，已下载部分已保留", "", bookId);
+      showOfflineCacheProgress("本机下载已取消，已下载部分已保留", "success", bookId);
       await loadOfflineCacheStatus(bookId);
     } else {
       showOfflineCacheProgress(
@@ -4463,10 +4562,11 @@ async function deleteSelectedLocalOffline() {
   if (!confirmed) return;
   setOfflineCacheBusy(true);
   try {
+    showOfflineCacheProgress("正在删除本机缓存…", "pending", bookId);
     const removed = await deleteLocalOfflineChapters(bookId, profileKey, chapterIndexes);
     showOfflineCacheProgress(
       `已删除本机缓存 ${removed.packs} 个播放包 · ${formatBytes(removed.sizeBytes)}`,
-      "",
+      "success",
       bookId,
     );
     await loadOfflineCacheStatus(bookId);
@@ -4491,6 +4591,7 @@ async function unpinSelectedServerOffline() {
   if (!confirmed) return;
   setOfflineCacheBusy(true);
   try {
+    showOfflineCacheProgress("正在取消服务器固定…", "pending", bookId);
     const removed = await api(`/api/books/${bookId}/tts-offline`, {
       method: "DELETE",
       body: JSON.stringify({ chapters: chapterIndexes }),
@@ -4498,7 +4599,7 @@ async function unpinSelectedServerOffline() {
     showOfflineCacheProgress(
       `已取消服务器固定 ${removed.entries} 条 · 清理播放包 `
         + `${Number(removed.pack_entries || 0)} 个 / ${formatBytes(removed.removed_size_bytes || 0)}`,
-      "",
+      "success",
       bookId,
     );
     await loadOfflineCacheStatus(bookId);
@@ -4674,14 +4775,18 @@ function ttsConfigPayload(overrides = {}) {
 }
 
 async function saveTtsConfig() {
+  const button = $("saveTtsConfigBtn");
+  if (button.disabled || $("refreshMimoBalanceBtn").disabled) return;
   const previousConfigured = !!readerState.ttsConfig?.api_key_configured;
   const payload = ttsConfigPayload();
   if (payload.enabled && !payload.api_key && !previousConfigured) {
     showTtsConfigMessage("请先配置 API Key", "error");
     return;
   }
+  const finish = window.TransUI.busyButton(button);
+  $("refreshMimoBalanceBtn").disabled = true;
   try {
-    showTtsConfigMessage("正在保存");
+    showTtsConfigMessage("正在保存…", "pending");
     const data = await api("/api/reader/tts-config", { method: "PUT", body: JSON.stringify(payload) });
     readerState.ttsConfig = data.config;
     if (readerState.reading) stopListening(false);
@@ -4689,25 +4794,26 @@ async function saveTtsConfig() {
     showTtsConfigMessage("听书配置已保存", "success");
   } catch (error) {
     showTtsConfigMessage(error.message, "error");
-  }
+  } finally { finish(); $("refreshMimoBalanceBtn").disabled = false; }
 }
 
 async function refreshMimoBalance() {
   const button = $("refreshMimoBalanceBtn");
-  if (button) button.disabled = true;
+  if (button.disabled || $("saveTtsConfigBtn").disabled) return;
+  $("saveTtsConfigBtn").disabled = true;
+  const finish = window.TransUI.busyButton(button);
+  showTtsConfigMessage("正在查询余额…", "pending", "balance");
   try {
-    await loadMimoBalance({ force: true });
-  } finally {
-    if (button) button.disabled = false;
-  }
+    const updated = await loadMimoBalance({ force: true });
+    showTtsConfigMessage(updated ? "余额已更新" : "余额查询失败，请查看下方提示", updated ? "success" : "error", "balance");
+  } finally { finish(); $("saveTtsConfigBtn").disabled = false; }
 }
 
 function showMimoCookieMessage(text, type = "") {
   const node = $("mimoCookieMessage");
   if (!node) return;
-  node.textContent = text || "";
   node.className = `reader-config-message ${type}`.trim();
-  node.hidden = !text;
+  window.TransUI.feedback(node, text || "", type || "info");
 }
 
 function openMimoCookieDialog() {
@@ -4746,7 +4852,7 @@ async function saveMimoBalanceCookie() {
   const button = $("saveMimoCookieBtn");
   if (button) button.disabled = true;
   try {
-    showMimoCookieMessage("正在保存");
+    showMimoCookieMessage("正在保存…", "pending");
     const data = await api("/api/reader/tts-config", {
       method: "PUT",
       body: JSON.stringify(persistedTtsConfigPayload({ balance_cookie: cookie })),
@@ -4755,14 +4861,14 @@ async function saveMimoBalanceCookie() {
     readerState.mimoBalance = data.config.balance_status || readerState.mimoBalance;
     input.value = "";
     $("mimoCookieDialog").close();
-    showTtsConfigMessage("Cookie 已保存，正在更新余额", "success");
+    showTtsConfigMessage("Cookie 已保存，正在更新余额", "pending");
     const updated = await loadMimoBalance({ force: true });
     if (updated) {
       showTtsConfigMessage("Cookie 已保存，余额已更新", "success");
     } else if (readerState.mimoBalance?.auth_expired) {
       showTtsConfigMessage("Cookie 已保存，但已失效，请重新获取", "error");
     } else {
-      showTtsConfigMessage("Cookie 已保存，余额更新失败，正在重试", "error");
+      showTtsConfigMessage("Cookie 已保存，余额更新失败，正在重试", "error", "balance");
     }
   } catch (error) {
     showMimoCookieMessage(error.message, "error");
@@ -4854,6 +4960,7 @@ $("statisticsBtn").addEventListener("click", () => {
   openReaderDialog($("statisticsDialog"));
   refreshAudioStatistics();
 });
+$("resumeLatestProgressBtn").addEventListener("click", resumeLatestProgress);
 $("refreshStatisticsBtn").addEventListener("click", () => refreshAudioStatistics(true));
 $("statisticsDialog").addEventListener("close", () => {
   if (!$("statisticsDialog").open) {
@@ -4877,6 +4984,8 @@ $("settingsBtn").addEventListener("click", () => {
 $("closeManageBtn").addEventListener("click", () => $("manageDialog").close());
 $("manageDialog").addEventListener("close", () => {
   readerState.tocEditRequestId += 1;
+  setUploadMessage("");
+  renderImportJobs();
 });
 $("cancelDeleteBookBtn")?.addEventListener("click", closeDeleteBookConfirm);
 $("confirmDeleteBookBtn")?.addEventListener("click", confirmDeleteBook);
@@ -4969,7 +5078,7 @@ window.TransUI.setupScrollFades($("shelfView"), ".book-list");
 document.querySelectorAll(".reader-dialog").forEach((dialog) => {
   window.TransUI.setupScrollFades(dialog,
     ".dialog-panel, .chapter-select-list, .book-search-results, .manage-book-list, "
-    + ".import-jobs, .statistics-list, .offline-chapter-list, .toc-edit-list, .toc-line-list"
+    + ".statistics-list, .offline-chapter-list, .toc-edit-list, .toc-line-list"
   );
   dialog.addEventListener("close", unlockReaderScroll);
   dialog.addEventListener("cancel", (event) => {
@@ -5001,7 +5110,7 @@ setupReaderViewport();
 restoreReaderSettings();
 initializeMediaSession();
 window.history.replaceState({ readerView: "shelf" }, "", window.location.href);
-ensureReaderFontLoaded("yshi-written").then((loaded) => {
+if (window.localStorage.getItem("readerFontFamily") === "yshi-written") ensureReaderFontLoaded("yshi-written").then((loaded) => {
   if (loaded && window.localStorage.getItem("readerFontFamily") === "yshi-written") {
     updateReaderFontFamily("yshi-written", false, false);
   }

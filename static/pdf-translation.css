@@ -9,6 +9,9 @@
 .pdf-panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:22px; min-width:0; box-shadow:var(--shadow); }
 .pdf-section-head, .pdf-group-heading { display:flex; justify-content:space-between; align-items:center; gap:12px; }
 .pdf-section-head { margin-bottom:18px; }
+.pdf-refresh-actions { display:flex; flex:1; justify-content:flex-end; align-items:center; gap:8px; min-width:0; }
+.pdf-refresh-actions #jobsMessage { min-width:0; }
+.pdf-refresh-actions > button, .pdf-section-head > h2 { flex-shrink:0; }
 .pdf-tag, .pdf-group-heading > span { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; }
 .pdf-body label { display:flex; flex-direction:column; gap:7px; font-size:14px; font-weight:500; min-width:0; }
 .pdf-body input:not([type=checkbox]):not([type=file]), .pdf-body select { height:38px; width:100%; min-width:0; padding:7px 10px; border:1px solid var(--line); border-radius:9px; background:var(--control); color:var(--ink); font:inherit; font-size:14px; font-weight:400; }
@@ -63,8 +66,7 @@
 .pdf-detail-grid dd { flex:1; min-width:0; font-size:12px; margin:0; color:var(--ink); overflow-wrap:anywhere; }
 .pdf-pagination { display:flex; align-items:center; justify-content:center; gap:16px; margin-top:18px; font-size:13px; }
 .pdf-message { color:var(--ink); background:var(--selected); border:1px solid var(--line); border-radius:8px; padding:9px 12px; font-size:13px; overflow-wrap:anywhere; }
-.pdf-message[data-error=true], .pdf-body .config-message[data-error=true] { color:var(--danger); background:rgba(var(--danger-rgb),.05); }
-#pageMessage { position:fixed; bottom:36px; left:50%; transform:translateX(-50%); max-width:min(620px,calc(100% - 28px)); width:max-content; z-index:20; box-shadow:var(--shadow); }
+.pdf-message[data-error=true], .pdf-body .config-message[data-error=true]:not([data-feedback-box]) { color:var(--danger); background:rgba(var(--danger-rgb),.05); }
 .pdf-body dialog { background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:16px; box-shadow:var(--dialog-shadow); padding:0; max-height:calc(100dvh - 28px); }
 .pdf-body .pdf-dialog { width:800px; max-width:calc(100% - 24px); }
 .pdf-dialog > form, .pdf-body .pdf-about { display:flex; flex-direction:column; max-height:calc(100dvh - 30px); }

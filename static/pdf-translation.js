@@ -7,7 +7,7 @@
   const languages = new Map([...$('sourceLang').options].map((o) => [o.value, o.text]));
   let config = null, file = null, uploadId = '', uploading = false;
   let localPreviewUrl = '', metadataWorker = null, metadataTimer = 0;
-  let page = 1, generation = 0, timer = 0, searchTimer = 0, messageTimer = 0, scrollTop = 0;
+  let page = 1, generation = 0, timer = 0, searchTimer = 0, scrollTop = 0;
   let currentJobs = new Map();
   let retentionDays = 0;
   const boolSettings = ['reuse_deepseek', 'enhance_compatibility', 'ocr', 'no_watermark', 'disable_glossary', 'translate_table_text', 'rich_text'];
@@ -18,15 +18,11 @@
   const expanded = new Map();
   const size = (bytes) => bytes < 1048576 ? `${Math.ceil(bytes / 1024)} KB` : `${(bytes / 1048576).toFixed(1)} MB`;
   function randomId() { return [...crypto.getRandomValues(new Uint8Array(16))].map((v) => v.toString(16).padStart(2, '0')).join(''); }
-  function message(text, error = false, target = 'pageMessage') {
+  function message(text, error = false, target = 'jobsMessage', type = 'success', source = 'operation') {
     const node = $(target);
-    node.textContent = text;
     node.dataset.error = String(error);
-    node.hidden = !text;
-    if (target === 'pageMessage') {
-      clearTimeout(messageTimer);
-      if (!error) messageTimer = setTimeout(() => { node.hidden = true; }, 7000);
-    }
+    node.dataset.source = source;
+    window.TransUI.feedback(node, text, error ? 'error' : type);
   }
   async function api(url, options = {}) {
     const controller = new AbortController();
@@ -39,6 +35,7 @@
       return data;
     } catch (error) {
       if (error.name === 'AbortError') throw new Error('请求超时，请刷新任务列表核对状态');
+      if (error instanceof TypeError) throw new Error('网络连接失败，请检查网络后重试');
       throw error;
     } finally { clearTimeout(timeout); }
   }
@@ -324,8 +321,12 @@
   $('reuse_deepseek').addEventListener('change', () => { $('ownCredentials').hidden = $('reuse_deepseek').checked; $('sharedConfigInfo').hidden = !$('reuse_deepseek').checked; });
   $('settingsBtn').addEventListener('click', async () => {
     $('settingsBtn').disabled = true;
-    try { applyConfig((await api('/api/pdf/config')).config, true); delete $('saveConfig').dataset.retention; message('', false, 'configMessage'); openDialog('settingsDialog', 'settingsTitle'); }
-    catch (error) { message(error.message, true); }
+    try {
+      applyConfig((await api('/api/pdf/config')).config, true);
+      if ($('jobsMessage').dataset.source === 'settings') message('');
+      delete $('saveConfig').dataset.retention; message('', false, 'configMessage'); openDialog('settingsDialog', 'settingsTitle');
+    }
+    catch (error) { message(error.message, true, 'jobsMessage', 'error', 'settings'); }
     finally { $('settingsBtn').disabled = false; }
   });
   $('closeSettings').addEventListener('click', () => $('settingsDialog').close());
@@ -348,7 +349,9 @@
         message(warning, true, 'configMessage'); return;
       }
     }
-    $('saveConfig').disabled = true;
+    const finish = window.TransUI.busyButton($('saveConfig'));
+    $('testService').disabled = true;
+    message('正在保存…', false, 'configMessage', 'pending');
     try {
       const data = await api('/api/pdf/config', {method:'PUT', body:JSON.stringify(body)});
       applyConfig(data.config, true);
@@ -357,14 +360,16 @@
       checkConnection();
       await loadJobs();
     } catch (error) { message(error.message, true, 'configMessage'); }
-    finally { $('saveConfig').disabled = false; }
+    finally { finish(); $('testService').disabled = false; }
   });
   $('testService').addEventListener('click', async () => {
-    $('testService').disabled = true;
-    message('正在测试连接…', false, 'configMessage');
+    if ($('testService').disabled) return;
+    const finish = window.TransUI.busyButton($('testService'));
+    $('saveConfig').disabled = true;
+    message('正在测试连接…', false, 'configMessage', 'pending');
     try { const result = await api('/api/pdf/health', {method:'POST', body:JSON.stringify({endpoint:$('endpoint').value})}); message(`连接正常 · 服务 v${result.version}`, false, 'configMessage'); }
     catch (error) { message(error.message, true, 'configMessage'); }
-    finally { $('testService').disabled = false; }
+    finally { finish(); $('saveConfig').disabled = false; }
   });
   $('aboutBtn').addEventListener('click', () => openDialog('aboutDialog', 'aboutTitle'));
   $('closeAbout').addEventListener('click', () => $('aboutDialog').close());
@@ -507,11 +512,19 @@
     if (actions.childElementCount) card.append(actions);
     return card;
   }
-  async function loadJobs() {
+  async function loadJobs(manual = false) {
+    const finish = manual ? window.TransUI.busyButton($('refreshBtn')) : () => {};
+    if (manual) message('正在刷新…', false, 'jobsMessage', 'pending', 'jobs');
     clearTimeout(timer);
     const sequence = ++generation;
     let delay = 30000;
     try {
+      // Retry a failed initial configuration read along with the task list.
+      if (!config) {
+        const initial = await api('/api/pdf/config');
+        if (sequence !== generation) return;
+        if (!config) { applyConfig(initial.config); checkConnection(true); }
+      }
       const params = new URLSearchParams({q:$('searchJobs').value.trim(), status:$('statusFilter').value, page:String(page), scope:'history'});
       const data = await api('/api/pdf/jobs?' + params);
       if (sequence !== generation) return;
@@ -537,9 +550,19 @@
       $('pageInfo').textContent = `${page} / ${Math.max(1, Math.ceil(data.total / 20))}`;
       $('prevPage').disabled = page <= 1;
       $('nextPage').disabled = page * 20 >= data.total;
+      if ($('jobsMessage').dataset.source === 'jobs') {
+        if ($('jobsMessage').dataset.feedback === 'pending') message('任务列表已刷新', false, 'jobsMessage', 'success', 'jobs');
+        else if ($('jobsMessage').dataset.feedback === 'error') message('', false, 'jobsMessage');
+      }
       delay = data.active_jobs.length ? 2000 : 30000;
-    } catch (error) { if (sequence === generation) message(error.message, true); delay = 10000; }
-    finally { if (sequence === generation && !document.hidden) timer = setTimeout(loadJobs, delay); }
+    } catch (error) {
+      const notice = $('jobsMessage');
+      if (sequence === generation && (!notice.textContent || notice.dataset.source === 'jobs')) {
+        message(error.message, true, 'jobsMessage', 'error', 'jobs');
+      }
+      delay = 10000;
+    }
+    finally { finish(); if (sequence === generation && !document.hidden) timer = setTimeout(loadJobs, delay); }
   }
   function selectTaskTab(name) {
     for (const key of ['active', 'history']) {
@@ -576,18 +599,19 @@
       }
       if (action === 'cancel' && job.status === 'unknown' && !await confirmAction('核对后取消任务？', '请先打开上游，确认任务未创建或已经结束。取消只结束 Trans 的跟踪并恢复队列，保留原文件，不会停止上游任务，也不会重新翻译。')) return;
       if (action === 'retry_download' && job.status === 'unknown' && !await confirmAction('确认结果已生成完整？', '请先确认上游已结束且所选 PDF 已完整生成。此操作只取回文件，不会重新翻译。')) return;
+      message('正在提交操作…', false, 'jobsMessage', 'pending');
       if (action === 'delete') await api('/api/pdf/jobs/' + job.id, {method:'DELETE'});
       else await api('/api/pdf/jobs/' + job.id + '/action', {method:'POST', body:JSON.stringify({action})});
-      message(action === 'delete' ? '已处理删除请求；上游副本需单独清理' : action === 'retry_download' ? '正在取回结果，不会重新翻译' : '操作已完成');
+      message(action === 'delete' ? '已处理删除请求；上游副本需单独清理' : action === 'retry_download' ? '已提交取回请求，进度见任务卡片' : '操作已完成');
     } catch (error) { message(error.message, true); }
     finally { busyJobs.delete(job.id); await loadJobs(); }
   });
   $('searchJobs').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { page = 1; loadJobs(); }, 300); });
   $('statusFilter').addEventListener('change', () => { page = 1; loadJobs(); });
-  $('refreshBtn').addEventListener('click', loadJobs);
+  $('refreshBtn').addEventListener('click', () => loadJobs(true));
   $('prevPage').addEventListener('click', () => { if (page > 1) { page--; loadJobs(); } });
   $('nextPage').addEventListener('click', () => { page++; loadJobs(); });
   document.addEventListener('visibilitychange', () => { clearTimeout(timer); clearTimeout(healthTimer); if (!document.hidden) { loadJobs(); checkConnection(); } });
   window.addEventListener('pageshow', (event) => { if (event.persisted) { loadJobs(); checkConnection(); } });
-  (async () => { applyConfig((await api('/api/pdf/config')).config); checkConnection(true); await loadJobs(); })().catch((error) => message(error.message, true));
+  loadJobs();
 })();

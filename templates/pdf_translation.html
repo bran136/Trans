@@ -42,7 +42,7 @@
 </form>
 </section>
 <section class="pdf-panel pdf-tasks-panel" aria-labelledby="historyTitle">
-<div class="pdf-section-head"><h2 id="historyTitle">任务列表</h2><button class="ghost" id="refreshBtn" type="button">刷新</button></div>
+<div class="pdf-section-head"><h2 id="historyTitle">任务列表</h2><div class="pdf-refresh-actions"><span id="jobsMessage" data-feedback-box role="status" hidden></span><button class="ghost" id="refreshBtn" type="button">刷新</button></div></div>
 <div class="pdf-task-tabs" role="tablist" aria-label="任务分组">
 <button class="ghost" id="activeTab" role="tab" aria-selected="true" aria-controls="activePanel" type="button">正在进行 <span id="activeCount">0</span></button>
 <button class="ghost" id="historyTab" role="tab" aria-selected="false" aria-controls="historyPanel" tabindex="-1" type="button">历史任务 <span id="historyCount">0</span></button>
@@ -58,10 +58,9 @@
 </section>
 </main>
 </div>
-<p id="pageMessage" class="pdf-message" role="status" hidden></p>
 <dialog id="settingsDialog" class="pdf-dialog" aria-labelledby="settingsTitle">
 <form id="settingsForm">
-<div class="dialog-head pdf-dialog-head"><h2 id="settingsTitle" tabindex="-1" autofocus>服务配置</h2><p id="configMessage" class="config-message" role="status" hidden></p><div class="dialog-actions compact-actions"><button class="ghost" id="testService" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.1 0l3-3a5 5 0 0 0-7.1-7.1l-1.7 1.7M14 11a5 5 0 0 0-7.1 0l-3 3a5 5 0 0 0 7.1 7.1l1.7-1.7"/></svg>测试连接</button><button class="ghost" id="saveConfig" type="submit">保存</button><button class="ghost" id="closeSettings" type="button">关闭</button></div></div>
+<div class="dialog-head pdf-dialog-head"><h2 id="settingsTitle" tabindex="-1" autofocus>服务配置</h2><p id="configMessage" data-feedback-box class="config-message" role="status" hidden></p><div class="dialog-actions compact-actions"><button class="ghost" id="testService" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.1 0l3-3a5 5 0 0 0-7.1-7.1l-1.7 1.7M14 11a5 5 0 0 0-7.1 0l-3 3a5 5 0 0 0 7.1 7.1l1.7-1.7"/></svg>测试连接</button><button class="ghost" id="saveConfig" type="submit">保存</button><button class="ghost" id="closeSettings" type="button">关闭</button></div></div>
 <div class="pdf-settings-scroll">
 <section class="pdf-settings-group"><h3>PDF2zh 服务地址</h3>
 <label class="pdf-address">接口地址<input id="endpoint" type="url" placeholder="http://内网IP:端口" autocomplete="off" maxlength="300"></label>
@@ -111,5 +110,6 @@
         <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
       </a>
     </div>
-<script src="{{ asset_url('ui.js') }}"></script><script src="{{ asset_url('select-menu.js') }}"></script><script src="{{ asset_url('font-cache.js') }}"></script><script src="{{ asset_url('pdf-translation.js') }}"></script>
+<script src="{{ asset_url('ui-feedback.js') }}"></script>
+    <script src="{{ asset_url('ui.js') }}"></script><script src="{{ asset_url('select-menu.js') }}"></script><script src="{{ asset_url('pdf-translation.js') }}"></script>
 </body></html>

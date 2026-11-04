@@ -28,7 +28,7 @@ import zipfile
 from functools import lru_cache, wraps
 from contextlib import contextmanager
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from io import BytesIO
 from html.parser import HTMLParser
 from logging.handlers import RotatingFileHandler
@@ -41,6 +41,8 @@ from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree
 
 import reader_search
+import reader_pdf
+import reader_backup
 import pdf_translation
 import requests
 import pyotp
@@ -121,8 +123,11 @@ def content_fingerprint(paths, length=12, seed=""):
 
 
 APP_VERSION = load_app_version()
-RUNTIME_BACKEND_FINGERPRINT = content_fingerprint((BASE_DIR / "app.py", BASE_DIR / "reader_search.py", BASE_DIR / "pdf_translation.py"), length=16)
+RUNTIME_BACKEND_FINGERPRINT = content_fingerprint((BASE_DIR / "app.py", BASE_DIR / "reader_search.py", BASE_DIR / "reader_pdf.py", BASE_DIR / "reader_backup.py", BASE_DIR / "backup_crypto.py", BASE_DIR / "backup_settings.py", BASE_DIR / "pdf_translation.py"), length=16)
 BUILD_VERSION_FILES = (
+    BASE_DIR / "templates" / "reader_backup.html",
+    BASE_DIR / "static" / "reader-backup.js",
+    BASE_DIR / "static" / "reader-backup.css",
     BASE_DIR / "templates" / "pdf_translation.html",
     BASE_DIR / "static" / "pdf-translation.css",
     BASE_DIR / "static" / "pdf-translation.js",
@@ -140,10 +145,11 @@ BUILD_VERSION_FILES = (
     BASE_DIR / "static" / "ui.css",
     BASE_DIR / "static" / "translation.css",
     BASE_DIR / "static" / "ui.js",
+    BASE_DIR / "static" / "ui-feedback.js",
     BASE_DIR / "static" / "select-menu.css",
     BASE_DIR / "static" / "select-menu.js",
     BASE_DIR / "static" / "app.js",
-    BASE_DIR / "static" / "font-cache.js",
+    BASE_DIR / "static" / "translation-state.js",
     BASE_DIR / "static" / "home.js",
     BASE_DIR / "static" / "passkeys.js",
     BASE_DIR / "static" / "login.js",
@@ -171,6 +177,7 @@ MAX_TRANSLATE_CHARS = 20000
 DEEPSEEK_TRANSLATION_PROMPT_VERSION = 4
 DEEPSEEK_BATCH_MAX_CHARS = 5000
 DEEPSEEK_BATCH_MAX_SEGMENTS = 30
+DEEPSEEK_BATCH_FALLBACK_LIMIT = 3
 MAX_BOOK_UPLOAD_BYTES = 50 * 1024 * 1024
 # JSON can encode each source byte as a six-byte Unicode escape.
 MAX_TXT_EDIT_REQUEST_BYTES = MAX_BOOK_UPLOAD_BYTES * 6 + 64 * 1024
@@ -218,6 +225,8 @@ READER_IO_LOCK = threading.RLock()
 CONFIG_IO_LOCK = threading.RLock()
 MIMO_BALANCE_LOCK = threading.RLock()
 TRANSLATION_CACHE_LOCK = threading.RLock()
+TRANSLATION_PENDING_LOCK = threading.Lock()
+TRANSLATION_PENDING = {}
 CHAPTER_PARSE_LOCKS = {}
 CHAPTER_PARSE_LOCKS_LOCK = threading.Lock()
 MAX_ACTIVE_BOOK_IMPORTS = 2
@@ -1146,6 +1155,9 @@ def apply_book_progress(book):
     if progress["chapter"] >= max(1, count):
         return book
     book["progress"] = dict(progress)
+    book["progress_version"] = saved.get("progress_version", 0)
+    book["progress_writer"] = saved.get("progress_writer", "")
+    book["progress_sequence"] = saved.get("progress_sequence", 0)
     for key in ("updated_at", "last_opened_at"):
         value = saved.get(key)
         if type(value) in (int, float) and value >= 0:
@@ -1168,6 +1180,9 @@ def write_book_progress(summary):
     write_json_atomic(book_dir(summary["id"]) / "progress.json", {
         "content_revision": summary.get("content_revision", ""),
         "progress": summary.get("progress") or {"chapter": 0, "sentence": 0},
+        "progress_version": summary.get("progress_version", 0),
+        "progress_writer": summary.get("progress_writer", ""),
+        "progress_sequence": summary.get("progress_sequence", 0),
         "updated_at": summary.get("updated_at", 0),
         "last_opened_at": summary.get("last_opened_at", 0),
     })
@@ -1199,6 +1214,7 @@ def book_summary(book):
         "chapter_count": len(chapters),
         "char_count": sum(int(chapter.get("char_count") or len(chapter.get("text", ""))) for chapter in chapters),
         "progress": progress,
+        "progress_version": book.get("progress_version", 0),
     }
 
 
@@ -2050,86 +2066,8 @@ def parse_epub_chapter_content(path, href, fragment="", end_fragment=""):
         return {"text": text, "images": images, "blocks": blocks}
 
 
-def pdf_text_paragraphs(text):
-    """Reflow ordinary prose, keeping short headings, lists and math rows separate."""
-    lines = str(text or "").replace("\r", "").splitlines()
-    widths = sorted(len(line.strip()) for line in lines if len(line.strip()) >= 45)
-    width = widths[len(widths) // 2] if widths else 80
-    indents = [len(line) - len(line.lstrip()) for line in lines if len(line.strip()) >= width * .7]
-    baseline = sorted(indents)[len(indents) // 2] if indents else 0
-    paragraphs, previous = [], ""
-
-    def prose(line):
-        return len(re.findall(r"[A-Za-z]{2,}", line)) >= 4 or len(re.findall(r"[\u3400-\u9fff]", line)) >= 15
-
-    for raw in lines:
-        line = re.sub(r"[ \t\u00a0]+", " ", raw).strip()
-        if not line:
-            previous = ""
-            continue
-        indented = len(raw) - len(raw.lstrip()) > baseline + 2
-        table_row = bool(re.search(r"\S {3,}\S", raw)) and len(re.findall(r"\b\d+(?:\.\d+)?\b", line)) >= 3
-        numbered = bool(re.match(r"(?:\d+[.)]|[•●▪])\s", line))
-        sentence_end = bool(re.search(r"[A-Za-z\u3400-\u9fff].*[.!?。！？][\"”’')]*$", line))
-        continuation = (prose(line) and len(line) >= width * .7) or sentence_end
-        join = (previous and prose(previous) and continuation and not indented and not table_row and not numbered
-                and (len(previous) >= width * .7 or previous.endswith(("-", "\u00ad"))))
-        if join:
-            separator = "" if previous.endswith(("-", "\u00ad")) or re.search(r"[\u3400-\u9fff]$", previous) and re.match(r"[\u3400-\u9fff]", line) else " "
-            paragraphs[-1] = paragraphs[-1].rstrip("\u00ad") + separator + line
-        else:
-            paragraphs.append(line)
-        previous = "" if table_row else line
-    return normalize_book_text("\n\n".join(paragraphs))
-
-
 def parse_pdf_book(path, fallback_title):
-    try:
-        from pypdf import PdfReader
-    except ImportError as exc:
-        raise ValueError("当前环境未安装 pypdf，暂不能解析 PDF") from exc
-    reader = PdfReader(str(path))
-    if len(reader.pages) > MAX_PDF_PAGES:
-        raise ValueError(f"PDF 页数过多，最多支持 {MAX_PDF_PAGES} 页")
-    chapters = []
-    page_buffer = []
-    start_page = 1
-    total_chars = 0
-    for index, page in enumerate(reader.pages, start=1):
-        # Use physical line positions instead of PDF drawing-command order.
-        # Do not retain alignment padding or a hard break for every printed line.
-        try:
-            extracted = page.extract_text(extraction_mode="layout", layout_mode_space_vertically=False)
-        except (TypeError, ValueError, NotImplementedError):
-            extracted = page.extract_text()
-        if not (extracted or "").strip():
-            extracted = page.extract_text()
-        text = pdf_text_paragraphs(extracted or "")
-        if text:
-            remaining = MAX_BOOK_TEXT_CHARS - total_chars
-            if remaining <= 0:
-                break
-            text = text[:remaining]
-            total_chars += len(text)
-            page_buffer.append(text)
-        if page_buffer and (len(page_buffer) >= 20 or index == len(reader.pages)):
-            end_page = index
-            chapters.append({
-                "title": f"第 {start_page}-{end_page} 页",
-                "text": "\n\n".join(page_buffer),
-            })
-            start_page = index + 1
-            page_buffer = []
-        if total_chars >= MAX_BOOK_TEXT_CHARS:
-            if page_buffer:
-                chapters.append({
-                    "title": f"第 {start_page}-{index} 页",
-                    "text": "\n\n".join(page_buffer),
-                })
-            break
-    if not chapters:
-        raise ValueError("PDF 中没有识别到可阅读文本")
-    return {"title": fallback_title, "author": "", "chapters": chapters}
+    return reader_pdf.parse_book(path, fallback_title, MAX_PDF_PAGES, MAX_BOOK_TEXT_CHARS)
 
 
 def parse_book_file(path, original_name):
@@ -2670,20 +2608,22 @@ def ensure_chapter_text(book, chapter_index):
         if book.get("format") != "epub" or not chapter.get("href"):
             return chapter
 
-        cache_path = book_chapter_cache_path(book["id"], chapter_index)
-        if cache_path.exists():
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if cached.get("parser_version") == CHAPTER_CACHE_VERSION:
-                chapter.update({
-                    "title": cached.get("title") or chapter.get("title") or f"第 {chapter_index + 1} 章",
-                    "text": cached.get("text", ""),
-                    "images": cached.get("images", []),
-                    "blocks": cached.get("blocks", []),
-                    "char_count": int(cached.get("char_count") or len(cached.get("text", ""))),
-                    "cached": True,
-                })
-                return chapter
-
+        with READER_IO_LOCK:
+            if read_book_summary(book["id"]).get("content_revision", "") != book.get("content_revision", ""):
+                raise ValueError("书籍已更新，请重新打开")
+            cache_path = book_chapter_cache_path(book["id"], chapter_index)
+            if cache_path.exists():
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                if cached.get("parser_version") == CHAPTER_CACHE_VERSION:
+                    chapter.update({
+                        "title": cached.get("title") or chapter.get("title") or f"第 {chapter_index + 1} 章",
+                        "text": cached.get("text", ""),
+                        "images": cached.get("images", []),
+                        "blocks": cached.get("blocks", []),
+                        "char_count": int(cached.get("char_count") or len(cached.get("text", ""))),
+                        "cached": True,
+                    })
+                    return chapter
         stored_name = book.get("stored_name")
         if not stored_name:
             raise ValueError("书籍源文件缺失")
@@ -2707,7 +2647,6 @@ def ensure_chapter_text(book, chapter_index):
             "blocks": blocks,
             "char_count": len(text),
         }
-        write_json_atomic(cache_path, cached)
         chapter.update({
             "title": chapter_title,
             "text": text,
@@ -2716,8 +2655,12 @@ def ensure_chapter_text(book, chapter_index):
             "char_count": len(text),
             "cached": True,
         })
-        try:
+        with READER_IO_LOCK:
             latest_book = read_book_record(book["id"])
+            if latest_book.get("content_revision", "") != book.get("content_revision", ""):
+                raise ValueError("书籍已更新，请重新打开")
+            cached["content_revision"] = book.get("content_revision", "")
+            write_json_atomic(cache_path, cached)
             latest_chapters = latest_book.get("chapters", [])
             if chapter_index < len(latest_chapters):
                 latest_chapters[chapter_index].update({
@@ -2730,8 +2673,6 @@ def ensure_chapter_text(book, chapter_index):
                 latest_book["updated_at"] = int(time.time())
                 write_book_record(latest_book)
                 upsert_book_index(latest_book)
-        except FileNotFoundError:
-            pass
         return chapter
 
 
@@ -3376,6 +3317,10 @@ def reject_cross_site_writes():
         request.max_content_length = MAX_TXT_DELTA_BYTES if request.mimetype == TXT_DELTA_MIMETYPE else MAX_TXT_EDIT_REQUEST_BYTES
         if request.content_length is not None and request.content_length > request.max_content_length:
             return jsonify({"error": "全文保存请求过大，正文最多支持 50MB（UTF-8）"}), 413
+    elif request.endpoint == "api_reader_backup" and request.method == "PUT":
+        request.max_content_length = reader_backup.CHUNK_BYTES
+        if request.content_length is not None and request.content_length > request.max_content_length:
+            return jsonify({"error": "备份上传分块过大"}), 413
     elif request.path == "/api/pdf/jobs" and request.method == "POST":
         # PDF uploads use their own request policy; other endpoints retain their limits.
         pass
@@ -3528,7 +3473,7 @@ def parse_number(value, fallback, min_value=None, max_value=None):
     return number
 
 
-def update_reader_tts_config(config, payload):
+def update_reader_tts_config(config, payload, *, persist=True):
     settings = config["reader_tts"]
     env_updates = {}
     balance_cookie_update = None
@@ -3557,9 +3502,9 @@ def update_reader_tts_config(config, payload):
     settings["timeout"] = int(parse_number(payload.get("timeout"), settings["timeout"], 5, 90))
     settings["chunk_chars"] = int(parse_number(payload.get("chunk_chars"), settings["chunk_chars"], 80, 800))
     settings["cache_enabled"] = bool(payload.get("cache_enabled", True))
-    if env_updates:
+    if persist and env_updates:
         save_dotenv_values(env_updates)
-    if balance_cookie_update is not None:
+    if persist and balance_cookie_update is not None:
         settings["balance_cookie"] = save_mimo_balance_cookie(balance_cookie_update)
     return config
 
@@ -3573,7 +3518,7 @@ def update_app_password(config, value):
     return config
 
 
-def update_nested_config(config, payload):
+def update_nested_config(config, payload, *, persist=True):
     env_updates = {}
 
     deepseek = payload.get("deepseek", {})
@@ -3614,7 +3559,7 @@ def update_nested_config(config, payload):
         )
         target["timeout"] = int(parse_number(google.get("timeout"), target["timeout"], 5, 120))
 
-    if env_updates:
+    if persist and env_updates:
         save_dotenv_values(env_updates)
     return config
 
@@ -3662,33 +3607,43 @@ def normalize_translation_text(value, source_text=""):
     return text.strip()
 
 
-def get_cached_translation(cache_key):
-    if not re.fullmatch(r"[0-9a-f]{64}", str(cache_key or "")):
-        return None
+def get_cached_translations(cache_keys):
+    keys = list(dict.fromkeys(key for key in cache_keys
+                             if isinstance(key, str) and re.fullmatch(r"[0-9a-f]{64}", key)))
+    if not keys:
+        return {}
     with TRANSLATION_CACHE_LOCK:
         connection = None
         try:
             connection = open_translation_cache()
-            row = connection.execute(
-                "SELECT value FROM translations WHERE cache_key = ?",
-                (cache_key,),
-            ).fetchone()
-            if not row:
-                return None
-            value = row[0]
-            if not isinstance(value, str) or len(value) > CACHE_MAX_TEXT_CHARS:
-                connection.execute("DELETE FROM translations WHERE cache_key = ?", (cache_key,))
-                connection.commit()
-                return None
-            connection.execute(
-                "UPDATE translations SET touched_at = ? WHERE cache_key = ?",
-                (time.time_ns(), cache_key),
-            )
-            connection.commit()
-            return value
+            rows = {}
+            # Bound SQL variables for older SQLite builds, even with many short lines.
+            for start in range(0, len(keys), 500):
+                batch = keys[start:start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows.update(connection.execute(
+                    f"SELECT cache_key, value FROM translations WHERE cache_key IN ({placeholders})", batch,
+                ))
+            cached, updates, invalid = {}, [], []
+            touched_at = time.time_ns()
+            for index, key in enumerate(keys):
+                if key not in rows:
+                    continue
+                value = rows[key]
+                if not isinstance(value, str) or not value.strip() or len(value) > CACHE_MAX_TEXT_CHARS:
+                    invalid.append((key,))
+                    continue
+                cached[key] = normalize_translation_segment(value)
+                updates.append((cached[key], touched_at + index, key))
+            with connection:
+                connection.executemany("DELETE FROM translations WHERE cache_key = ?", invalid)
+                connection.executemany(
+                    "UPDATE translations SET value = ?, touched_at = ? WHERE cache_key = ?", updates,
+                )
+            return cached
         except sqlite3.Error as exc:
             app.logger.error("deepseek cache read failed error=%s", exc)
-            return None
+            return {}
         finally:
             if connection is not None:
                 connection.close()
@@ -3729,10 +3684,12 @@ def prune_translation_cache():
                 connection.close()
 
 
-def set_cached_translation(cache_key, value):
-    if not re.fullmatch(r"[0-9a-f]{64}", str(cache_key or "")):
-        return
-    if not isinstance(value, str) or len(value) > CACHE_MAX_TEXT_CHARS:
+def set_cached_translations(values):
+    touched_at = time.time_ns()
+    entries = [(key, value, touched_at + index) for index, (key, value) in enumerate(values.items())
+               if isinstance(key, str) and re.fullmatch(r"[0-9a-f]{64}", key)
+               and isinstance(value, str) and value.strip() and len(value) <= CACHE_MAX_TEXT_CHARS]
+    if not entries:
         return
     with TRANSLATION_CACHE_LOCK:
         connection = None
@@ -3740,10 +3697,10 @@ def set_cached_translation(cache_key, value):
             limit = translation_cache_limit()
             connection = open_translation_cache()
             with connection:
-                connection.execute(
+                connection.executemany(
                     "INSERT INTO translations(cache_key, value, touched_at) VALUES(?, ?, ?) "
                     "ON CONFLICT(cache_key) DO UPDATE SET value = excluded.value, touched_at = excluded.touched_at",
-                    (cache_key, value, time.time_ns()),
+                    entries,
                 )
                 trim_translation_cache(connection, limit)
         except sqlite3.Error as exc:
@@ -3969,9 +3926,31 @@ def audio_cache_coverage_percent(covered, total):
 
 
 def finish_book_audio_statistics(books, profile_key, settings):
-    for book in books.values():
+    for book_id, book in list(books.items()):
         files = book.pop("_files")
         counts = book["chapter_sentences"]
+        # Cache updates run in the statistics worker, never in a snapshot GET.
+        # First-time playback also needs the shared denominator, without requiring
+        # the user to open cache management or manually recalibrate the library.
+        if counts is None and any(files.values()):
+            try:
+                source = read_book_record(book_id)
+                if source.get("content_revision", "") == book["content_revision"]:
+                    ensure_tts_sentence_counts(source, settings, notify_statistics=False)
+                    counts, stamp = book_audio_sentence_counts(book_summary(source), settings, {})
+                    book["chapter_sentences"] = counts
+                    book["source_stamp"] = stamp
+            except (FileNotFoundError, ValueError):
+                # A concurrent delete/reparse queues fresh statistics of its own.
+                # Drop only the superseded book; genuine parsing errors still surface.
+                try:
+                    current = read_book_summary(book_id)
+                except FileNotFoundError:
+                    current = None
+                if current is None or current.get("content_revision", "") != book["content_revision"]:
+                    books.pop(book_id, None)
+                    continue
+                raise
         total = sum(counts.values()) if counts is not None else None
         categories = {
             name: {"size_bytes": sum(size for key, size in values.items()
@@ -3998,7 +3977,10 @@ def finish_book_audio_statistics(books, profile_key, settings):
                 ambiguous = True
         known = counts is not None and not ambiguous
         for group in categories.values():
+            empty = not group["size_bytes"] and not group["sentences"]
             group["coverage_percent"] = audio_cache_coverage_percent(group["sentences"], total) if known else None
+            if empty:
+                group["coverage_percent"] = 0
             if not known:
                 group["complete_chapters"] = None
         book.update(categories)
@@ -4006,6 +3988,8 @@ def finish_book_audio_statistics(books, profile_key, settings):
         book["total_sentences"] = total
         book["coverage_verified"] = known
         book["coverage_percent"] = audio_cache_coverage_percent(sum(g["sentences"] for g in categories.values()), total) if known else None
+        if all(g["coverage_percent"] == 0 for g in categories.values()):
+            book["coverage_percent"] = 0
     return {"schema": 1, "updated_at": time.time(), "profile_key": profile_key,
             "chunk_chars": int(settings.get("chunk_chars", 260)), "books": books}
 
@@ -4625,13 +4609,14 @@ def load_tts_sentence_index(book_id):
     return data if isinstance(data, dict) else {}
 
 
-def save_tts_sentence_index(book_id, data):
+def save_tts_sentence_index(book_id, data, notify_statistics=True):
     with READER_IO_LOCK:
         write_json_atomic(book_tts_sentence_index_path(book_id), data)
-    schedule_tts_cache_stats_refresh(book_ids={book_id})
+    if notify_statistics:
+        schedule_tts_cache_stats_refresh(book_ids={book_id})
 
 
-def ensure_tts_sentence_counts(book, settings):
+def ensure_tts_sentence_counts(book, settings, notify_statistics=True):
     book_id = book["id"]
     lock = TTS_SENTENCE_INDEX_LOCKS[int(book_id[:8], 16) % len(TTS_SENTENCE_INDEX_LOCKS)]
     max_chars = int(settings.get("chunk_chars", 260))
@@ -4676,8 +4661,12 @@ def ensure_tts_sentence_counts(book, settings):
             "chunk_chars": max_chars,
             "chapters": entries,
         }
-        if data != cached:
-            save_tts_sentence_index(book_id, data)
+        with READER_IO_LOCK:
+            current = read_book_summary(book_id)
+            if current.get("content_revision", "") != latest.get("content_revision", ""):
+                raise ValueError("书籍已更新，请重新打开")
+            if data != cached:
+                save_tts_sentence_index(book_id, data, notify_statistics=notify_statistics)
     if parsed:
         app.logger.info(
             "tts sentence index updated book=%s parsed=%s cached=%s elapsed=%.3fs",
@@ -7224,8 +7213,26 @@ def deepseek_chat(settings, messages):
         allow_redirects=False,
     )
     response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"]
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("DeepSeek 返回格式异常，请稍后重试") from exc
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise RuntimeError("DeepSeek 未返回有效翻译")
+    choice = choices[0]
+    reason = choice.get("finish_reason")
+    if reason != "stop":
+        if reason == "length":
+            raise RuntimeError("DeepSeek 译文被截断，请缩短单段原文后重试")
+        if reason == "content_filter":
+            raise RuntimeError("DeepSeek 未完成翻译：内容审核拦截")
+        raise RuntimeError("DeepSeek 未确认翻译完整结束，请稍后重试")
+    message = choice.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("DeepSeek 未返回有效译文")
+    return content
 
 
 def strip_json_fence(value):
@@ -7248,7 +7255,8 @@ def parse_deepseek_translation_list(value, expected_count):
         except ValueError:
             return None
     translations = payload.get("translations") if isinstance(payload, dict) else payload
-    if not isinstance(translations, list) or len(translations) != expected_count:
+    if (not isinstance(translations, list) or len(translations) != expected_count
+            or not all(isinstance(item, str) for item in translations)):
         return None
     cleaned = [normalize_translation_segment(item) for item in translations]
     return cleaned if all(cleaned) else None
@@ -7286,6 +7294,9 @@ def translate_deepseek_segments_batch(segments, source, target, settings, style)
     ])
     translations = parse_deepseek_translation_list(raw, len(segments))
     if translations is None:
+        # A malformed large batch must not silently expand into dozens of paid calls.
+        if len(segments) > DEEPSEEK_BATCH_FALLBACK_LIMIT:
+            raise RuntimeError("DeepSeek 返回的段落格式不完整，请减少原文段落后重试")
         translations = []
         for segment in segments:
             translations.extend(translate_deepseek_segments_batch([segment], source, target, settings, style))
@@ -7312,36 +7323,55 @@ def chunk_deepseek_segments(segments):
 
 def translate_deepseek(text, source, target, config):
     settings = config["deepseek"]
+    identity = json.dumps([cache_key_for_deepseek(text, source, target, settings),
+                           settings.get("base_url"), settings.get("api_key")])
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    with TRANSLATION_PENDING_LOCK:
+        future = TRANSLATION_PENDING.get(key)
+        owner = future is None
+        if owner:
+            if len(TRANSLATION_PENDING) >= 16:
+                raise RuntimeError("翻译请求较多，请稍后再试")
+            future = TRANSLATION_PENDING[key] = Future()
+    if not owner:
+        return future.result()
+    try:
+        result = translate_deepseek_paragraphs(text, source, target, config)
+        future.set_result(result)
+        return result
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with TRANSLATION_PENDING_LOCK:
+            TRANSLATION_PENDING.pop(key, None)
+
+
+def translate_deepseek_paragraphs(text, source, target, config):
+    settings = config["deepseek"]
     if not settings.get("api_key"):
         raise RuntimeError("DeepSeek API Key 未配置")
     style = DEEPSEEK_STYLES.get(settings.get("style"), DEEPSEEK_STYLES["default"])
     parts = split_translation_lines(text)
-    translated_by_segment = {}
     segment_keys = {}
-    uncached_segments = []
-    all_cached = True
     for part in parts:
         segment = part.strip()
         if not segment or "\n" in part:
             continue
-        if segment in translated_by_segment or segment in segment_keys:
+        if segment in segment_keys:
             continue
         cache_key = cache_key_for_deepseek(segment, source, target, settings)
         segment_keys[segment] = cache_key
-        cached = get_cached_translation(cache_key)
-        if cached is None:
-            uncached_segments.append(segment)
-            all_cached = False
-            continue
-        normalized_cached = normalize_translation_segment(cached)
-        if normalized_cached != cached:
-            set_cached_translation(cache_key, normalized_cached)
-        translated_by_segment[segment] = normalized_cached
+    cached = get_cached_translations(segment_keys.values())
+    translated_by_segment = {segment: cached[key] for segment, key in segment_keys.items() if key in cached}
+    uncached_segments = [segment for segment in segment_keys if segment not in translated_by_segment]
+    all_cached = not uncached_segments
     for batch in chunk_deepseek_segments(uncached_segments):
         translations = translate_deepseek_segments_batch(batch, source, target, settings, style)
         for segment, translated in zip(batch, translations):
             translated_by_segment[segment] = translated
-            set_cached_translation(segment_keys[segment], translated)
+        # Persist completed batches so a later failure does not waste earlier results.
+        set_cached_translations({segment_keys[segment]: translated_by_segment[segment] for segment in batch})
     output_parts = []
     for part in parts:
         if "\n" in part:
@@ -7668,13 +7698,8 @@ def api_reader_audio_statistics():
     settings = load_config()["reader_tts"]
     profile_key = tts_offline_profile_key(settings)
     load_tts_cache_stats_snapshot()
-    with TTS_CACHE_STATS_LOCK:
-        previous = (TTS_CACHE_STATS_STATE["data"] or {}).get("book_audio") or {}
-        missing = not (previous.get("schema") == 1 and previous.get("profile_key") == profile_key
-                       and previous.get("chunk_chars") == int(settings.get("chunk_chars", 260)))
-        missing = missing and not TTS_CACHE_STATS_STATE["refreshing"] and not TTS_CACHE_STATS_STATE["error"]
-    if missing:
-        schedule_tts_cache_stats_refresh(book_ids=set())
+    # Read-only: imports, cache changes, settings changes and explicit refresh
+    # schedule the work. Opening this dialog must not start a library scan.
     with TTS_CACHE_STATS_LOCK:
         data = (TTS_CACHE_STATS_STATE["data"] or {}).get("book_audio")
         ready = (isinstance(data, dict) and data.get("schema") == 1
@@ -8017,6 +8042,8 @@ def api_book_tts_offline_create(book_id):
             })
 
         with TTS_OFFLINE_JOB_LOCK:
+            if read_book_summary(book_id).get("content_revision", "") != book.get("content_revision", ""):
+                return jsonify({"error": "书籍已更新，请重新打开听书缓存页面"}), 409
             active = next(
                 (job for job in TTS_OFFLINE_JOBS.values() if job.get("status") in {"queued", "running"}),
                 None,
@@ -8884,6 +8911,53 @@ def api_txt_chapter_split(book_id, chapter_index):
         return jsonify({"error": str(exc)}), 400
 
 
+@app.route("/api/books/<book_id>/bookmarks", methods=["GET", "POST", "DELETE"])
+@serialize_book_write
+def api_book_bookmarks(book_id):
+    if not require_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        book = read_book_summary(book_id)
+        path = book_dir(book_id) / "bookmarks.json"
+        try:
+            bookmarks = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            bookmarks = []
+        if not isinstance(bookmarks, list) or not all(isinstance(item, dict) for item in bookmarks):
+            raise ValueError("书签文件无效，请从备份恢复")
+        duplicate = False
+        if request.method == "DELETE":
+            bookmark_id = request_json_object().get("id")
+            bookmarks = [item for item in bookmarks if item.get("id") != bookmark_id]
+            write_json_atomic(path, bookmarks)
+        elif request.method == "POST":
+            payload = request_json_object()
+            if payload.get("content_revision") != book.get("content_revision", ""):
+                return jsonify({"error": "正文已更新，请重新打开本书后添加书签"}), 409
+            chapter, sentence = payload.get("chapter"), payload.get("sentence")
+            if type(chapter) is not int or type(sentence) is not int or chapter < 0 or sentence < 0:
+                raise ValueError("书签位置无效")
+            duplicate = any(item.get("content_revision") == book.get("content_revision", "")
+                            and item.get("chapter") == chapter and item.get("sentence") == sentence for item in bookmarks)
+            if not duplicate:
+                if len(bookmarks) >= 200:
+                    raise ValueError("每本书最多保存 200 个书签，请先删除不需要的书签")
+                detail = chapter_payload(read_book_record(book_id), chapter, include_book=False)["chapter"]
+                sentences = [entry for paragraph in detail["paragraphs"] for entry in paragraph.get("sentences", [])]
+                if sentence >= len(sentences):
+                    raise ValueError("书签位置无效")
+                bookmarks.insert(0, {"id": uuid.uuid4().hex, "chapter": chapter, "sentence": sentence,
+                                     "title": detail["title"], "quote": sentences[sentence]["text"][:240],
+                                     "content_revision": book.get("content_revision", ""), "created_at": int(time.time())})
+                write_json_atomic(path, bookmarks)
+        return jsonify({"duplicate": duplicate, "bookmarks": [{**item, "stale": item.get("content_revision") != book.get("content_revision", "")}
+                                      for item in bookmarks]})
+    except FileNotFoundError:
+        return jsonify({"error": "书籍不存在"}), 404
+    except (ValueError, IndexError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
 @app.route("/api/books/<book_id>/progress", methods=["PUT"])
 @serialize_book_write
 def api_book_progress(book_id):
@@ -8894,7 +8968,20 @@ def api_book_progress(book_id):
         with READER_IO_LOCK:
             book = read_book_summary(book_id)
             if "content_revision" in payload and payload["content_revision"] != book.get("content_revision", ""):
-                return jsonify({"error": "书籍正文或目录已更新，请重新打开本书"}), 409
+                return jsonify({"error": "书籍正文或目录已更新，请重新打开本书", "code": "content_changed"}), 409
+            version = payload.get("progress_version")
+            writer = payload.get("progress_writer")
+            sequence = payload.get("progress_sequence")
+            if (type(version) is not int or version < 0 or type(sequence) is not int or sequence < 1
+                    or not isinstance(writer, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,80}", writer)):
+                return jsonify({"error": "请刷新页面后继续同步阅读进度", "code": "progress_conflict"}), 409
+            current_version = book.get("progress_version", 0)
+            same_writer = writer == book.get("progress_writer")
+            if same_writer and sequence <= book.get("progress_sequence", 0):
+                return jsonify({"ok": True, "stale": True, "book": book})
+            if not same_writer and version != current_version:
+                return jsonify({"error": "其他页面已更新进度，请重新打开本书后继续同步",
+                                "code": "progress_conflict", "book": book}), 409
             chapter = int(payload.get("chapter", 0))
             sentence = int(payload.get("sentence", 0))
             chapter = max(0, min(chapter, max(book["chapter_count"] - 1, 0)))
@@ -8908,6 +8995,9 @@ def api_book_progress(book_id):
                 book["progress"]["percent"] = round(percent, 1)
             book["updated_at"] = now
             book["last_opened_at"] = now
+            book["progress_version"] = current_version + 1
+            book["progress_writer"] = writer
+            book["progress_sequence"] = sequence
             write_book_progress(book)
         return jsonify({"ok": True, "book": book})
     except Exception as exc:
@@ -9435,6 +9525,7 @@ def api_translate():
         return jsonify({"error": str(exc)}), 502
 
 
+reader_backup.install(app, sys.modules[__name__])
 pdf_translation.install(app, BASE_DIR / "pdf_data", require_auth, load_config, LANGUAGES)
 
 

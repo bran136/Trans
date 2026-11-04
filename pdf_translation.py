@@ -258,44 +258,48 @@ class PdfTasks:
         with self.storage_lock():
             if self.active_jobs():
                 raise PdfError('请先等待任务结束或取消排队任务，再修改 PDF 配置')
-            config = self.config()
-            for key in ('reuse_deepseek', 'enhance_compatibility', 'json_mode', 'ocr',
-                        'no_watermark', 'disable_glossary', 'translate_table_text', 'rich_text'):
-                if type(payload.get(key, config[key])) is not bool:
-                    raise PdfError('配置选项无效')
-                config[key] = payload.get(key, config[key])
-            endpoint = payload.get('endpoint', '')
-            if not isinstance(endpoint, str):
-                raise PdfError('服务地址无效')
-            endpoint = endpoint.strip()
-            config['endpoint'] = service_url(endpoint) if endpoint else ''
-            for key in ('api_key', 'service_token'):
-                value = payload.get(key, '')
-                if not isinstance(value, str) or len(value) > 4096 or '\n' in value or '\r' in value:
-                    raise PdfError('密钥格式无效')
-                if payload.get('clear_' + key) is True:
-                    config[key] = ''
-                elif value.strip():
-                    config[key] = value.strip()
-            model = payload.get('model', config['model'])
-            if model not in MODELS:
-                raise PdfError('不支持的 DeepSeek 模型')
-            config['model'] = model
-            for key, low, high in (('qps', 1, 1000), ('pool_size', 0, 1000), ('skip_last_pages', 0, 100000), ('retention_days', 0, 3650)):
-                value = payload.get(key, config[key])
-                if type(value) is not int or not low <= value <= high:
-                    raise PdfError('配置数值超出允许范围')
-                config[key] = value
-            for key, allowed in (('thinking', ('disabled', 'enabled')), ('reasoning_effort', ('high', 'max'))):
-                value = payload.get(key, config[key])
-                if value not in allowed:
-                    raise PdfError('DeepSeek 推理配置无效')
-                config[key] = value
-            if config['model'] != 'deepseek-v4-pro':
-                config['thinking'] = 'disabled'
+            config = self.validated_config(payload)
             atomic_json(self.root / 'config.json', config)
         self.ensure_worker(force=True)
         return self.public_config()
+
+    def validated_config(self, payload):
+        config = self.config()
+        for key in ('reuse_deepseek', 'enhance_compatibility', 'json_mode', 'ocr',
+                    'no_watermark', 'disable_glossary', 'translate_table_text', 'rich_text'):
+            if type(payload.get(key, config[key])) is not bool:
+                raise PdfError('配置选项无效')
+            config[key] = payload.get(key, config[key])
+        endpoint = payload.get('endpoint', '')
+        if not isinstance(endpoint, str):
+            raise PdfError('服务地址无效')
+        endpoint = endpoint.strip()
+        config['endpoint'] = service_url(endpoint) if endpoint else ''
+        for key in ('api_key', 'service_token'):
+            value = payload.get(key, '')
+            if not isinstance(value, str) or len(value) > 4096 or '\n' in value or '\r' in value:
+                raise PdfError('密钥格式无效')
+            if payload.get('clear_' + key) is True:
+                config[key] = ''
+            elif value.strip():
+                config[key] = value.strip()
+        model = payload.get('model', config['model'])
+        if model not in MODELS:
+            raise PdfError('不支持的 DeepSeek 模型')
+        config['model'] = model
+        for key, low, high in (('qps', 1, 1000), ('pool_size', 0, 1000), ('skip_last_pages', 0, 100000), ('retention_days', 0, 3650)):
+            value = payload.get(key, config[key])
+            if type(value) is not int or not low <= value <= high:
+                raise PdfError('配置数值超出允许范围')
+            config[key] = value
+        for key, allowed in (('thinking', ('disabled', 'enabled')), ('reasoning_effort', ('high', 'max'))):
+            value = payload.get(key, config[key])
+            if value not in allowed:
+                raise PdfError('DeepSeek 推理配置无效')
+            config[key] = value
+        if config['model'] != 'deepseek-v4-pro':
+            config['thinking'] = 'disabled'
+        return config
 
     def credentials(self, config, job=None):
         reuse = bool(job['reuse_deepseek']) if job else config['reuse_deepseek']

@@ -184,7 +184,7 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
 #monitorDialog .monitor-heading { display:flex; flex:1; align-items:center; gap:8px 12px; min-width:0; }
 #monitorDialog .monitor-heading h2 { flex-shrink:0; margin:0; }
 #monitorDialog .compact-actions { flex-shrink:0; align-self:start; }
-#monitorDialog #monitorMessage { min-width:0; max-width:100%; min-height:32px; margin:0; padding:6px 10px; line-height:18px; overflow-wrap:anywhere; }
+#monitorDialog #monitorMessage { min-width:0; max-width:100%; margin:0; overflow-wrap:anywhere; }
 #monitorDialog #monitorMessage[hidden] { display:none !important; }
 #metricTtsCacheDetail { font-size:12px; }
 @media (min-width:981px) {
@@ -234,7 +234,8 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
 .security-panel { padding:22px; }
 .security-panel .dialog-head { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:12px; margin-bottom:16px; }
 .security-panel .dialog-head h2 { grid-column:1; grid-row:1; margin:0; font-size:21px; white-space:nowrap; }
-.security-panel .dialog-head > button { grid-column:3; grid-row:1; white-space:nowrap; }
+.security-panel .dialog-head > button, .security-panel .security-header-actions { grid-column:3; grid-row:1; white-space:nowrap; }
+.security-header-actions { display:flex; align-items:center; gap:8px; }
 .security-panel .dialog-head .config-message { grid-column:2; grid-row:1; justify-self:end; min-width:0; max-width:100%; min-height:0; margin:0; overflow-wrap:anywhere; }
 .security-section + .security-section { margin-top:20px; padding-top:20px; border-top:1px solid var(--line); }
 .security-section h3 { margin:0; font-size:16px; font-weight:600; }
@@ -254,7 +255,7 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
 .password-visibility-btn svg { width:19px; height:19px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }
 .password-visibility-btn[aria-pressed="true"] .password-eye-slash { display:none; }
 .security-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; grid-column:1 / -1; }
-.security-panel button { height:32px; min-height:32px; padding:0 10px; font-size:13px; line-height:1.3; }
+.security-panel button, .security-panel .security-header-actions a { height:32px; min-height:32px; padding:0 10px; font-size:13px; line-height:1.3; }
 .security-setup { display:grid; grid-template-columns:180px minmax(0,1fr); align-items:center; gap:16px; grid-column:1 / -1; padding:12px; border:1px solid var(--line); border-radius:10px; background:var(--subtle); }
 .security-setup img { width:180px; height:auto; max-width:100%; border-radius:6px; }
 .security-setup p, .security-recovery p { font-size:13px; line-height:1.6; margin:0 0 8px; }
@@ -328,6 +329,10 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
   .security-panel { padding:14px; }
   #securityDialog .security-panel { padding:14px; }
   .security-panel .dialog-head h2 { font-size:17px; }
+  #securityDialog .dialog-head { grid-template-columns:auto minmax(0,1fr) auto; gap:6px; min-height:34px; }
+  #securityDialog .security-header-actions { grid-column:3; gap:5px; }
+  #securityDialog .security-header-actions .ghost { padding-inline:7px; font-size:12px; }
+  #securityDialog .dialog-head .config-message { grid-column:2; grid-row:1; font-size:11px; line-height:1.2; padding:3px 5px; }
   .security-section + .security-section { margin-top:16px; padding-top:16px; }
   .security-form { gap:10px; }
   .security-form input { font-size:var(--mobile-input-size,13px); }

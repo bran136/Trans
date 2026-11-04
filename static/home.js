@@ -62,17 +62,15 @@ function formatUptime(seconds) {
 function setMonitorMessage(text, type = "success", source = "") {
   const message = $("monitorMessage");
   message.dataset.source = source;
-  message.textContent = text;
   message.className = `config-message ${type}`;
-  message.hidden = false;
+  window.TransUI.feedback(message, text, type);
 }
 
 function clearMonitorMessage() {
   const message = $("monitorMessage");
   delete message.dataset.source;
-  message.textContent = "";
   message.className = "config-message";
-  message.hidden = true;
+  window.TransUI.feedback(message, "");
 }
 
 function renderServiceStatus(data) {
@@ -97,20 +95,28 @@ function renderServiceStatus(data) {
   $("metricDisk").textContent = `${data.disk.used_percent}% | ${formatBytes(data.disk.free_bytes)} 可用`;
 }
 
-async function loadServiceStatus(showError = true) {
+async function loadServiceStatus(showError = true, manual = false) {
+  if ($("restartServiceBtn").disabled) return false;
+  if (!manual && $("refreshStatusBtn").classList.contains("ui-busy")) return false;
   const requestId = ++monitorRequestId;
+  const finish = manual ? window.TransUI.busyButton($("refreshStatusBtn")) : () => {};
+  if (manual) setMonitorMessage("正在刷新…", "pending", "status");
   try {
     const data = await api("/api/status");
     if (requestId < monitorAppliedRequestId) return false;
     monitorAppliedRequestId = requestId;
     renderServiceStatus(data);
-    if ($("monitorMessage").dataset.source === "status") clearMonitorMessage();
+    if (manual) setMonitorMessage("状态已刷新", "success", "status");
+    else if ($("monitorMessage").dataset.source === "status" && $("monitorMessage").dataset.feedback === "error") clearMonitorMessage();
     return true;
   } catch (error) {
     if (requestId < monitorAppliedRequestId) return false;
     monitorAppliedRequestId = requestId;
     if (showError) setMonitorMessage(`状态获取失败：${error.message}`, "error", "status");
     return false;
+  } finally {
+    finish();
+    if ($("restartServiceBtn").disabled) $("refreshStatusBtn").disabled = true;
   }
 }
 
@@ -133,35 +139,42 @@ function openRestartConfirmation() {
   window.setTimeout(() => $("confirmRestartBtn").focus(), 0);
 }
 
+function setRestartBusy(busy) {
+  $("restartServiceBtn").disabled = busy;
+  $("refreshStatusBtn").disabled = busy;
+}
+
 async function restartService() {
   if ($("restartServiceBtn").disabled) return;
   $("restartConfirmDialog").close();
-  $("restartServiceBtn").disabled = true;
+  setRestartBusy(true);
+  stopMonitorRefresh();
+  setMonitorMessage("正在提交重启请求…", "pending");
   try {
     const previous = await api("/api/restart", { method: "POST", body: "{}" });
-    setMonitorMessage("正在重启，恢复后自动刷新", "success");
-    stopMonitorRefresh();
+    setMonitorMessage("正在重启，恢复后自动刷新", "pending");
     const deadline = Date.now() + 90000;
     window.setTimeout(async function poll() {
       try {
         const ready = await api("/api/ready", { timeout: 2500 });
         if (ready.pid !== previous.pid || ready.started !== previous.started) {
           setMonitorMessage("服务已恢复", "success");
-          $("restartServiceBtn").disabled = false;
+          setRestartBusy(false);
           if ($("monitorDialog").open) startMonitorRefresh();
           return;
         }
       } catch (_) { /* The listener can be unavailable while the process restarts. */ }
       if (Date.now() >= deadline) {
         setMonitorMessage("尚未确认服务恢复，请刷新页面或检查服务日志", "error");
-        $("restartServiceBtn").disabled = false;
+        setRestartBusy(false);
         return;
       }
       window.setTimeout(poll, 1000);
     }, 600);
   } catch (error) {
     setMonitorMessage(`重启失败：${error.message}`, "error");
-    $("restartServiceBtn").disabled = false;
+    setRestartBusy(false);
+    if ($("monitorDialog").open) startMonitorRefresh();
   }
 }
 
@@ -183,14 +196,14 @@ function unlockHomeScroll() {
 document.addEventListener("close", unlockHomeScroll, true);
 
 $("monitorBtn").addEventListener("click", () => {
-  clearMonitorMessage();
+  if (!$("restartServiceBtn").disabled) clearMonitorMessage();
   lockHomeScroll();
   $("monitorDialog").showModal();
   startMonitorRefresh();
 });
 
 $("closeMonitorBtn").addEventListener("click", () => $("monitorDialog").close());
-$("refreshStatusBtn").addEventListener("click", () => loadServiceStatus());
+$("refreshStatusBtn").addEventListener("click", () => loadServiceStatus(true, true));
 $("restartServiceBtn").addEventListener("click", openRestartConfirmation);
 $("cancelRestartBtn").addEventListener("click", () => $("restartConfirmDialog").close());
 $("confirmRestartBtn").addEventListener("click", restartService);
@@ -247,9 +260,8 @@ function fitClientLocation(node) {
 
 function securityMessage(text = "", type = "success", id = "securityMessage") {
   const node = $(id);
-  node.textContent = text;
   node.className = `config-message ${type}`;
-  node.hidden = !text;
+  window.TransUI.feedback(node, text, type);
 }
 
 function recoveryRecentlyVerified() {
@@ -351,7 +363,7 @@ async function logoutClient(client) {
   if (securityBusy || !securityState || !client.id) return;
   securityBusy = true;
   renderSecurityState();
-  securityMessage();
+  securityMessage("正在退出客户端…", "pending");
   try {
     const data = await api(`/api/security/clients/${encodeURIComponent(client.id)}`, { method: "DELETE" });
     if (data.signed_out_current) {
@@ -456,13 +468,14 @@ async function changeSecurity(event) {
   const action = mfaStep === "bind" ? "enable" : mfaAction;
   securityBusy = true;
   renderSecurityState();
-  securityMessage("", "success", "mfaMessage");
+  securityMessage("正在验证并更新…", "pending", "mfaMessage");
   try {
     const data = await api("/api/security", {
       method: "POST",
       body: JSON.stringify({ action, current_password: $("mfaPassword").value, code: $("mfaCode").value }),
     });
     if (action === "setup") {
+      securityMessage("", "info", "mfaMessage");
       mfaStep = "bind";
       $("mfaQr").src = data.qr;
       $("mfaSecret").textContent = data.secret;
@@ -508,7 +521,7 @@ async function submitAccessPassword(code = "") {
   const messageId = verifying ? "mfaMessage" : "securityMessage";
   securityBusy = true;
   renderSecurityState();
-  securityMessage("", "success", messageId);
+  securityMessage("正在修改密码…", "pending", messageId);
   try {
     securityState = await api("/api/password", {
       method: "PUT",
@@ -686,7 +699,7 @@ async function submitPasskeyAction(event) {
   securityBusy = true;
   renderSecurityState();
   renderPasskeyAuth();
-  securityMessage("", "success", "passkeyAuthMessage");
+  securityMessage("正在处理通行密钥…", "pending", "passkeyAuthMessage");
   let creatingCredential = false;
   try {
     let data;
@@ -714,6 +727,7 @@ async function submitPasskeyAction(event) {
         $("passkeyCode").value = "";
       }
       await preparePasskeyOptions();
+      securityMessage("", "info", "passkeyAuthMessage");
       $("passkeyAuthTitle").focus({ preventScroll: true });
       return;
     }
@@ -773,13 +787,16 @@ $("refreshClientsBtn").addEventListener("click", async () => {
   if (securityBusy || !securityState) return;
   securityBusy = true;
   renderSecurityState();
-  securityMessage();
+  const finish = window.TransUI.busyButton($("refreshClientsBtn"));
+  securityMessage("正在刷新已登录设备…", "pending");
   try {
     securityState = await api("/api/security");
     renderLoginClients();
+    securityMessage("已登录设备已刷新");
   } catch (error) {
     securityMessage(`刷新失败：${error.message}`, "error");
   } finally {
+    finish();
     securityBusy = false;
     renderSecurityState();
   }

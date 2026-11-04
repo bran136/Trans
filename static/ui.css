@@ -712,7 +712,7 @@ html:not(.keyboard-navigation) .home-body :is(button, a):focus {
     white-space: nowrap;
   }
 
-  #monitorDialog .config-message {
+  #monitorDialog .config-message:not([data-feedback-box]) {
     margin-top: 6px;
     min-height: 0;
     padding: 4px 8px;
@@ -738,13 +738,13 @@ html:not(.keyboard-navigation) .home-body :is(button, a):focus {
   /* A transparent desktop scrollbar still takes space in mobile previews.
      Hide only page-level bars; nested lists keep their scrolling indicators. */
 
-  html:has(> :is(.app-body, .reader-body, .home-body, .login-body)),
-  :is(.app-body, .reader-body, .home-body, .login-body) {
+  html:has(> :is(.app-body, .reader-body, .home-body, .login-body, .backup-page)),
+  :is(.app-body, .reader-body, .home-body, .login-body, .backup-page) {
     scrollbar-width: none;
   }
 
-  html:has(> :is(.app-body, .reader-body, .home-body, .login-body))::-webkit-scrollbar,
-  :is(.app-body, .reader-body, .home-body, .login-body)::-webkit-scrollbar {
+  html:has(> :is(.app-body, .reader-body, .home-body, .login-body, .backup-page))::-webkit-scrollbar,
+  :is(.app-body, .reader-body, .home-body, .login-body, .backup-page)::-webkit-scrollbar {
     width: 0;
     height: 0;
   }
@@ -863,33 +863,43 @@ html.iphone-safari dialog:has(> .browser-edge-tint) {
   bottom: -16px;
 }
 
-/* Compact status badges shared by translation and listening settings. */
-
-.app-body #settingsDialog .config-message,
-#ttsDialog #ttsConfigMessage {
+/* One compact message box for refresh and configuration operations. */
+[data-feedback-box][data-feedback]:not(:empty) {
   box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
   justify-self: end;
+  gap: 7px;
+  min-height: 28px;
+  min-width: 0;
   max-width: 100%;
-  padding: 4px 7px;
+  padding: 4px 8px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--subtle);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
   text-align: left;
+  overflow-wrap: anywhere;
 }
-
-.app-body #settingsDialog .config-message.success,
-#ttsDialog #ttsConfigMessage.success {
-  border-color: rgba(var(--success-rgb), 0.24);
-  background: rgba(var(--success-rgb), 0.08);
+[data-feedback-box][data-feedback="pending"]:not(:empty) {
+  border-color: rgba(var(--accent-rgb), .24);
+  background: rgba(var(--accent-rgb), .08);
+  color: var(--accent-strong);
+}
+[data-feedback-box][data-feedback="success"]:not(:empty) {
+  border-color: rgba(var(--success-rgb), .24);
+  background: rgba(var(--success-rgb), .08);
   color: var(--success);
 }
-
-.app-body #settingsDialog .config-message.error,
-#ttsDialog #ttsConfigMessage.error {
-  border-color: rgba(var(--danger-rgb), 0.24);
-  background: rgba(var(--danger-rgb), 0.08);
+[data-feedback-box][data-feedback="error"]:not(:empty) {
+  border-color: rgba(var(--danger-rgb), .24);
+  background: rgba(var(--danger-rgb), .08);
   color: var(--danger);
 }
+[data-feedback-box][hidden] { display: none !important; }
 
 .login-panel .login-factor-hint {
   margin: 0;
@@ -966,4 +976,20 @@ html.iphone-safari dialog:has(> .browser-edge-tint) {
 
 .passkey-login-btn[hidden] {
   display: none !important;
+}
+
+/* Preserve button geometry while making asynchronous operations visible. */
+button.ui-busy { position: relative; color: transparent !important; }
+button.ui-busy > * { visibility: hidden; }
+button.ui-busy::after, [data-feedback="pending"]::before {
+  content: ""; display: inline-block; box-sizing: border-box; width: 14px; height: 14px;
+  border: 2px solid rgba(var(--accent-rgb), .2); border-top-color: var(--accent);
+  border-radius: 50%; animation: ui-feedback-spin .8s linear infinite;
+}
+button.ui-busy::after { position: absolute; inset: 0; margin: auto; }
+[data-feedback="pending"]::before { margin-right: 7px; vertical-align: -2px; }
+[data-feedback-box][data-feedback="pending"]::before { flex: 0 0 14px; margin: 0; align-self: center; }
+@keyframes ui-feedback-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  button.ui-busy::after, [data-feedback="pending"]::before { animation: none; }
 }

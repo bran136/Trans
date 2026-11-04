@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="csrf-token" content="{{ csrf_token() }}"><meta name="theme-color" content="#f6f5f2">
+<title>备份与恢复 · Trans</title>
+<link rel="icon" type="image/svg+xml" href="{{ asset_url('site-icon.svg') }}">
+<script src="{{ asset_url('theme.js') }}"></script>
+<link rel="stylesheet" href="{{ asset_url('theme.css') }}">
+<link rel="stylesheet" href="{{ asset_url('styles.css') }}">
+<link rel="stylesheet" href="{{ asset_url('ui.css') }}">
+<link rel="stylesheet" href="{{ asset_url('reader-backup.css') }}">
+</head>
+<body class="backup-page" data-no-entry-input-focus>
+<div class="backup-shell">
+<header class="backup-header"><h1>备份与恢复</h1><a class="ghost" href="/">← 返回主页</a></header>
+<main class="backup-panel">
+<div class="backup-toolbar"><div class="backup-tabs" role="tablist" aria-label="备份操作">
+<button class="ghost" id="createTab" type="button" role="tab" aria-controls="createPanel" aria-selected="true">创建备份</button>
+<button class="ghost" id="filesTab" type="button" role="tab" aria-controls="filesPanel" aria-selected="false" tabindex="-1">服务器备份</button>
+<button class="ghost" id="restoreTab" type="button" role="tab" aria-controls="restorePanel" aria-selected="false" tabindex="-1">恢复备份</button>
+</div><div class="backup-feedback"><span id="backupStatus" data-feedback-box role="status" hidden></span><button class="ghost" id="refreshBackup" type="button">刷新</button></div></div>
+<progress id="backupProgress" max="100" value="0" hidden aria-label="备份操作进度"></progress>
+<section id="createPanel" class="backup-view" role="tabpanel" aria-labelledby="createTab">
+<div class="backup-section-head"><p class="backup-note">选择工具与书籍的备份项目</p><button id="selectAll" class="ghost" type="button">全选／清空</button></div>
+<div class="backup-scroll" aria-label="选择备份项目">
+<h2 class="backup-group-title">工具与服务</h2><div id="backupTools" class="backup-tool-grid"></div>
+<div id="backupEncryption" class="backup-encryption" hidden>
+<label>备份密码<input id="backupPassword" type="password" autocomplete="off" data-lpignore="true" data-1p-ignore autocapitalize="off" spellcheck="false" minlength="12" maxlength="256" placeholder="至少 12 个字符"></label>
+<label>确认密码<input id="backupPasswordAgain" type="password" autocomplete="off" data-lpignore="true" data-1p-ignore autocapitalize="off" spellcheck="false" minlength="12" maxlength="256" placeholder="再次输入备份密码"></label>
+<p class="backup-note">包含服务凭据时，整个文件加密。密码不保存，遗失无法恢复。</p>
+</div>
+<h2 class="backup-group-title">阅读数据</h2><div id="backupBooks"></div>
+</div>
+<div class="backup-bottom"><span id="backupEstimate" class="backup-note" role="status">请选择备份项目</span><button id="createBackup" class="ghost backup-primary" type="button">创建备份</button></div>
+</section>
+<section id="filesPanel" class="backup-view" role="tabpanel" aria-labelledby="filesTab" hidden>
+<p class="backup-note">文件保留 24 小时，可提前删除。到期后由服务自动清理，下载的副本不受影响。</p>
+<div id="serverBackups" class="backup-scroll"></div>
+</section>
+<section id="restorePanel" class="backup-view" role="tabpanel" aria-labelledby="restoreTab" hidden>
+<div class="backup-section-head"><label class="ghost backup-upload">上传备份<input id="backupFile" type="file" accept=".zip,.transbak,application/zip,application/octet-stream" aria-label="上传备份"></label><button class="ghost" id="compareBackup" type="button" hidden>刷新对比</button></div>
+<p id="restoreIntro" class="backup-note">选择服务器备份或上传文件，核对内容后按项目恢复。</p>
+<div id="restoreBooks" class="backup-scroll"></div>
+</section>
+</main>
+<p class="backup-footnote">凭据随整个备份加密；登录认证不参与备份。</p>
+</div>
+<div class="version-badge app-version has-theme-toggle">
+{% include '_theme_toggle.html' %}
+<a class="version-link" href="https://github.com/bran136/Trans/blob/master/CHANGELOG.md" target="_blank" rel="noopener noreferrer" title="查看更新日志">v{{ app_version() }}</a>
+<a class="version-github-link" href="https://github.com/bran136/Trans" target="_blank" rel="noopener noreferrer" aria-label="在 GitHub 查看 Trans"><img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true"></a>
+</div>
+<dialog id="backupConfirm" aria-labelledby="backupConfirmTitle">
+<div class="backup-section-head"><h2 id="backupConfirmTitle" tabindex="-1" autofocus>确认恢复</h2><button id="cancelBackupConfirm" class="ghost" type="button">取消</button></div>
+<p id="backupConfirmText"></p><input id="restorePassword" type="password" autocomplete="off" data-lpignore="true" data-1p-ignore autocapitalize="off" spellcheck="false" maxlength="256" aria-label="备份密码" placeholder="请输入备份密码" hidden><div class="backup-actions"><button id="acceptBackupConfirm" class="ghost danger" type="button">确认</button></div>
+</dialog>
+<script src="{{ asset_url('ui-feedback.js') }}"></script><script src="{{ asset_url('ui.js') }}"></script>
+<script src="{{ asset_url('reader-backup.js') }}"></script>
+</body></html>

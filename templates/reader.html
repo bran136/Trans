@@ -54,6 +54,7 @@
               <span id="chapterSelectLabel">选择章节</span>
             </button>
             <button id="nextChapterBtn" type="button">下一章</button>
+            <div id="readerProgressNotice" hidden><span id="readerProgressMessage" data-feedback-box role="status" hidden></span><button id="resumeLatestProgressBtn" type="button">跳转最新进度</button></div>
           </div>
           <div id="listenToolbar" class="listen-toolbar" hidden>
             <button id="listenPauseBtn" type="button">暂停</button>
@@ -77,13 +78,15 @@
     <dialog id="chapterSelectDialog" class="reader-dialog chapter-select-dialog">
       <section class="dialog-panel">
         <div class="dialog-head">
-          <h2>目录与搜索</h2>
+          <h2>目录、搜索与书签</h2>
           <button id="closeChapterSelectBtn" type="button">关闭</button>
         </div>
         <div class="book-search-tabs" role="group" aria-label="搜索范围">
           <button id="searchTocTab" type="button" aria-pressed="true">目录</button>
           <button id="searchBodyTab" type="button" aria-pressed="false">正文</button>
+          <button id="bookmarksTab" type="button" aria-pressed="false">书签</button>
         </div>
+        <div id="bookmarkActions" class="bookmark-actions" hidden><button id="addBookmarkBtn" type="button">添加选中句</button><button id="exportBookmarksBtn" type="button">导出</button></div>
         <form id="bookSearchForm" class="book-search-form">
           <input id="bookSearchInput" type="search" placeholder="搜索章节标题或序号" aria-label="搜索本书" maxlength="80" autocomplete="off">
           <button id="bookSearchSubmit" type="submit" hidden>搜索</button>
@@ -158,10 +161,7 @@
         <div id="statisticsList" class="statistics-list"></div>
         <p id="statisticsCacheStatus" class="statistics-cache-note statistics-cache-status" role="status">
           <span id="statisticsCacheStatusText"></span>
-          <span id="statisticsCacheUpdating" class="statistics-cache-updating" hidden>
-            <span class="statistics-spinner" aria-hidden="true"></span>
-            <span id="statisticsCacheUpdatingText"></span>
-          </span>
+          <span id="statisticsCacheUpdating" data-feedback-box hidden></span>
         </p>
         <p class="statistics-cache-note">覆盖率按句数统计；点击缓存明细可进入听书缓存页面。</p>
       </section>
@@ -247,7 +247,7 @@
       <section class="dialog-panel">
         <div class="dialog-head">
           <h2>听书</h2>
-          <div id="ttsConfigMessage" class="reader-config-message" role="status" hidden></div>
+          <div id="ttsConfigMessage" data-feedback-box class="reader-config-message" role="status" hidden></div>
           <div class="dialog-actions">
             <button id="saveTtsConfigBtn" type="button">保存</button>
             <button id="closeTtsBtn" type="button">关闭</button>
@@ -396,9 +396,9 @@
         <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
       </a>
     </div>
+    <script src="{{ asset_url('ui-feedback.js') }}"></script>
     <script src="{{ asset_url('ui.js') }}"></script>
     <script src="{{ asset_url('select-menu.js') }}"></script>
-    <script src="{{ asset_url('font-cache.js') }}"></script>
     <script src="{{ asset_url('reader-audio.js') }}"></script>
     <script src="{{ asset_url('reader-stream.js') }}"></script>
     <script src="{{ asset_url('reader.js') }}"></script>

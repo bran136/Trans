@@ -58,7 +58,7 @@
             <div class="input-pane">
               <div class="pane-head">
                 <span>原文</span>
-                <span id="charCount">0 字</span>
+                <div class="translation-input-actions"><span id="charCount">0 字</span><div class="translation-auto"><input id="autoTranslate" type="checkbox" aria-label="自动翻译"><span>自动</span></div><button class="ghost" id="translateBtn" type="button" title="翻译（Ctrl / ⌘ + Enter）">翻译</button></div>
               </div>
               <div class="source-editor">
                 <div id="sourceHighlight" class="source-highlight" aria-hidden="true"></div>
@@ -88,8 +88,10 @@
       <section class="history-panel">
         <div class="dialog-head">
           <h2 tabindex="-1" autofocus>本地历史</h2>
-          <button class="icon-btn" id="closeHistoryBtn" type="button">×</button>
+          <div class="translation-history-actions"><button class="ghost" id="exportHistoryBtn" type="button">导出</button><button class="icon-btn" id="closeHistoryBtn" type="button" aria-label="关闭历史">×</button></div>
         </div>
+        <input id="historySearch" class="history-search" type="search" placeholder="搜索原文或译文" aria-label="搜索翻译历史" autocomplete="off" name="translation-history-search" data-lpignore="true" data-1p-ignore>
+        <p id="historyMessage" class="history-message" role="status"></p>
         <div id="historyList" class="history-list"></div>
       </section>
     </dialog>
@@ -98,7 +100,7 @@
       <form method="dialog" class="settings">
         <div class="dialog-head">
           <h2 tabindex="-1" autofocus>服务配置</h2>
-          <div id="configMessage" class="config-message" role="status" hidden></div>
+          <div id="configMessage" data-feedback-box class="config-message" role="status" hidden></div>
           <div class="dialog-actions compact-actions">
             <button class="ghost" value="cancel" type="submit" formnovalidate>取消</button>
             <button class="ghost" id="saveConfigBtn" type="button">保存配置</button>
@@ -239,9 +241,10 @@
         <img src="{{ asset_url('github-mark.svg') }}" alt="" aria-hidden="true">
       </a>
     </div>
+    <script src="{{ asset_url('ui-feedback.js') }}"></script>
     <script src="{{ asset_url('ui.js') }}"></script>
     <script src="{{ asset_url('select-menu.js') }}"></script>
-    <script src="{{ asset_url('font-cache.js') }}"></script>
+    <script src="{{ asset_url('translation-state.js') }}"></script>
     <script src="{{ asset_url('app.js') }}"></script>
   </body>
 </html>

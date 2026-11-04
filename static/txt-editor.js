@@ -13,7 +13,10 @@
   const editorToken = Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, '0')).join('');
   let revision = '', dirty = false, saving = false, maxChars = 3000000, maxBytes = 50 * 1024 * 1024, timer;
   const csrf = document.querySelector('meta[name="csrf-token"]').content;
-  function message(text, error = false) { status.textContent = text; status.classList.toggle('error', error); }
+  function message(text, error = false, type = 'info') {
+    status.classList.toggle('error', error);
+    window.TransUI.feedback(status, text, error ? 'error' : type, false);
+  }
   async function request(options = {}, suffix = 'text') {
     const response = await fetch(`/api/books/${bookId}/${suffix}`, { ...options,
       headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf, 'X-Editor-Token': editorToken, ...options.headers } });
@@ -289,7 +292,7 @@
     saving = true; stopPreview(); textarea.readOnly = true; save.disabled = true;
     get('txtEditorBack').disabled = true; get('txtEditorBackup').disabled = true;
     get('txtEditorProgress').hidden = false;
-    message('正在读取原文备份…');
+    message('正在读取原文备份…', false, 'pending');
     try {
       await lease('renew');
       const data = await request({}, 'text-backup');
@@ -380,12 +383,13 @@
     if (saving || !leaseHeld) return;
     get('txtEditorDeleteConfirm').close(); saving = true; textarea.readOnly = true; count();
     get('txtEditorBack').disabled = true; get('txtEditorBackup').disabled = true;
+    message('正在删除原文备份…', false, 'pending');
     try {
       await lease('renew');
       await request({ method: 'DELETE' }, 'text-backup');
       hasBackup = false; get('txtEditorDownload').hidden = true; get('txtEditorDeleteBackup').hidden = true;
       get('txtEditorBackupTime').hidden = true; get('txtEditorBackupTime').textContent = ''; get('txtEditorBackupTime').removeAttribute('datetime');
-      message('原文备份已删除，当前书籍未改变');
+      message('原文备份已删除，当前书籍未改变', false, 'success');
     } catch (error) { message(error.message, true); }
     finally {
       saving = false; textarea.readOnly = !leaseHeld; get('txtEditorBack').disabled = false;
@@ -423,12 +427,12 @@
     saving = true; stopPreview(); clearTimeout(findTimer); save.disabled = true; textarea.readOnly = true;
     get('txtEditorBackup').disabled = true;
     get('txtEditorBack').disabled = true; get('txtEditorProgress').hidden = false;
-    message('正在计算修改内容并压缩…');
+    message('正在计算修改内容并压缩…', false, 'pending');
     try {
       await lease('renew');
       const delta = await prepareDelta(text, parse);
       if (delta.unchanged && !(parse && pendingParse)) { dirty = false; clearPreview(); message(pendingParse ? '原文已保存，尚未解析' : '正文没有变化，无需保存'); return; }
-      message(parse ? '正在上传修改并完整解析，请稍候…' : '正在压缩上传并保存原文…');
+      message(parse ? '正在上传修改并完整解析，请稍候…' : '正在压缩上传并保存原文…', false, 'pending');
       const data = delta.unchanged
         ? await request({ method: 'PUT', body: JSON.stringify({ revision, parse: true, reparse_current: true }) })
         : await request({ method: 'PUT', body: delta.body,
@@ -436,7 +440,7 @@
       originalText = text;
       revision = data.revision; dirty = false; updateTools(data);
       clearPreview();
-      message(data.parsed ? `已保存并重新解析 · ${data.book.chapter_count} 个章节` : '原文已保存到服务器，尚未解析；阅读内容将在解析后更新');
+      message(data.parsed ? `已保存并重新解析 · ${data.book.chapter_count} 个章节` : '原文已保存到服务器，尚未解析；阅读内容将在解析后更新', false, data.parsed ? 'success' : 'info');
       if (data.parsed) try { localStorage.setItem('readerTextEdit', JSON.stringify({ bookId, revision, contentRevision: data.book.content_revision, time: Date.now() })); } catch { /* Server save has succeeded. */ }
     } catch (error) { message(error.message, true); }
     finally {

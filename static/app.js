@@ -1,9 +1,7 @@
 function storedHistory() {
   try {
     const value = JSON.parse(localStorage.getItem("trans-history") || "[]");
-    return Array.isArray(value) ? value.filter((item) => item &&
-      ["text", "source", "target", "targetName"].every((key) => typeof item[key] === "string")
-    ).slice(0, 100) : [];
+    return window.TransTranslation.normalizeHistory(value);
   } catch {
     return [];
   }
@@ -13,13 +11,17 @@ const state = {
   languages: [],
   engines: [],
   config: null,
+  configRevision: 0,
   history: storedHistory(),
-  translateTimer: null,
+  historyDirty: false,
+  composing: false,
+  automatic: true,
+  currentResults: [],
+  resultContext: null,
   balanceTimer: null,
   balanceRetryTimer: null,
   deepseekBalance: null,
   deepseekBalanceLoadedAt: 0,
-  requestId: 0,
   sourceAutoMode: true,
   targetAutoMode: true,
   resultPanelCollapsed: {},
@@ -30,6 +32,9 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.content || "";
+const historyStore = window.TransTranslation.createHistoryStore(state.history);
+const translationQueue = window.TransTranslation.createQueue(runTranslation, (error) => setStatus(error.message));
+try { state.automatic = localStorage.getItem("trans-auto-translate") !== "false"; } catch { /* Optional preference. */ }
 
 function lockTranslationBackground() {
   if (state.dialogScrollPosition) return;
@@ -241,34 +246,28 @@ function setStatus(text) {
   const status = $("statusText");
   status.className = "";
   if (!text || text === "待翻译" || text === "请输入原文") {
-    status.textContent = "";
-    return;
-  }
-  if (text === "翻译中") {
+    window.TransUI.feedback(status, "", "info", false);
+  } else if (text === "翻译中") {
+    window.TransUI.feedback(status, "", "info", false);
     status.className = "status-icon loading";
-    status.textContent = "";
-    return;
-  }
-  if (text === "已完成") {
+  } else if (text === "已完成") {
     status.className = "status-icon done";
-    status.textContent = "✓";
-    return;
+    window.TransUI.feedback(status, "✓", "info", false);
+  } else {
+    window.TransUI.feedback(status, text, "info", false);
   }
-  status.textContent = text;
 }
 
 function setConfigMessage(text, type = "success") {
   const message = $("configMessage");
-  message.textContent = text;
   message.className = `config-message ${type}`;
-  message.hidden = false;
+  window.TransUI.feedback(message, text, type);
 }
 
 function clearConfigMessage() {
   const message = $("configMessage");
-  message.textContent = "";
   message.className = "config-message";
-  message.hidden = true;
+  window.TransUI.feedback(message, "");
 }
 
 function renderDeepSeekCacheStatus(cache = {}) {
@@ -285,7 +284,10 @@ async function loadDeepSeekCacheStatus() {
 }
 
 async function clearDeepSeekCache() {
-  $("clearCacheBtn").disabled = true;
+  if ($("clearCacheBtn").disabled || $("saveConfigBtn").disabled) return;
+  const finish = window.TransUI.busyButton($("clearCacheBtn"));
+  $("saveConfigBtn").disabled = true;
+  setConfigMessage("正在清空缓存…", "pending");
   try {
     const data = await api("/api/cache", { method: "DELETE" });
     renderDeepSeekCacheStatus(data);
@@ -293,7 +295,8 @@ async function clearDeepSeekCache() {
   } catch (error) {
     setConfigMessage(`清空缓存失败：${error.message}`, "error");
   } finally {
-    $("clearCacheBtn").disabled = false;
+    finish();
+    $("saveConfigBtn").disabled = false;
   }
 }
 
@@ -646,49 +649,8 @@ function createRetryButton(engineId, index) {
   return button;
 }
 
-async function retryTranslationEngine(engineId, index, button) {
-  if (button.dataset.busy === "true") return;
-  const text = $("sourceText").value.trim();
-  if (!text) return;
-  const requestId = state.requestId;
-  const source = sourceForRequest();
-  const target = $("targetLang").value;
-  button.dataset.busy = "true";
-  button.setAttribute("aria-disabled", "true");
-  button.textContent = "重试中";
-  let result;
-  try {
-    const translated = await translateWithEngine(engineId, text, source, target);
-    result = {
-      engine: engineId,
-      name: engineName(engineId),
-      ok: true,
-      text: translated.text,
-      target,
-      detectedSource: translated.detectedSource,
-    };
-  } catch (error) {
-    const hint = error.name === "AbortError" ? "请求超时" : error.message;
-    result = { engine: engineId, name: engineName(engineId), ok: false, error: hint };
-  }
-  const requestIsCurrent = requestId === state.requestId
-    && text === $("sourceText").value.trim()
-    && source === sourceForRequest()
-    && target === $("targetLang").value;
-  if (!requestIsCurrent) {
-    if (button.isConnected) {
-      button.dataset.busy = "false";
-      button.removeAttribute("aria-disabled");
-      button.textContent = "重试";
-    }
-    return;
-  }
-  if (result.ok && result.detectedSource) updateDetectedSource([result], text);
-  updateResultCard(result, index);
-  if (result.ok) {
-    const targetName = $("targetLang").selectedOptions[0].textContent;
-    saveHistory({ text, source: sourceForRequest(), target, targetName, time: Date.now() });
-  }
+function retryTranslationEngine(engineId) {
+  scheduleTranslate(0, true, [engineId]);
 }
 
 async function copyText(text) {
@@ -834,12 +796,18 @@ async function translateWithEngine(engineId, text, source, target) {
   throw new Error("未知引擎");
 }
 
-function saveHistory(item) {
-  state.history = [item, ...state.history.filter((old) => old.text !== item.text)].slice(0, 100);
+async function saveHistory(item) {
+  item = window.TransTranslation.normalizeHistory([item])[0];
+  if (!item?.results.length) return;
+  state.history = window.TransTranslation.mergeHistory(state.history, item);
   try {
-    localStorage.setItem("trans-history", JSON.stringify(state.history));
+    state.history = await historyStore.save(state.history);
+    state.historyDirty = false;
+    try { localStorage.removeItem("trans-history"); } catch { /* Saved in IndexedDB. */ }
+    $("historyMessage").textContent = "";
   } catch {
-    // Storage can be full or unavailable; keep this session's history usable.
+    state.historyDirty = true;
+    $("historyMessage").textContent = "本地历史未能保存，当前记录仅在本页保留；可导出备份。";
   }
   renderHistory();
 }
@@ -851,24 +819,45 @@ function renderHistory() {
     list.innerHTML = '<div class="history-item">暂无历史<span>翻译后会出现在这里</span></div>';
     return;
   }
-  state.history.forEach((item) => {
+  const query = $("historySearch").value.trim().toLocaleLowerCase();
+  const entries = state.history.filter((item) => [item.text, item.targetName, ...item.results.map((r) => r.text)]
+    .some((text) => text.toLocaleLowerCase().includes(query)));
+  if (!entries.length) { list.textContent = "没有匹配的历史记录"; return; }
+  entries.forEach((item) => {
     const btn = document.createElement("button");
     btn.className = "history-item";
     btn.type = "button";
-    const title = document.createTextNode(item.targetName);
+    const sourceName = state.languages.find((lang) => lang.code === item.source)?.name || item.source;
+    const title = document.createTextNode(`${sourceName} → ${item.targetName}`);
     const text = document.createElement("span");
-    text.textContent = item.text;
-    btn.appendChild(title);
-    btn.appendChild(text);
+    text.textContent = item.text.slice(0, 180);
+    const meta = document.createElement("span");
+    meta.textContent = [item.time ? new Date(item.time).toLocaleString() : "", item.results.length
+      ? item.results.map((r) => r.model || r.name).join(" · ") : "旧记录 · 未保存译文"].filter(Boolean).join(" · ");
+    btn.append(title, text, meta);
     btn.addEventListener("click", () => {
       $("sourceText").value = item.text;
       $("sourceLang").value = item.source;
       $("targetLang").value = item.target;
       state.sourceAutoMode = item.source === "auto";
       state.targetAutoMode = false;
+      translationQueue.cancel();
+      state.currentResults = item.results;
+      state.resultContext = null;
+      state.activeSentence = null;
+      applyVisualSentenceHighlight(null, null);
       updateCharCount();
       $("historyDialog").close();
-      scheduleTranslate(0);
+      const box = $("results");
+      box.replaceChildren();
+      box.classList.toggle("empty", !item.results.length);
+      item.results.forEach((result, index) => {
+        const card = document.createElement("article");
+        fillResultCard(card, result, index);
+        box.appendChild(card);
+      });
+      if (!item.results.length) box.textContent = "此旧记录未保存译文，点击“翻译”可重新翻译。";
+      setStatus(item.results.length ? "历史译文" : "待翻译");
     });
     list.appendChild(btn);
   });
@@ -901,42 +890,66 @@ function handleSourceInput() {
   scheduleTranslate();
 }
 
-function scheduleTranslate(delay = 500) {
-  // Invalidate in-flight responses immediately, including during the input debounce.
-  state.requestId++;
-  window.clearTimeout(state.translateTimer);
-  state.translateTimer = window.setTimeout(translate, delay);
-}
-
-async function translate() {
-  window.clearTimeout(state.translateTimer);
-  const requestId = ++state.requestId;
+function scheduleTranslate(delay = 1000, explicit = false, onlyEngines = null) {
+  if (!state.config) return;
+  if (state.composing || (!state.automatic && !explicit && $("sourceText").value.trim())) {
+    translationQueue.cancel();
+    setStatus(state.composing ? "输入中" : "待翻译");
+    return;
+  }
   const text = $("sourceText").value.trim();
-  const engines = selectedEngines();
+  let engines = selectedEngines();
   state.activeSentence = null;
   applyVisualSentenceHighlight(null, null);
   if (!text) {
+    translationQueue.cancel();
+    state.currentResults = [];
+    state.resultContext = null;
     setStatus("待翻译");
     renderEngineShells();
     return;
   }
   if (!engines.length) {
+    translationQueue.cancel();
+    state.currentResults = [];
+    state.resultContext = null;
     setStatus("请选择引擎");
     renderEngineShells();
     return;
   }
-  setStatus("翻译中");
   if (state.sourceAutoMode) {
     applyDetectedSource(guessSourceLang(text));
   } else {
     syncTargetForSource($("sourceLang").value);
   }
-  renderEngineShells();
-  try {
-    const source = sourceForRequest();
-    const target = $("targetLang").value;
-    const results = [];
-    const tasks = engines.map(async (engineId, index) => {
+  const source = sourceForRequest();
+  const target = $("targetLang").value;
+  const config = JSON.stringify(state.config);
+  const context = JSON.stringify([text, source, target, config, state.configRevision]);
+  const partial = Boolean(onlyEngines && state.resultContext === context);
+  if (partial) engines = onlyEngines;
+  const job = { text, source, target, engines, config, context, partial,
+    targetName: $("targetLang").selectedOptions[0].textContent,
+    key: JSON.stringify([context, engines]) };
+  setStatus(delay ? "等待输入完成" : "等待翻译");
+  translationQueue.schedule(job, delay);
+}
+
+async function runTranslation(job, isCurrent) {
+  const { text, source, target, engines } = job;
+  const settings = JSON.parse(job.config);
+  const retainedResults = job.partial ? [...state.currentResults] : [];
+  if (!job.partial) { state.currentResults = []; renderEngineShells(); }
+  state.resultContext = job.context;
+  function restoreResultContext() {
+    if (state.resultContext === job.context) return;
+    state.currentResults = [...retainedResults];
+    renderEngineShells();
+    state.resultContext = job.context;
+    retainedResults.forEach((result, index) => updateResultCard(result, index));
+  }
+  setStatus("翻译中");
+  const results = await Promise.all(engines.map(async (engineId, index) => {
       let result;
       try {
         const translated = await translateWithEngine(engineId, text, source, target);
@@ -946,32 +959,38 @@ async function translate() {
           ok: true,
           text: translated.text,
           target,
+          model: settings[engineId]?.model || "",
+          style: settings[engineId]?.style || "",
           detectedSource: translated.detectedSource,
         };
       } catch (error) {
         const hint = error.name === "AbortError" ? "请求超时" : error.message;
         result = { engine: engineId, name: engineName(engineId), ok: false, error: hint };
       }
-      if (requestId === state.requestId) {
-        results[index] = result;
-        updateDetectedSource(results.filter(Boolean), text);
+      if (isCurrent()) {
+        restoreResultContext();
+        state.currentResults = [...state.currentResults.filter((item) => item.engine !== engineId), result];
+        updateDetectedSource(state.currentResults, text);
         updateResultCard(result, index);
       }
       return result;
+    }));
+    if (!isCurrent()) return;
+    restoreResultContext();
+    // Also restore results that finished while another input was temporarily current.
+    results.forEach((result, index) => {
+      state.currentResults = [...state.currentResults.filter((item) => item.engine !== result.engine), result];
+      updateResultCard(result, index);
     });
-    await Promise.all(tasks);
-    if (requestId !== state.requestId) return;
     if (!updateTranslationStatus()) return;
-    const targetName = $("targetLang").selectedOptions[0].textContent;
-    saveHistory({ text, source: sourceForRequest(), target, targetName, time: Date.now() });
-  } catch (error) {
-    if (requestId !== state.requestId) return;
-    setStatus(error.message);
-  }
+    await saveHistory({ text, source, target, targetName: job.targetName, time: Date.now(),
+      results: state.currentResults.filter((result) => result.ok) });
 }
 
 async function saveConfig() {
+  if ($("saveConfigBtn").disabled || $("clearCacheBtn").disabled) return;
   if (!$("deepseekCacheLimit").reportValidity()) return;
+  translationQueue.cancel();
   const payload = {
     deepseek: {
       enabled: $("deepseekEnabled").checked,
@@ -993,21 +1012,22 @@ async function saveConfig() {
       timeout: Number($("googleTimeout").value),
     },
   };
-  $("saveConfigBtn").disabled = true;
-  clearConfigMessage();
+  const finish = window.TransUI.busyButton($("saveConfigBtn"));
+  $("clearCacheBtn").disabled = true;
+  setConfigMessage("正在保存…", "pending");
   try {
     const data = await api("/api/config", { method: "PUT", body: JSON.stringify(payload) });
     state.config = data.config;
+    state.configRevision++;
     await bootstrap();
     await loadDeepSeekCacheStatus();
     setConfigMessage("配置已保存", "success");
-    setStatus("配置已保存");
     scheduleTranslate(0);
   } catch (error) {
     setConfigMessage(`保存失败：${error.message}`, "error");
-    setStatus(error.message);
   } finally {
-    $("saveConfigBtn").disabled = false;
+    finish();
+    $("clearCacheBtn").disabled = false;
   }
 }
 
@@ -1024,6 +1044,21 @@ async function bootstrap() {
 }
 
 $("sourceText").addEventListener("input", handleSourceInput);
+$("sourceText").addEventListener("compositionstart", () => {
+  state.composing = true;
+  translationQueue.cancel();
+});
+$("sourceText").addEventListener("compositionend", () => {
+  state.composing = false;
+  handleSourceInput();
+});
+$("autoTranslate").checked = state.automatic;
+$("autoTranslate").addEventListener("change", () => {
+  state.automatic = $("autoTranslate").checked;
+  try { localStorage.setItem("trans-auto-translate", String(state.automatic)); } catch { /* Optional preference. */ }
+  scheduleTranslate();
+});
+$("translateBtn").addEventListener("click", () => scheduleTranslate(0, true));
 $("sourceText").addEventListener("scroll", syncSourceHighlight, { passive: true });
 $("sourceText").addEventListener("focus", () => $("sourceHighlight").replaceChildren());
 new ResizeObserver(syncSourceHighlight).observe($("sourceText"));
@@ -1054,7 +1089,8 @@ $("googleEndpointPreset").addEventListener("change", () => {
 });
 $("sourceText").addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-    translate();
+    event.preventDefault();
+    if (!event.isComposing) scheduleTranslate(0, true);
   }
 });
 $("swapBtn").addEventListener("click", () => {
@@ -1071,6 +1107,20 @@ window.TransUI.setupScrollFades($("historyDialog"), ".history-list");
 $("historyBtn").addEventListener("click", () => {
   lockTranslationBackground();
   $("historyDialog").showModal();
+  historyStore.load().then((items) => {
+    if (!state.historyDirty) { state.history = items; $("historyMessage").textContent = ""; }
+    renderHistory();
+  }).catch(() => { $("historyMessage").textContent = "无法读取持久历史，显示本页已有记录。"; });
+});
+$("historySearch").addEventListener("input", renderHistory);
+$("exportHistoryBtn").addEventListener("click", () => {
+  const blob = new Blob([JSON.stringify({ version: 1, records: state.history }, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `trans-history-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60000);
 });
 for (const dialog of [$("historyDialog"), $("settingsDialog")]) {
   dialog.addEventListener("close", unlockTranslationBackground);
@@ -1132,3 +1182,8 @@ $("logoutBtn").addEventListener("click", async () => {
 bootstrap().catch((error) => {
   setStatus(error.message);
 });
+historyStore.load().then((items) => {
+  if (!state.historyDirty) { state.history = items; $("historyMessage").textContent = ""; }
+  try { localStorage.removeItem("trans-history"); } catch { /* Migration has already completed. */ }
+  renderHistory();
+}).catch(() => { $("historyMessage").textContent = "本地存储不可用，历史暂时只在本页保留。"; });

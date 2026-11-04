@@ -414,6 +414,30 @@
   overflow: auto;
 }
 
+.app-body .translation-input-actions,
+.app-body .translation-history-actions,
+.app-body .translation-auto {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.app-body .translation-input-actions button,
+.app-body .translation-history-actions .ghost {
+  min-height: 28px;
+  padding: 3px 9px;
+  font-size: 13px;
+}
+
+.app-body .translation-auto { margin-left: auto; font-size: 12px; white-space: nowrap; }
+.app-body .translation-auto input { width: 16px; height: 16px; margin: 0; }
+.app-body .history-search { width: 100%; min-width: 0; margin-bottom: 10px; }
+.app-body .history-message { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+.app-body .history-message:empty { display: none; }
+.app-body #historyDialog .history-panel { display: flex; flex-direction: column; max-height: calc(100dvh - 48px); }
+.app-body #historyDialog .history-list { min-height: 0; }
+
 :where(.app-body) .history-item {
   width: 100%;
   text-align: left;
@@ -1324,14 +1348,6 @@
     font-size: var(--mobile-control-size);
   }
 
-  .app-body #settingsDialog .config-message {
-    margin-top: 6px;
-    min-height: 0;
-    font-size: 12px;
-    font-weight: 400;
-    line-height: 1.4;
-  }
-
   .app-body #settingsDialog .config-message[hidden] {
     display: none !important;
   }
@@ -1402,11 +1418,7 @@ html.translation-dialog-open .app-body {
 
 .app-body #settingsDialog .config-message {
   min-width: 0;
-  min-height: 0;
   margin: 0;
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 1.4;
   overflow-wrap: anywhere;
 }
 
