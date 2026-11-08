@@ -88,11 +88,25 @@
       <section class="history-panel">
         <div class="dialog-head">
           <h2 tabindex="-1" autofocus>本地历史</h2>
-          <div class="translation-history-actions"><button class="ghost" id="exportHistoryBtn" type="button">导出</button><button class="icon-btn" id="closeHistoryBtn" type="button" aria-label="关闭历史">×</button></div>
+          <div class="translation-history-actions"><button class="ghost" id="clearHistoryBtn" type="button">清除</button><button class="ghost" id="exportHistoryBtn" type="button">导出</button><button class="icon-btn" id="closeHistoryBtn" type="button" aria-label="关闭历史">×</button></div>
         </div>
         <input id="historySearch" class="history-search" type="search" placeholder="搜索原文或译文" aria-label="搜索翻译历史" autocomplete="off" name="translation-history-search" data-lpignore="true" data-1p-ignore>
-        <p id="historyMessage" class="history-message" role="status"></p>
+        <p id="historyMessage" class="history-message" data-feedback-box role="status"></p>
         <div id="historyList" class="history-list"></div>
+      </section>
+    </dialog>
+
+    <dialog id="clearHistoryConfirmDialog" aria-labelledby="clearHistoryConfirmTitle">
+      <section class="action-confirm-panel">
+        <div class="action-confirm-icon" aria-hidden="true">!</div>
+        <div class="action-confirm-copy">
+          <h2 id="clearHistoryConfirmTitle" tabindex="-1" autofocus>清除本地历史？</h2>
+          <p>删除当前浏览器的全部翻译历史，无法撤销。服务器翻译缓存不受影响。</p>
+        </div>
+        <div class="action-confirm-actions">
+          <button class="ghost" id="cancelClearHistoryBtn" type="button">取消</button>
+          <button class="danger-btn" id="confirmClearHistoryBtn" type="button">确认清除</button>
+        </div>
       </section>
     </dialog>
 

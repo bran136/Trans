@@ -277,18 +277,20 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
 #securityDialog .security-panel { display:flex; flex-direction:column; max-height:calc(100vh - 30px); max-height:calc(100dvh - 30px); padding:18px; overflow:hidden; }
 #securityDialog .security-panel > .dialog-head,
 #securityDialog .security-panel > .security-section { flex-shrink:0; }
-#securityDialog .security-panel > .security-clients-section { display:flex; flex-direction:column; flex-shrink:1; min-height:0; }
+#securityDialog .security-panel > .security-clients-section { --clients-reserved-height:236px; display:flex; flex-direction:column; flex-shrink:1; min-height:0; height:calc(32px + 8px + var(--clients-reserved-height)); box-sizing:content-box; }
 #securityDialog .security-clients-section > .security-section-head { flex-shrink:0; }
 #securityDialog .dialog-head { margin-bottom:12px; }
 #securityDialog .security-section + .security-section { margin-top:10px; padding-top:10px; }
 #securityDialog .security-hint { margin:6px 0 8px; line-height:1.5; }
 #securityDialog .security-form { margin-top:8px; gap:10px; }
-#securityDialog .login-clients { min-height:0; max-height:var(--clients-preview-height, 236px); margin-top:8px; gap:6px; grid-auto-rows:max-content; align-content:start; overflow-y:auto; overscroll-behavior-y:contain; scrollbar-gutter:stable; -webkit-overflow-scrolling:touch; }
+/* Reserve the device area before the response arrives; the panel can still
+   shrink to the viewport, while the measured third-card fade stays local. */
+#securityDialog .login-clients { height:var(--clients-reserved-height); min-height:0; max-height:var(--clients-preview-height, var(--clients-reserved-height)); margin-top:8px; gap:6px; grid-auto-rows:max-content; align-content:start; overflow-y:auto; overscroll-behavior-y:contain; scrollbar-gutter:stable; -webkit-overflow-scrolling:touch; }
 #securityDialog .login-client { padding:9px 10px; }
 .login-client-location { flex-basis:100%; min-width:0; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink); }
 #securityDialog .login-clients { overflow-x:hidden; }
 @media (max-width:560px) {
-  #securityDialog .login-clients { max-height:var(--clients-preview-height, 282px); }
+  #securityDialog .security-panel > .security-clients-section { --clients-reserved-height:282px; }
   #securityDialog .login-client-meta { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); justify-content:space-between; column-gap:6px; }
   #securityDialog .login-client-location { grid-column:1 / -1; min-width:0; }
   #securityDialog .login-client-time { font-size:11px; white-space:nowrap; font-variant-numeric:tabular-nums; }
@@ -300,7 +302,7 @@ html.home-about-open .home-body { position:fixed; top:var(--about-scroll-top); l
 /* Short screens need a scrollable panel so added security controls cannot hide devices. */
 @media (max-height:480px), (max-width:560px) and (max-height:700px) {
   #securityDialog .security-panel { overflow-y:auto; }
-  #securityDialog .security-panel > .security-clients-section { flex-shrink:0; }
+  #securityDialog .security-panel > .security-clients-section { --clients-reserved-height:160px; flex-shrink:0; }
   #securityDialog .login-clients { max-height:160px; }
 }
 @media (min-width:561px) {

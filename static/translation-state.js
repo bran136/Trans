@@ -80,15 +80,16 @@
       }).catch((error) => { opening = null; throw error; });
       return opening;
     }
-    async function update(incoming = null) {
+    async function update(incoming = null, clear = false) {
       const db = await open();
       return new Promise((resolve, reject) => {
         // Reading and merging in one transaction preserves updates from other tabs.
         const tx = db.transaction("entries", "readwrite");
         const store = tx.objectStore("entries");
-        const request = store.getAll();
+        const request = clear ? store.clear() : store.getAll();
         let records;
         request.onsuccess = () => {
+          if (clear) { records = []; return; }
           records = normalizeHistory(request.result.length ? request.result : legacy);
           if (incoming) {
             normalizeHistory(Array.isArray(incoming) ? incoming : [incoming]).reverse()
@@ -99,11 +100,11 @@
             records.forEach((item) => store.put(item));
           }
         };
-        tx.oncomplete = () => resolve(records);
+        tx.oncomplete = () => { legacy = []; resolve(records); };
         tx.onerror = tx.onabort = () => reject(tx.error || new Error("无法保存本地历史"));
       });
     }
-    return { load: () => update(), save: (item) => update(item) };
+    return { load: () => update(), save: (item) => update(item), clear: () => update(null, true) };
   }
 
   const api = { createQueue, normalizeHistory, mergeHistory, createHistoryStore };

@@ -230,7 +230,7 @@
   align-items: center;
   flex: 1 1 auto;
   min-width: 0;
-  padding: 8px 11px;
+  padding: 4px 11px;
   color: var(--ink);
   font-weight: 600;
   text-align: left;
@@ -242,7 +242,7 @@
   justify-content: center;
   flex: 0 0 40px;
   width: 40px;
-  min-height: 40px;
+  min-height: 32px;
   padding: 0;
   border: 0;
   background: var(--subtle);
@@ -257,7 +257,8 @@
 
 :where(.app-body) .result-copy {
   flex: 0 0 auto;
-  margin: 5px 4px 5px 0;
+  min-height: 24px;
+  margin: 4px 4px 4px 0;
   padding: 0 10px;
   border: 1px solid rgba(var(--accent-rgb), 0.22);
   border-radius: 10px;
@@ -430,7 +431,16 @@
   font-size: 13px;
 }
 
+/* Fit inside the 32px pane header without increasing its height. */
+.app-body .translation-input-actions button {
+  height: 24px;
+  min-height: 24px;
+  padding-block: 0;
+}
+
 .app-body .translation-auto { margin-left: auto; font-size: 12px; white-space: nowrap; }
+.app-body #clearHistoryBtn { color:var(--danger); border-color:rgba(var(--danger-rgb), .3); background:rgba(var(--danger-rgb), .06); }
+.app-body #clearHistoryConfirmDialog { width:min(440px,calc(100% - 24px)); padding:0; }
 .app-body .translation-auto input { width: 16px; height: 16px; margin: 0; }
 .app-body .history-search { width: 100%; min-width: 0; margin-bottom: 10px; }
 .app-body .history-message { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
@@ -941,7 +951,7 @@
 
 .app-body .toolbar {
   align-items: center;
-  padding: 7px 14px;
+  padding: 4px 14px;
 }
 
 .app-body .toolbar > label {
@@ -965,6 +975,12 @@
   width: 100%;
 }
 
+.app-body .toolbar select,
+.app-body .toolbar .swap {
+  height: 30px;
+  min-height: 30px;
+}
+
 .app-body .pane-head {
   min-height: 32px;
   padding: 3px 14px;
@@ -977,7 +993,7 @@
 }
 
 .app-body .engine-row {
-  padding: 6px 14px;
+  padding: 3px 14px;
 }
 
 :where(.app-body) .engine-controls {
@@ -1000,12 +1016,12 @@
 }
 
 :where(.app-body) .engine-controls .engine-chip {
-  min-height: 32px;
+  min-height: 28px;
 }
 
 @media (max-width: 640px) {
   .app-body .toolbar {
-    padding: 6px 10px;
+    padding: 4px 10px;
   }
 
   .app-body .toolbar select {
@@ -1018,7 +1034,7 @@
   }
 
   .app-body .engine-row {
-    padding: 5px 10px;
+    padding: 3px 10px;
   }
 
   :where(.app-body) .engine-controls .engine-list {
@@ -1027,7 +1043,6 @@
   }
 
   :where(.app-body) .engine-controls .engine-chip {
-    min-height: 40px;
     padding: 0 7px;
     gap: 8px;
     flex-wrap: nowrap;
@@ -1221,7 +1236,6 @@
 
   .app-body .toolbar {
     gap: 4px 6px;
-    padding-block: 5px;
   }
 
   .app-body .toolbar > label {
@@ -1229,33 +1243,24 @@
   }
 
   .app-body .toolbar select {
-    height: 34px;
-    min-height: 34px;
     font-size: var(--mobile-control-size, 14px);
   }
 
   .app-body .swap {
-    height: 34px;
-    min-height: 34px;
     font-size: 20px;
   }
 
   .app-body .engine-controls .engine-chip {
-    min-height: 32px;
     font-size: 12px;
   }
 
-  .app-body .engine-row {
-    padding-block: 5px;
-  }
-
   .app-body .result-copy {
-    min-height: 30px;
+    min-height: 24px;
     font-size: 12px;
   }
 
   .app-body .result-toggle {
-    min-height: 34px;
+    min-height: 32px;
     flex-basis: 34px;
     width: 34px;
   }

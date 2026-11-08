@@ -14,6 +14,9 @@ const state = {
   configRevision: 0,
   history: storedHistory(),
   historyDirty: false,
+  historyPending: [],
+  historyRevision: 0,
+  historyClearing: false,
   composing: false,
   automatic: true,
   currentResults: [],
@@ -797,19 +800,62 @@ async function translateWithEngine(engineId, text, source, target) {
 }
 
 async function saveHistory(item) {
+  if (state.historyClearing) return;
   item = window.TransTranslation.normalizeHistory([item])[0];
   if (!item?.results.length) return;
+  const revision = state.historyRevision;
   state.history = window.TransTranslation.mergeHistory(state.history, item);
+  state.historyPending = window.TransTranslation.mergeHistory(state.historyPending, item);
+  const pending = state.historyPending;
   try {
-    state.history = await historyStore.save(state.history);
-    state.historyDirty = false;
+    // Write only new/unsaved records; another tab may have cleared older history.
+    const records = await historyStore.save(pending);
+    if (revision !== state.historyRevision) return;
+    state.history = records;
+    const saved = new Set(pending.map(entry => entry.id));
+    state.historyPending = state.historyPending.filter(entry => !saved.has(entry.id));
+    state.historyDirty = !!state.historyPending.length;
     try { localStorage.removeItem("trans-history"); } catch { /* Saved in IndexedDB. */ }
-    $("historyMessage").textContent = "";
+    window.TransUI.feedback($("historyMessage"), "");
   } catch {
+    if (revision !== state.historyRevision) return;
     state.historyDirty = true;
-    $("historyMessage").textContent = "本地历史未能保存，当前记录仅在本页保留；可导出备份。";
+    window.TransUI.feedback($("historyMessage"), "本地历史未能保存，当前记录仅在本页保留；可导出备份。", "error");
   }
   renderHistory();
+}
+
+async function loadHistory() {
+  const revision = state.historyRevision;
+  if (state.historyClearing) return;
+  try {
+    const items = await historyStore.load();
+    if (revision !== state.historyRevision) return;
+    if (!state.historyDirty) { state.history = items; window.TransUI.feedback($("historyMessage"), ""); }
+    try { localStorage.removeItem("trans-history"); } catch { /* Migration completed. */ }
+    renderHistory();
+  } catch {
+    if (revision === state.historyRevision) window.TransUI.feedback($("historyMessage"), "无法读取持久历史，显示本页已有记录。", "error");
+  }
+}
+
+async function clearHistory() {
+  if (state.historyClearing) return;
+  $("clearHistoryConfirmDialog").close();
+  state.historyClearing = true;
+  state.historyRevision++;
+  const finish = window.TransUI.busyButton($("clearHistoryBtn"));
+  window.TransUI.feedback($("historyMessage"), "正在清除…", "pending");
+  try {
+    localStorage.removeItem("trans-history");
+    await historyStore.clear();
+    state.history = []; state.historyPending = []; state.historyDirty = false;
+    $("historySearch").value = "";
+    renderHistory();
+    window.TransUI.feedback($("historyMessage"), "本地历史已清除", "success");
+  } catch {
+    window.TransUI.feedback($("historyMessage"), "清除失败，请重试", "error");
+  } finally { state.historyClearing = false; finish(); }
 }
 
 function renderHistory() {
@@ -936,6 +982,7 @@ function scheduleTranslate(delay = 1000, explicit = false, onlyEngines = null) {
 }
 
 async function runTranslation(job, isCurrent) {
+  const historyRevision = state.historyRevision;
   const { text, source, target, engines } = job;
   const settings = JSON.parse(job.config);
   const retainedResults = job.partial ? [...state.currentResults] : [];
@@ -983,7 +1030,7 @@ async function runTranslation(job, isCurrent) {
       updateResultCard(result, index);
     });
     if (!updateTranslationStatus()) return;
-    await saveHistory({ text, source, target, targetName: job.targetName, time: Date.now(),
+    if (historyRevision === state.historyRevision) await saveHistory({ text, source, target, targetName: job.targetName, time: Date.now(),
       results: state.currentResults.filter((result) => result.ok) });
 }
 
@@ -1107,11 +1154,13 @@ window.TransUI.setupScrollFades($("historyDialog"), ".history-list");
 $("historyBtn").addEventListener("click", () => {
   lockTranslationBackground();
   $("historyDialog").showModal();
-  historyStore.load().then((items) => {
-    if (!state.historyDirty) { state.history = items; $("historyMessage").textContent = ""; }
-    renderHistory();
-  }).catch(() => { $("historyMessage").textContent = "无法读取持久历史，显示本页已有记录。"; });
+  loadHistory();
 });
+$("clearHistoryBtn").addEventListener("click", () => {
+  if (!state.historyClearing) $("clearHistoryConfirmDialog").showModal();
+});
+$("cancelClearHistoryBtn").addEventListener("click", () => $("clearHistoryConfirmDialog").close());
+$("confirmClearHistoryBtn").addEventListener("click", clearHistory);
 $("historySearch").addEventListener("input", renderHistory);
 $("exportHistoryBtn").addEventListener("click", () => {
   const blob = new Blob([JSON.stringify({ version: 1, records: state.history }, null, 2)], { type: "application/json" });
@@ -1182,8 +1231,4 @@ $("logoutBtn").addEventListener("click", async () => {
 bootstrap().catch((error) => {
   setStatus(error.message);
 });
-historyStore.load().then((items) => {
-  if (!state.historyDirty) { state.history = items; $("historyMessage").textContent = ""; }
-  try { localStorage.removeItem("trans-history"); } catch { /* Migration has already completed. */ }
-  renderHistory();
-}).catch(() => { $("historyMessage").textContent = "本地存储不可用，历史暂时只在本页保留。"; });
+loadHistory();

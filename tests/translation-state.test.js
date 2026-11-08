@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { createQueue, normalizeHistory, mergeHistory } = require("../static/translation-state.js");
+const { createQueue, normalizeHistory, mergeHistory, createHistoryStore } = require("../static/translation-state.js");
 
 function fakeClock() {
   let id = 0;
@@ -105,4 +105,36 @@ test("history is bounded and excludes failed or malformed result contents", () =
   item.results.push({ engine: "google", name: "Google", text: "", ok: true });
   item.results.push({ engine: "google", name: "Google", text: "error", ok: false });
   assert.equal(normalizeHistory([item])[0].results.length, 1);
+});
+
+test("clearing history removes stored and legacy entries, while new translations can still be saved", async () => {
+  const previous = globalThis.indexedDB;
+  const entries = new Map();
+  const db = {transaction() {
+    const tx = {};
+    const request = result => {
+      const req = {result};
+      queueMicrotask(() => { req.onsuccess?.(); queueMicrotask(() => tx.oncomplete?.()); });
+      return req;
+    };
+    tx.objectStore = () => ({getAll:()=>request([...entries.values()]),
+      clear:()=>{ entries.clear(); return request(); }, put:item=>entries.set(item.id,item)});
+    return tx;
+  }};
+  globalThis.indexedDB = {open() {
+    const req = {result:db}; queueMicrotask(()=>req.onsuccess()); return req;
+  }};
+  try {
+    const history = createHistoryStore([entry()]);
+    assert.equal((await history.load()).length,1);
+    await history.clear(); assert.equal(entries.size,0);
+    assert.deepEqual(await history.load(),[]);
+    assert.equal((await history.save(entry('fr'))).length,1);
+    assert.equal((await history.load())[0].target,'fr');
+    const unmigrated = createHistoryStore([entry()]);
+    await unmigrated.clear(); assert.deepEqual(await unmigrated.load(),[]);
+  } finally {
+    if (previous === undefined) delete globalThis.indexedDB;
+    else globalThis.indexedDB = previous;
+  }
 });

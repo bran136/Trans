@@ -206,6 +206,29 @@ test('reusing an active translation after viewing history does not mix historica
   resolveTranslation({ text: '新的译文' }); await task;
   assert.deepEqual(Array.from(saved.results, result => result.engine), ['google']);
   assert.equal(state.resultContext, 'new'); assert.equal(shells, 2);
+  // Clearing history while a model request is in flight must not put its result back.
+  saved = null;
+  state.historyRevision = 0;
+  const next = context.runTranslation({ text:'Another source', source:'en', target:'zh',
+    targetName:'中文', engines:['google'], config:'{}', context:'another', partial:false },()=>true);
+  state.historyRevision++;
+  resolveTranslation({text:'另一条译文'}); await next;
+  assert.equal(saved,null);
+});
+
+test('clearing local history ignores stale loads and preserves visible records on failure', async () => {
+  const $ = dom(); let resolveLoad, fail = false, rendered = 0;
+  const state = {history:[{id:'old'}], historyPending:[], historyDirty:false, historyRevision:0, historyClearing:false};
+  const context = vm.createContext({ $, state, localStorage:{removeItem:key=>assert.equal(key,'trans-history')},
+    window:{TransUI:createFeedback(clock())}, renderHistory:()=>{rendered++;},
+    historyStore:{load:()=>new Promise(resolve=>{resolveLoad=resolve;}), clear:async()=>{if(fail)throw Error('disk');}} });
+  vm.runInContext(code('app.js','async function loadHistory()', 'function renderHistory()'),context);
+  const loading = context.loadHistory();
+  await context.clearHistory(); resolveLoad([{id:'old'}]); await loading;
+  assert.equal(state.history.length,0); assert.equal(rendered,1); assert.equal(state.historyClearing,false);
+  state.history=[{id:'new'}]; fail=true;
+  await context.clearHistory(); assert.equal(state.history[0].id,'new');
+  assert.equal($('historyMessage').dataset.feedback,'error'); assert.equal(state.historyClearing,false);
 });
 
 test('an outstanding monitor refresh cannot replace the restart progress message', async () => {
